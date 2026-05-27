@@ -1,0 +1,1 @@
+g++ -g testEnumerator.cpp -fsanitize=address -O0 -o test.exe -lglpk && ./test.exe

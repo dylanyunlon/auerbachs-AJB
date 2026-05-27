@@ -1,0 +1,1 @@
+g++ testIndex.cpp -O3 -g -o test.exe -lglpk && ./test.exe
