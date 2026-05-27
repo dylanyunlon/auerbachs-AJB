@@ -1,0 +1,24 @@
+[submodule "third_party/cxxopts"]
+	path = third_party/cxxopts
+	url = https://github.com/jarro2783/cxxopts.git
+[submodule "third_party/moderngpu"]
+	path = third_party/moderngpu
+	url = https://github.com/moderngpu/moderngpu.git
+[submodule "third_party/randomdist"]
+	path = third_party/randomdist
+	url = https://github.com/llersch/cpp_random_distributions.git
+[submodule "third_party/tabulate"]
+	path = third_party/tabulate
+	url = https://github.com/p-ranav/tabulate.git
+[submodule "third_party/termcolor"]
+	path = third_party/termcolor
+	url = https://github.com/ikalnytskyi/termcolor.git
+[submodule "third_party/thrust"]
+	path = third_party/thrust
+	url = https://github.com/NVIDIA/thrust.git
+[submodule "third_party/zipiterator"]
+	path = third_party/zipiterator
+	url = https://github.com/dpellegr/ZipIterator.git
+[submodule "third_party/csvparser"]
+	path = third_party/csvparser
+	url = https://github.com/vincentlaucsb/csv-parser.git
