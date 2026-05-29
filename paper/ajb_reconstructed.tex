@@ -638,8 +638,115 @@ risking buffer overflow and violating the high-probability tail condition that
 guarantees a non-overflowing merge path.
 
 %=============================================================================
-% Sections 4 (Experimental Design) and 5 (Evaluation) are left for subsequent
-% Claudes per the development plan. Symbol mapping is fixed in ajb_mapping.txt.
+\section{Experimental Design}
+\label{sec:experimental_design}
+%=============================================================================
+% Claude-3 (M051-M075): Section 4 + Section 5 lead-in.
+% Template anchor: \section{Experimental Design} in
+%   template_extraction_des_loc_reconstructed_EN.tex
+% Mapping: RQ1-RQ6 re-grounded on relation-resident structures; CLXX/CLXXIV=
+%   13B-tuple scale; CLX=chunk cap rho; CLXIII=K_x=256; CLXVII=A6000x2 + H100 NVL
+%   + CPU host; CLIV=2x; CXLV=skew-adaptive host re-balancer; CXLVII=random-order
+%   merge-path enumeration. Metrics: end-to-end join time, slow-tier byte volume,
+%   relative structure drift, output cardinality (correctness).
+
+Our experimental evaluation addresses the following research questions:
+\begin{description}[nosep,leftmargin=*]
+\item[RQ1] Do the theoretical drift rates (Section~\ref{sec:timescales})
+  predict the empirical evolution of the relation-resident structures across
+  device-local chunks?
+\item[RQ2] How does the cross-tier transfer period of each structure class---
+  build partitions, merge-path boundaries, materialization buffers---impact
+  end-to-end join time?
+\item[RQ3] To what extent can AJB reduce slow-tier byte volume relative to the
+  uniform-cadence P2P join in practical join configurations?
+\item[RQ4] How does AJB scale with increasing relation size and toward
+  out-of-core, billion-tuple joins?
+\item[RQ5] How does the join perform when a skew-adaptive host re-balancer
+  replaces plain multiway-merge averaging?
+\item[RQ6] Is the decoupled transfer schedule compatible with non-sort-merge
+  build phases, including a random-order merge-path enumeration variant?
+\end{description}
+
+%-----------------------------------------------------------------------------
+\subsection{Experimental Setup}
+\label{sec:experimental_setup}
+%-----------------------------------------------------------------------------
+
+\paragraph{Relations and data.}
+We join a build relation $R$ against a probe relation $S$ of $8$-byte
+key/$8$-byte payload tuples, generated under controlled key distributions. We
+distinguish the per-device chunk size $B_w$---capped at a fixed fraction of free
+device memory---from the global input $B = \sum_{m=0}^{M-1} B_w$ resident across
+the $M$ devices. Inputs range from $1$\,B to $13$\,B tuples and are sampled under
+both a uniform key distribution and a Zipfian distribution with skew parameter
+$\theta$ controlling the fraction of tuples falling in the hottest key range,
+following the generator conventions of the multi-GPU join
+benchmark~\citep{maltry2025multigpu}. Match selectivity is fixed by a target
+output cardinality so that the materialization volume is comparable across
+distributions. Foreign-key and many-to-many join variants---in which a single
+hot key fans out to a large materialized range---are reported in the appendix.
+
+\paragraph{Join configurations.}
+We employ a sort-merge build phase backed by parallel CPU
+sorting~\citep{kim2009sortvshash} and a hybrid-radix build phase that partitions
+on the device, the latter modifying the partitioning rule to remain balanced
+under any key skew. For the $1$\,B-tuple workload we grid-search the chunk-size
+cap, the base transfer period $K_x$, and the device tier assignment; larger
+workloads reuse the resulting configuration. Chunk sizes follow a
+warmup-stable-decay schedule that synchronizes all tiers during the warmup
+horizon before relaxing to the decoupled periods. We favor the hybrid-radix
+build with a slowly drifting buffer-occupancy summary ($\beta_2 = 0.9999$) in
+high-skew regimes, where eager re-partitioning otherwise thrashes the slow tier.
+We also ablate the host re-balancer, comparing plain multiway-merge averaging
+against a skew-adaptive re-balancer that biases boundaries toward dense ranges,
+on the $1$\,B-tuple workload.
+
+\paragraph{Baselines.}
+We compare AJB with: (i)~eager per-level repartitioning, which reshuffles every
+structure across the device boundary at every partitioning level (upper bound on
+balance quality, worst case on slow-tier volume); (ii)~the uniform-cadence
+P2P-enabled multi-GPU join with a single transfer period
+$K$~\citep{maltry2025multigpu}; (iii)~the pin-local heuristic, which fixes every
+structure to the device that first produced it; and (iv)~the periodic-full-reset
+heuristic, which recomputes all boundary structures from scratch after each
+phase. The pin-local heuristic corresponds to AJB with $K_u, K_v = \infty$ and
+constitutes an upper bound on slow-tier efficiency; eager repartitioning
+constitutes an upper bound on partition-balance quality.
+
+\paragraph{Metrics.}
+We evaluate by (i)~end-to-end join time, decomposed into its sort, merge, and
+join phases, and (ii)~per-device asymptotic slow-tier byte volume, assuming a
+bandwidth-optimal peer-to-peer ring for the fast tier and scaling linearly with
+the transferred structure size. We additionally report (iii)~output cardinality,
+which must match the single-device join exactly and serves as our correctness
+check across all transfer cadences. To fairly compare structure evolution across
+drift rates, we measure the \emph{relative} rate of change
+$\|s_{t+K} - s_t\|_2 / \|s_t\|_2$. We report both stepwise (per chunk group) and
+wall-clock convergence to a balanced partitioning. Our hardware consists of a
+single heterogeneous server combining two RTX A6000s (NVLink-bridged fast tier)
+and one H100 NVL with a multi-core CPU host; the cross-tier host link runs at
+$100$\,Gb/s with practical throughput of $60$--$70$\,Gb/s. An analysis of join
+time versus bandwidth appears in the appendix.
+
+%=============================================================================
+\section{Evaluation}
+\label{sec:evaluation}
+%=============================================================================
+
+Our results demonstrate that the relation-resident structures evolve at
+empirically distinct rates governed by their drift constants
+(Section~\ref{sec:rq1}), forming a clear transfer hierarchy
+(Section~\ref{sec:rq2}). AJB reduces slow-tier byte volume by $2\times$ relative
+to the uniform-cadence P2P join (Section~\ref{sec:rq3}), converges robustly to a
+balanced partition under device addition, and scales effectively toward
+billion-tuple joins (Section~\ref{sec:rq4}). The decoupled schedule composes with
+both a skew-adaptive host re-balancer (Section~\ref{sec:rq5}) and a random-order
+merge-path enumeration variant of the build phase (Section~\ref{sec:rq6}).
+
+%=============================================================================
+% Section 5 subsections (RQ1-RQ6) are left for subsequent Claudes per the
+% development plan. Symbol mapping is fixed in ajb_mapping.txt.
 %=============================================================================
 
 \end{document}
