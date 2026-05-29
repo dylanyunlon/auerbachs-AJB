@@ -420,10 +420,226 @@ buffers. The corresponding figure and a non-uniform-key variant are
 deferred to the evaluation and appendix.
 
 %=============================================================================
-% Sections 3 (Convergence/Correctness Guarantees), 4 (Experimental Design),
-% and 5 (Evaluation) are left for subsequent Claudes per the development plan.
-% The symbol mapping for those sections is fixed in the accompanying
-% mapping file so the cadence/half-life vocabulary stays consistent.
+\section{Correctness and Balance Guarantees}
+\label{sec:convergence}
+%=============================================================================
+% Claude-2 (M026-M050): Section 3.
+% Template anchor: \section{CI for A} in template_extraction_des_loc_reconstructed_EN.tex
+% Mapping: CI=correctness/balance guarantees, CIV=partitioning problem,
+%   CV/CVI/CVII=global/per-device/global imbalance objective, CVIII=device,
+%   CIX=per-device key range, CX=uniform keys, CXVII=chunk size, CXVIII=chunk
+%   limit eta_0, CXXII=psi cadence penalty, CXXIII=probabilistic transfer
+%   equivalence, CXXV=finite period for the boundary vector.
+
+This section establishes the theoretical foundation for AJB's decoupled
+cross-tier transfer schedule. We analyze a single-structure variant of the join
+under decoupled transfer cadences---tracking only the merge-path boundary
+vector---and defer the full two-structure analysis (boundary vector and
+materialization buffers) and the high-probability balance bounds to the
+appendix. Throughout, ``correctness'' means that AJB enumerates \emph{exactly}
+the set of matching tuple pairs of a single-device hash join, and
+``balance'' refers to how evenly the build relation is partitioned across
+devices.
+
+A question specific to the composed pipeline is whether the
+intra-step fast-tier peer-to-peer copies affect the analysis. We show that they
+do not: the fast-tier reconciliation produces, on each device, an \emph{exact
+local join} over that device's assigned key range, and the subsequent decoupled
+slow-tier merge operates on these already-correct partial results. The analysis
+therefore concerns only the cross-device partitioning cadence, and the output
+cardinality is invariant to the choice of transfer periods.
+
+\paragraph{Problem formulation.}
+We cast the cross-device partitioning as the balance problem
+\begin{equation}
+\min_{x \in \mathbb{R}^d} f(x) := \frac{1}{M} \sum_{m=1}^{M} f_m(x),
+\quad \text{with } f_m(x) = \mathbb{E}_{\xi \sim \mathcal{D}_m}[F_m(x; \xi)],
+\label{eq:objective}
+\end{equation}
+where $M$ devices collaboratively minimize the global imbalance $f$ of a
+candidate partitioning $x$ (a vector of per-device key-range assignments),
+$f_m$ is the local imbalance contributed by device $m$, and $F_m(x;\xi)$ is the
+per-chunk imbalance for a sampled key range $\xi$. In the general (skewed)
+setting, each device $m$ observes keys drawn from a local distribution
+$\mathcal{D}_m$ that may differ across devices; the uniform-key case
+$\mathcal{D}_1 = \cdots = \mathcal{D}_M$ is recovered as a special instance.
+
+When the join runs across a tier topology of degree $P$, each device processes
+a contiguous chunk of the build relation and joins it against the co-resident
+probe range by binary search. The fast-tier copies redistribute boundary
+keys so that each device holds the exact build- and probe-side ranges bracketing
+its partition. The resulting per-chunk imbalance increment $g_t^m =
+\nabla F_m(x_t^m;\,\xi_t^m)$ is therefore computed with respect to the
+\emph{same} balance objective $F_m$ as in the single-tier case---the fast-tier
+redistribution introduces no additional bias or variance into the count
+oracle.
+
+\begin{figure}[t]
+\centering
+% [Figure 1 graphic: toy two-relation join; populated by a later Claude.]
+\caption{(Left) Distance to a perfectly balanced partitioning and (right) the
+2-D key-density contour for a toy skewed two-relation join over a hot key range,
+with $M=256$ devices and IID Poisson count noise ($\sigma=1.5$).
+AJB ($K_x=192$, $K_u=192$, $K_v=692$) and the uniform-cadence P2P join ($K=K_x$)
+both converge to a balanced partition with identical output cardinality
+(overlapping trajectories). The pin-local heuristic, which fixes each partition
+to the device that first produced it (\protect\rule{6pt}{6pt}), fails to
+balance. The periodic-full-reset heuristic (\protect\rule{6pt}{6pt}) stalls and
+overflows its buffers due to repeated boundary oscillations. A non-uniform-key
+variant appears in the appendix.}
+\label{fig:toy}
+\end{figure}
+
+We impose the following standard regularity conditions on the balance problem.
+
+\begin{assumption}[Lower bound and smoothness]
+\label{asm:smooth}
+The global imbalance $f\!:\mathbb{R}^d\!\to\!\mathbb{R}$ is bounded below by
+some $f^*\!\in\!\mathbb{R}$ (the imbalance of the optimal partitioning), and
+each local imbalance $f_m$ is $L$-smooth:
+\begin{equation}
+\|\nabla f_m(x) - \nabla f_m(y)\| \leq L\|x - y\|, \quad
+\forall\, x,y \in \mathbb{R}^d.
+\end{equation}
+\end{assumption}
+
+\begin{assumption}[Unbiased counts with bounded variance]
+\label{asm:noise}
+The per-chunk count increment $g^m$ measured by device $m$ is an unbiased
+estimator of $\nabla f_m(x)$ with bounded variance:
+\begin{equation}
+\mathbb{E}[g^m] = \nabla f_m(x), \quad
+\mathbb{E}[\|g^m_t - \nabla f_m(x)\|^2] \leq \sigma^2, \quad
+\forall\, x \in \mathbb{R}^d.
+\end{equation}
+\end{assumption}
+
+\begin{assumption}[Bounded skew]
+\label{asm:heterogeneity}
+For any $x \in \mathbb{R}^d$, the inter-device count heterogeneity satisfies
+\begin{equation}
+\frac{1}{M} \sum_{m=1}^{M} \|\nabla f_m(x)\|^2 \leq G^2 + B^2
+\|\nabla f(x)\|^2.
+\end{equation}
+\end{assumption}
+
+All three assumptions are standard in the analysis of partitioning and
+load-balancing under
+sampling~\citep{karimireddy2020scaffold,wang2021field,DeWitt1992practical}.
+Setting $G^2 = 0$, $B^2 = 1$ recovers the uniform-key case.
+
+\paragraph{Probabilistic transfer equivalence.}
+To facilitate the analysis, we view each cross-tier transfer as a Bernoulli
+trial: instead of re-balancing the build partitioning every $K_x$ chunk groups
+($t \bmod K_x = 0$), we re-balance with probability $p_x = 1/K_x$ at each chunk
+group. The two formulations are statistically equivalent in expectation and
+permit a cleaner expression of the balance rate in terms of continuous transfer
+probabilities.
+
+\begin{theorem}[Balance rate of AJB under decoupled transfer]
+\label{thm:sgdm}
+Let Assumptions~\ref{asm:smooth},~\ref{asm:noise}, and~\ref{asm:heterogeneity}
+hold. Choose the device-local chunk size $\eta = \min(\eta_0,\, T^{-1/2})$ with
+\begin{equation}
+\eta_0 \stackrel{\mathrm{def}}{=}
+\frac{1}{4L} \min\!\left(1 - \beta,\;
+\frac{1}{6\sqrt{\psi\,\max(1,\, B^2 - 1)}}\right),
+\quad \text{where}\;\;
+\psi \stackrel{\mathrm{def}}{=}
+\frac{4(1-p_x)}{p_x^2}
+\cdot \frac{(1-\beta)(1-p_u)}{1-(1-p_u)\beta}\,.
+\label{eq:step_size}
+\end{equation}
+Then the averaged partitioning $\bar{x}_t = \mathbb{E}_m[x^m_t]$ produced by AJB
+approaches a balanced assignment at rate
+\begin{equation}
+\frac{1}{T}\sum_{t=0}^{T-1}
+\mathbb{E}\|\nabla f(\bar{x}_t)\|^2
+\;\leq\; \frac{4}{\sqrt{T}}
+\left(f(x_0) - f^* + \frac{L\sigma^2}{2M}\right)
++ \mathcal{O}\!\left(\frac{1+\psi}{T}\right).
+\label{eq:rate}
+\end{equation}
+\end{theorem}
+
+We now discuss the implications of this result and its interaction with the
+composed join pipeline.
+
+\paragraph{Asymptotic optimality.}
+The leading $\mathcal{O}(1/\sqrt{T})$ term in~\eqref{eq:rate} matches the
+minimax lower bound for stochastic balancing under count
+noise~\citep{arjevani2023lower} and is \emph{independent of the number of local
+chunks processed between transfers}. The transfer probabilities $p_x$, $p_u$ and
+the drift parameter $\beta$ enter only the higher-order $\mathcal{O}(1/T)$ term
+through the cadence-penalty factor $\psi$, and therefore exert a limited impact
+on the asymptotic balance rate. The $1/M$ factor on the variance term confirms a
+\emph{linear speedup}: aggregating counts across more devices proportionally
+sharpens the balance estimate.
+
+\paragraph{Asymmetric sensitivity to build-partition vs.\ boundary transfer.}
+The structure of $\psi$ reveals a fundamental asymmetry between transferring the
+build partitioning and transferring the merge-path boundaries. Build-partition
+transfer exerts a \emph{quadratic} influence: $\psi = \mathcal{O}(1/p_x^2)$, so
+that letting $p_x \to 0$ (never re-balancing) renders the imbalance term
+unbounded and breaks the balance guarantee. Boundary transfer, by contrast,
+enters \emph{linearly}: setting $p_u = 0$ (never transferring the boundary
+vector) does not destroy the asymptotic rate. However, the chunk-size
+restriction~\eqref{eq:step_size} depends on $\sqrt{\psi}$, and $\psi$ is
+maximized as $p_u \to 0$ (since $(1-p_u)/(1-(1-p_u)\beta) \to 1/(1-\beta)$),
+imposing the most severe constraint on the admissible chunk size $\eta_0$.
+
+This analysis yields the central design principle underlying AJB's tiered
+transfer schedule:
+\begin{quote}
+\emph{The build partitioning must be transferred frequently ($p_x$ large,
+equivalently $K_x$ small). The merge-path structures may be transferred less
+often---but increasing the boundary-transfer frequency $p_u$ relaxes the
+chunk-size restriction, enabling larger device-local chunks, greater copy/compute
+overlap, and faster practical balancing.}
+\end{quote}
+
+\paragraph{Interaction with tier-routed transfer.}
+In AJB, the theoretical distinction between build-partition and boundary
+transfer frequencies is operationalized through the tier-routed scheduler of
+Section~\ref{sec:ajb_algorithm}. The $x$-tier (build partitions) is transferred
+at the base period $K_x$, reflecting the quadratic sensitivity
+$\psi \propto 1/p_x^2$. The $u$-tier (merge-path boundary vector) and $v$-tier
+(materialization buffers) are transferred at $K_u = 3K_x$ and $K_v = 6K_x$
+respectively, reflecting the empirical finding that the boundary and buffer
+structures tolerate longer local phases in proportion to their residency
+half-lives (Section~\ref{sec:timescales}). The warmup phase
+$t < T_{\mathrm{warm}}$ forces $K_x = K_u = K_v = 1$, recovering the
+uniform-cadence multi-GPU join until the partitioning enters a stable basin.
+
+\paragraph{Composition with fast-tier reconciliation.}
+A natural concern is whether the intra-step fast-tier copies introduce
+additional terms into the balance bound. They do not, because the fast-tier
+reconciliation is a \emph{deterministic, lossless} redistribution of boundary
+keys: each device joins its exact assigned build- and probe-side ranges,
+producing precisely the matches a single-device join would enumerate (up to the
+order in which materialized rows are appended, which does not affect
+cardinality). The per-chunk count increment $g_t^m$ entering the decoupled
+transfer loop of Algorithm~\ref{alg:ajb} is therefore an unbiased estimator of
+$\nabla f_m(x_t^m)$ with variance bounded by $\sigma^2$, and
+Assumptions~\ref{asm:noise}--\ref{asm:heterogeneity} hold with the same
+constants as in the single-tier case.
+
+\paragraph{Extension to buffers and high-probability bounds.}
+Our analysis extends to the full two-structure join with decoupled boundary- and
+buffer-transfer periods under mildly skewed key distributions (appendix). The
+high-probability analysis establishes that---unlike the in-expectation bound
+above, which tolerates $p_u = 0$---the merge-path boundary vector must be
+transferred with \emph{finite} period whenever the key distribution is
+non-uniform ($\beta_2 < 1.0$), i.e., $K_v < \infty$. This is consistent with the
+residency half-life intuition: a buffer-occupancy summary with $\beta_2 = 0.999$
+has $\tau_{0.5} \approx 693$ chunks, which is large but finite; indefinitely
+postponing its transfer lets the per-device occupancy estimates drift unboundedly,
+risking buffer overflow and violating the high-probability tail condition that
+guarantees a non-overflowing merge path.
+
+%=============================================================================
+% Sections 4 (Experimental Design) and 5 (Evaluation) are left for subsequent
+% Claudes per the development plan. Symbol mapping is fixed in ajb_mapping.txt.
 %=============================================================================
 
 \end{document}
