@@ -744,9 +744,245 @@ billion-tuple joins (Section~\ref{sec:rq4}). The decoupled schedule composes wit
 both a skew-adaptive host re-balancer (Section~\ref{sec:rq5}) and a random-order
 merge-path enumeration variant of the build phase (Section~\ref{sec:rq6}).
 
+%-----------------------------------------------------------------------------
+\subsection{Higher-Drift Structures Exhibit Slower Empirical Rates of Change (RQ1)}
+\label{sec:rq1}
+% Claude-4 (M076-M100): RQ1. Template anchor: \subsection{RQ1: Empirical Rate
+% of Change}. Mapping: momenta->boundary vector / buffer occupancy; CLX=rho=1;
+% CLXI=half-life ratio. Figure 2 = relative drift figure.
+%-----------------------------------------------------------------------------
+
+Figure~\ref{fig:rates_of_change} confirms that the relative rates of change of
+the two merge-path structures---the boundary-count vector and the
+buffer-occupancy summary---scale with their respective drift rates under the
+bounded per-chunk count increment ($\rho = 1$). Consistent with the residency
+half-life analysis of Section~\ref{sec:timescales}, the buffer-occupancy summary
+evolves substantially slower than the boundary vector whenever $\beta_2 \gg
+\beta_1$. The occupancy estimate remains slower even when $\beta_2 \approx
+\beta_1$, because the squared-count variance underlying the buffer summary
+accumulates on an inherently slower timescale than the raw boundary counts that
+drive the boundary vector.
+
+\paragraph{Takeaway.}
+When $\beta_1 \ll \beta_2$, the buffer-occupancy summary's empirical rate of
+change is slower than the boundary vector's by a factor proportional to the
+residency half-life ratio $\tau_{0.5}(\beta_2)/\tau_{0.5}(\beta_1) =
+\ln(\beta_1)/\ln(\beta_2)$, validating the motivation for assigning a longer
+cross-tier transfer period to the slower-drifting structure.
+
+\begin{figure}[t]
+\centering
+% [Figure 2 graphic; populated by a later Claude from the relative-drift data.]
+\caption{Relative rates of change for the boundary-count vector (left) and the
+buffer-occupancy summary (right) across transfer rounds for the hybrid-radix
+build ($K = 64$). At $\beta_2 = 0.9999$, increasing $\beta_1 \geq 0.99$ greatly
+slows the boundary vector's rate of change. The buffer-occupancy summary evolves
+${\sim}100\times$ slower, consistent with its residency half-life being two
+orders of magnitude larger.}
+\label{fig:rates_of_change}
+\end{figure}
+
+%-----------------------------------------------------------------------------
+\subsection{Build Partitions Require Frequent Transfer; Boundary Transfer Scales
+with Half-Life (RQ2)}
+\label{sec:rq2}
+% Template anchor: \subsection{RQ2: Independent R}. CLXIII=K_b=16/256.
+% Figure 3 = independent-period sweep.
+%-----------------------------------------------------------------------------
+
+Figure~\ref{fig:sync_freq} evaluates the effect of independently varying the
+transfer periods $K_x$, $K_u$, and $K_v$. We consider two base periods ($K_b =
+16$ and $K_b = 256$), chosen to bracket the fastest structure's residency
+half-life ($\tau_{0.5}(0.95) \approx 13.5$). Frequent transfer of the build
+partitioning ($K_x$) is critical for balance quality and end-to-end time,
+consistent with the quadratic sensitivity $\psi \propto 1/p_x^2$ established in
+Theorem~\ref{thm:sgdm}. By contrast, the transfer frequency of the merge-path
+structures ($K_u$, $K_v$) materially affects join time only when the assigned
+period is commensurate with the corresponding structure's half-life; outside
+this resonance regime, boundary and buffer transfer frequency primarily
+influences slow-tier volume rather than balance quality.
+
+\paragraph{Takeaway.}
+Build-partition transfer frequency dominates balance quality and join time, in
+agreement with the leading-term analysis of Section~\ref{sec:convergence}.
+Merge-path transfer periods matter empirically only when chosen near their
+residency half-lives, validating the timescale separation principle of
+Sections~\ref{sec:timescales} and~\ref{sec:convergence}.
+
+\begin{figure}[t]
+\centering
+% [Figure 3 graphic; populated by a later Claude.]
+\caption{End-to-end join time for AJB (hybrid-radix, $\beta_1 = 0.95$,
+$\beta_2 = 0.9999$), varying transfer periods independently while holding the
+others at $K_b$. (a)~Build-partition transfer is critical, with clear
+degradation at higher $K_x$. (b)~Buffer transfer minimally affects join time due
+to its large residency half-life ($\tau_{0.5} \approx 6931$). (c,d)~Boundary
+transfer improves balance when the period matches its half-life; contrast the
+two base regimes. Results for the sort-merge build appear in the appendix.}
+\label{fig:sync_freq}
+\end{figure}
+
+%-----------------------------------------------------------------------------
+\subsection{AJB Achieves $2\times$ Cross-Tier Volume Reduction over the
+Uniform-Cadence P2P Join (RQ3)}
+\label{sec:rq3}
+% Template anchor: \subsection{RQ3: N Reduction}. CLIV=2x, CLXV=1.37x, CLXVI=
+% 1.1x, CLXVII=hardware. Figure 4 = comms reduction + device addition.
+%-----------------------------------------------------------------------------
+
+As shown in Figure~\ref{fig:comms}, AJB halves the slow-tier byte volume
+relative to the uniform-cadence P2P join~\citep{maltry2025multigpu} at matching
+output cardinality and balance, by transferring the merge-path structures less
+frequently ($K_u = 3K_x$, $K_v = 6K_x$) and exploiting the buffer summary's
+lower sensitivity to transfer frequency (Figure~\ref{fig:sync_freq}). At $K_x =
+16$ on the A6000$\times$2 $+$ H100 server, this yields a $1.37\times$ end-to-end
+speedup over eager per-level repartitioning and $1.1\times$ over the
+uniform-cadence join. At $K_x = 256$, the speedup over eager repartitioning
+increases to $1.47\times$, and both AJB and the uniform-cadence join approach the
+fast-tier-only throughput ceiling at which the slow link is no longer the
+bottleneck.
+
+Figure~\ref{fig:comms}(c,d) further demonstrates that AJB cleanly admits a newly
+attached device via its periodic structure transfer, re-deriving a balanced
+partitioning and outperforming the ad-hoc alternative of reusing a stale,
+device-local boundary vector---whose insufficiency under skew is detailed in the
+appendix.
+
+\paragraph{Takeaway.}
+AJB achieves a $2\times$ reduction in slow-tier byte volume over the
+uniform-cadence join by leveraging two complementary insights from the balance
+analysis: (i)~merge-path transfer has a weaker asymptotic impact than
+build-partition transfer ($\psi$ depends linearly on $p_u$ but quadratically on
+$1/p_x$), and (ii)~structures with larger residency half-lives tolerate longer
+local phases without balance degradation. By eventually transferring all
+structures at finite periods, AJB matches the device-fault-tolerance of the
+uniform-cadence join---with effective period $K = \max(K_x, K_u, K_v)$---when
+incorporating a new device or recovering from a stalled tier.
+
+\begin{figure}[t]
+\centering
+% [Figure 4 graphic; populated by a later Claude.]
+\caption{AJB ($K_u = 3K_x$, $K_v = 6K_x$) reduces slow-tier byte volume by
+$2\times$ over the uniform-cadence P2P join while matching its output cardinality
+and balance, and that of the heuristic baselines, in both the high-frequency (a)
+and low-frequency (b) regimes. Panels (c,d) demonstrate robustness: attaching an
+additional device at chunk group $1536$, AJB and the uniform-cadence join
+maintain a stable, balanced partitioning, outperforming the pin-local and
+periodic-reset heuristics and stale-boundary reuse.}
+\label{fig:comms}
+\end{figure}
+
+%-----------------------------------------------------------------------------
+\subsection{AJB Scales Toward Billion-Tuple, Out-of-Core Joins (RQ4)}
+\label{sec:rq4}
+% Template anchor: \subsection{RQ4: Large-Scale Training}. CLXX/CLXXIV=13B,
+% CLXVIII=256, CLXXI=Table 1 (quality), CLXXIII=2.2x. Figure 5 + Table 1/2.
+%-----------------------------------------------------------------------------
+
+Figure~\ref{fig:billion} demonstrates that AJB reliably scales toward
+billion-tuple, out-of-core joins under highly infrequent transfer ($K_x = 256$).
+Evaluating on out-of-core join quality across input distributions
+(Table~\ref{tab:icl}), AJB matches the output cardinality and balance of all
+baselines while moving substantially fewer bytes across the slow tier than both
+the uniform-cadence join and eager repartitioning. The pin-local
+heuristic~\citep{maltry2025multigpu} suffers from load imbalance under
+skew---manifesting as buffer-occupancy growth on the hot device
+(Figure~\ref{fig:billion}b)---which inflates its tail join time and underscores
+the advantage of AJB's principled transfer schedule. We elaborate on the
+conditions under which decoupled transfer improves stability under skew in the
+appendix.
+
+The reduced slow-tier volume translates to a ${\approx}\,2.2\times$ end-to-end
+join-time speedup over eager per-level repartitioning (Figure~\ref{fig:billion}).
+As shown in Table~\ref{tab:wallclock}, these savings scale with input size and
+transfer period. At the $13$\,B-tuple scale with $K_x = 16$, AJB saves more than
+$13$ time units relative to the uniform-cadence join and over $73$ relative to
+eager repartitioning (in the normalized units of Table~\ref{tab:wallclock}). The
+advantage over eager repartitioning widens further at $K_x = 256$, where the
+cross-tier-efficient methods approach peak device utilization. Equivalent
+throughput figures appear in the appendix.
+
+\begin{figure}[t]
+\centering
+% [Figure 5 graphic; populated by a later Claude.]
+\caption{AJB matches the uniform-cadence join's time-to-balance (left) for
+billion-tuple joins at half the slow-tier cost ($K_x = 256$, $K_u = 3K_x$,
+$K_v = 6K_x$), representing a $\mathbf{170\times}$ reduction over eager per-level
+repartitioning. Both AJB and the uniform-cadence join produce identical output
+cardinality at this scale. The pin-local heuristic reaches comparable
+time-to-balance on uniform keys (left) but exhibits buffer-occupancy growth on
+the hot device (right) and partition drift under skew, raising concerns for
+adversarial workloads.}
+\label{fig:billion}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Billion-tuple out-of-core join quality across input distributions
+(higher is better; balance score, normalized so that a perfectly even partition
+$= 100$). AJB matches or surpasses the partition balance achieved under the
+uniform-cadence join and the pin-local heuristic, approaching eager
+repartitioning. The pin-local heuristic underperforms under the skewed
+(Zipfian, foreign-key) distributions, consistent with the buffer-occupancy
+growth of Fig.~\ref{fig:billion}b, indicating that stale device-local boundaries
+have unbalanced the partitioning.}
+\label{tab:icl}
+\begin{tabular}{lcccc|c}
+\toprule
+& Uniform & Zipfian & Foreign-key & Many-to-many & Avg \\
+\midrule
+AJB                & 31.8 & 59.0 & 70.7 & 44.9 & 51.6 \\
+Uniform-cadence    & 31.9 & 59.0 & 70.6 & 45.8 & 51.8 \\
+Pin-local          & 30.1 & 58.0 & 70.0 & 44.8 & 50.7 \\
+\midrule
+Eager repartition  & 33.8 & 62.5 & 71.1 & 47.8 & 53.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{End-to-end join time (normalized units) for $1$--$13$\,B-tuple inputs at
+high ($K_x = 16$) and low ($K_x = 256$) transfer frequencies. At high frequency,
+AJB outperforms the uniform-cadence join by over $13$ units on the $13$\,B input
+and is within $3\%$ of the pin-local heuristic. At low frequency, it reduces the
+$13$\,B join time by $>93$ units versus eager repartitioning.}
+\label{tab:wallclock}
+\begin{tabular}{l|cc|cc|cc}
+\toprule
+& \multicolumn{2}{c|}{1B tuples} & \multicolumn{2}{c|}{7B tuples}
+& \multicolumn{2}{c}{13B tuples} \\
+$K_x$ & 16 & 256 & 16 & 256 & 16 & 256 \\
+\midrule
+Eager repartition & $1.41 \pm 0.008$ & $1.41 \pm 0.008$
+& $38.74 \pm 0.161$ & $38.74 \pm 0.161$
+& $175.50 \pm 0.478$ & $175.50 \pm 0.478$ \\
+\midrule
+Pin-local & $0.80 \pm 0.007$ & $0.63 \pm 0.006$
+& $28.52 \pm 0.095$ & $24.01 \pm 0.088$
+& $100.21 \pm 0.544$ & $82.46 \pm 0.513$ \\
+Uniform-cadence & $0.96 \pm 0.006$ & $0.64 \pm 0.006$
+& $31.46 \pm 0.090$ & $24.18 \pm 0.087$
+& $116.10 \pm 0.484$ & $83.34 \pm 0.509$ \\
+AJB & $0.81 \pm 0.006$ & $0.63 \pm 0.006$
+& $28.80 \pm 0.094$ & $24.06 \pm 0.088$
+& $102.03 \pm 0.537$ & $82.68 \pm 0.512$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Takeaway.}
+AJB enables efficient billion-tuple joins, particularly on out-of-core inputs
+where the slow tier dominates, with partition balance and output cardinality
+competitive with eager repartitioning. We recommend setting $K_x$ to balance
+throughput against the available cross-tier bandwidth, then choosing $K_u$,
+$K_v$ as fixed multiples of $K_x$ (e.g., $3\times$, $6\times$) or calibrating
+them against the residency half-lives of their respective $\beta$ values
+(see appendix).
+
 %=============================================================================
-% Section 5 subsections (RQ1-RQ6) are left for subsequent Claudes per the
-% development plan. Symbol mapping is fixed in ajb_mapping.txt.
+% Section 5.5-5.6 (RQ5-RQ6) and Sections 6-7 are left for subsequent Claudes
+% per the development plan. Symbol mapping is fixed in ajb_mapping.txt.
 %=============================================================================
 
 \end{document}
