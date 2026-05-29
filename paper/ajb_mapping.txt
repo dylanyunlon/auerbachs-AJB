@@ -1,0 +1,144 @@
+%================================================================================
+% Auerbachs-AJB Template Mapping (Claude-1, M001-M025)
+% Source skeleton: template_extraction_des_loc_reconstructed_EN.tex
+% Target domain:    Bandwidth-tier-adaptive hash join on heterogeneous GPU
+%                   interconnects (NVLink fast tier / PCIe slow tier + CPU host)
+% Upstream code:    multi-gpu-sort-merge-join (VLDB'25) + joinrenum
+%
+% RULE: this file fixes the symbol -> concept correspondence so Sections 3/4/5
+% (later Claudes) stay consistent with Sections 1/2 (this Claude). Concepts are
+% named by ROLE, never by source-file name (academic register).
+%================================================================================
+
+% ---- Latin uppercase A-Z ----
+% A  = AJB (the proposed adaptive-join family)
+% B  = the uniform-cadence base join (hybrid sort-merge / hybrid-radix)
+% C  = eager per-level repartitioning (the "DDP-equivalent": reshuffle at every boundary)
+% D  = multi-GPU join pipeline / system
+% E  = framework
+% F  = independent transfer-period strategy
+% G  = (Independent Cross-Tier Transfer Periods)
+% H  = uniform-cadence P2P-enabled multi-GPU join (the "Local Adam" analogue, state-of-the-art baseline)
+% I  = cross-tier structure-transfer logic
+% J  = build partitioning (the "parameters" analogue: x)
+% K  = (partition / re-balance) update
+% L  = build-partition transfer
+% M  = merge-path structures (the "momenta" analogue: boundary vector u, buffers v)
+% N  = cross-tier (slow-link) byte volume / data-movement cost
+% O  = once-only host-side partitioning (the "Local SGD" analogue)
+% P  = peer-to-peer copy (fast-tier transfer; the "AllReduce" analogue)
+% Q  = probabilistic periodic transfer (p_x = 1/K_x)
+% R  = transfer period (K_x, K_u, K_v)
+% S  = device (GPU/accelerator participating in the join)
+% T  = coupling (of structures forced to one cadence)
+% U  = decoupling / desync (of transfer cadences)
+% V  = tiers
+% W  = key-count increment / per-chunk delta (the "gradient" analogue: g_t)
+% X  = chunk-size cap mechanism (the "clipping" analogue)
+% Y  = radix-partitioning build variant (the "ADOPT" analogue, alternative base)
+% Z  = encapsulation (planning pass)
+
+% ---- Greek (lowercase mechanism vocabulary, mirrors template) ----
+% alpha = initialization / admission (of a new device)
+% beta  = variant
+% gamma = management
+% delta = module
+% epsilon = configuration knobs (beta1, beta2, chunk cap rho)
+% zeta  = callback/hook (transfer trigger)
+% eta_var = instance
+% theta = chunk-size schedule (WSD-style warmup-stable-decay over chunk groups)
+% iota  = concrete join implementation (subclass)
+% kappa = caller / query planner
+% lambda = inheritance
+% mu    = method
+% nu    = warmup
+% xi    = argument / per-device sample range
+% omicron = unified
+% pi    = encapsulation (same as Z)
+% rho_var = host re-balancer helper
+% sigma = per-coordinate / per-range
+% tau   = chunk-size cap (clip)
+% upsilon = data (tuples)
+% phi   = pipeline flow
+% chi   = config
+% psi_var = strategy
+% omega = structure state (partition placement)
+
+% ---- Roman numerals (fast-tier transfer + scheduler vocabulary) ----
+% I    = cross-tier transfer
+% II   = peer-to-peer fabric (NVLink/NVSwitch ring), the "Ring-AllReduce" analogue
+% III  = lightweight
+% IV   = transfer round
+% V    = staging buffer
+% VI   = device ID
+% VII  = distributed / multi-tenant
+% VIII = tracking
+% IX   = reconciliation operations (cross-device merge)
+% X    = join pipeline loop
+% XI   = chunk-group index t
+% XII  = transfer scheduler
+% XIII = mod operation (t mod K)
+% XIV  = P2P channel
+% XV   = link/connection
+% XVI  = residency half-life
+% XVII = awareness
+% XVIII = adaptive transfer-frequency tuning
+% XIX  = tau_0.5(beta)
+% XX   = drift / decay rate
+% XXI  = merge-path structure state
+% XXII = decoupling
+% XXIII = lifecycle
+% XXIV = half-life formula tau_psi(beta)=ln(psi)/ln(beta)
+% XXV  = slow-tier send
+% XXVI = transfer threshold
+% XXVII = stall (slow-link wait)
+% XXVIII = high-frequency
+% XXIX = staging / cache
+% XXX  = device memory
+% XXXI = OOM (device-memory overflow)
+% XXXII = slow interconnect tier (PCIe/host)
+
+% ---- Correctness theory (CI-CXXV), re-grounded for the join ----
+% CI    = correctness guarantees (the "convergence guarantees" analogue)
+% CII   = skewed / non-uniform key distribution (the "non-convex" analogue)
+% CIII  = mildly-skewed (the "weakly convex" analogue)
+% CIV   = partitioning problem (the "optimization problem" analogue)
+% CV    = global balance objective f
+% CVI   = per-device local imbalance f_m
+% CVII  = global imbalance f
+% CVIII = device/machine (M of them)
+% CIX   = per-device key range D_m
+% CX    = uniform key distribution (the "homogeneous" analogue)
+% CXI   = skew (heterogeneity analogue)
+% CXII  = lower bound f* (best achievable imbalance)
+% CXIII = L-smoothness of the balance objective
+% CXIV  = unbiased per-chunk count estimate
+% CXV   = bounded count variance sigma^2
+% CXVI  = bounded skew (G^2, B^2)
+% CXVII = device-local chunk size (the "step size" analogue: eta)
+% CXVIII = chunk-size limit eta_0
+% CXIX  = asymptotically optimal
+% CXX   = leading term O(1/sqrt(T))
+% CXXI  = higher-order term O(1/T)
+% CXXII = psi factor (cadence penalty)
+% CXXIII = probabilistic transfer equivalence (p_x = 1/K_x)
+% CXXIV = linear speedup in device count (1/M)
+% CXXV  = finite transfer period (required for boundary vector when keys non-uniform)
+
+% ---- Experimental-design + evaluation symbols (Sections 4-5, later Claudes) ----
+% CLX    = chunk-cap radius rho (= 1.0 normalized)
+% CLXIII = base transfer period K_x = 256 (slow-tier-friendly)
+% CLXVII = the heterogeneous server: 2x RTX A6000 + 1x H100 NVL + CPU host
+% CLXX   = largest scale: 13B tuples (mapped from the template's 1.7B "model size")
+% CLXXIV = 13B-tuple scale
+% CLIV   = 2x (slow-tier volume reduction vs uniform-cadence P2P join H)
+% (170x  = vs eager per-level repartitioning C; carried as a literal)
+% CXLV   = skew-adaptive host re-balancer (the "Nesterov outer optimizer" analogue)
+% CXLVII = random-order merge-path enumeration (the "Muon inner optimizer" analogue),
+%          drawn from joinrenum
+%
+% Literal anchors carried from the upstream VLDB'25 result (kept as facts, not
+% re-derived here): up to 15.2x vs parallel CPU sort-merge, 5.5x vs CPU radix-hash,
+% 8.7x vs non-P2P multi-GPU sort-merge, 2.5x vs non-P2P hybrid-radix,
+% up to 14.4x on pre-sorted inputs, ~12% shorter on skewed data.
+%================================================================================

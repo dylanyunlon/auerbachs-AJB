@@ -1,0 +1,429 @@
+%=============================================================================
+% Auerbachs-AJB: Adaptive Hash Join on Mixed-Bandwidth GPU Interconnects
+% Template fill of: template_extraction_des_loc_reconstructed_EN.tex
+% Source domain: upstream/multi-gpu-sort-merge-join (VLDB'25) +
+%                upstream/joinrenum (random-order enumeration)
+% Hardware:      2x RTX A6000 + 1x H100 NVL + multi-core CPU host
+%
+% Claude-1 (M001-M025): Title + Abstract + Section 1 (Introduction)
+%                        + Section 2 (AJB System / Algorithm)
+% NOTE on register: this is an academic systems paper. Mechanisms are named
+% by their role (e.g. "tier-routed transfer scheduler", "merge-path partition
+% boundaries"), never by source-file names. The convergence/cadence vocabulary
+% is inherited 1:1 from the template skeleton and re-grounded in the join domain.
+%=============================================================================
+\documentclass{article}
+
+% --- preamble assumed to match the project shell (algorithm, algorithmic,
+%     amsmath, amsthm, enumitem, natbib); declared here only for standalone
+%     compilation checks. Later Claudes inherit the real preamble. ---
+\usepackage{amsmath,amsthm,amssymb}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage[numbers]{natbib}
+\newtheorem{assumption}{Assumption}
+\newtheorem{theorem}{Theorem}
+
+\title{Auerbachs-AJB: Bandwidth-Tier-Adaptive Hash Joins with
+Decoupled Cross-Tier Transfer on Heterogeneous GPU Interconnects}
+
+\author{%
+Anonymous Authors\\
+\\
+Submitted to the build sandbox; provenance recorded honestly.%
+}
+
+\begin{document}
+\maketitle
+
+%=============================================================================
+% ABSTRACT
+%=============================================================================
+\begin{abstract}
+Scaling relational joins to billion-tuple inputs on multi-GPU servers is
+\emph{interconnect-limited}. Production-grade multi-GPU joins assume a single,
+uniform peer-to-peer fabric (NVLink or NVSwitch) and repartition the build and
+probe relations across devices \emph{eagerly}, at every partitioning boundary;
+on the heterogeneous interconnects that dominate commodity servers---where a
+fast NVLink island coexists with PCIe-attached accelerators and a CPU host---
+this uniform-cadence repartitioning saturates the slowest link and dominates
+end-to-end runtime. Heuristic remedies that pin partitions to whichever device
+first materialized them avoid cross-tier traffic but forfeit load balance and
+become unstable under data skew; conversely, repartitioning every structure at a
+single global cadence is robust but multiplies the volume crossing the slow tier.
+We propose \emph{Auerbachs-AJB} (AJB), a family of adaptive hash joins that
+assigns \emph{independent transfer periods} to the three relation-resident
+structures of a sort-merge / hybrid-radix join---the sorted build partitions,
+the merge-path partition boundaries, and the materialization buffers---enabling
+lower cross-tier volume while preserving the join's correctness and its
+output cardinality. Our analysis shows that while the build-partition transfer
+cadence dominates the asymptotic balance of the join, bounded-staleness
+correctness requires at least infrequent transfer of the merge-path boundaries;
+furthermore, we show that more frequent boundary transfer permits larger
+device-local chunk sizes and thus higher overlap of copy and compute. On a
+server combining two RTX A6000s, one H100 NVL, and a multi-core CPU host, AJB
+moves up to $170\times$ fewer bytes across the PCIe tier than uniform-cadence
+multi-GPU repartitioning and $2\times$ fewer than the strongest non-P2P-aware
+baseline, yielding $1.3$--$2.1\times$ end-to-end speedups for $1$--$13$\,B-tuple
+joins on a $100$\,Gb/s host link. Unlike the pin-local heuristic, AJB tolerates
+the loss or stall of an individual device, offering a scalable, efficient, and
+fault-tolerant join for heterogeneous accelerator platforms.
+\end{abstract}
+
+%=============================================================================
+\section{Introduction}
+\label{sec:introduction}
+%=============================================================================
+
+% --- Paragraph 1: Background ---
+% template: distributing optimization across S / frequent W N in standard C
+%           / Local SGD averaging J after K>>1 steps / adaptive optimizers
+%           with additional momenta
+Executing large relational joins efficiently requires distributing the work
+across accelerators for improved memory capacity and instruction
+throughput~\citep{paul2021revisiting,sioulas2019hardware}. However, the
+\emph{eager cross-device repartitioning} performed by standard multi-GPU joins
+imposes substantial data-movement overhead and limits scalability, particularly
+on heterogeneous servers where devices joined by asymmetric interconnect
+bandwidth---a fast NVLink island alongside PCIe-attached accelerators and a CPU
+host---must all participate in the same shuffle. Early out-of-core join
+strategies~\citep{kim2009sortvshash,balkesen2013multicore} reduced this overhead
+by moving each tuple across the device boundary \emph{only once}, after a single
+host-side partitioning pass, rather than reshuffling at every level of the join
+pipeline. However, modern multi-GPU sort-merge and hybrid-radix
+joins~\citep{maltry2025multigpu,rui2020efficient} maintain several additional
+\emph{relation-resident structures} beyond the input keys---a set of sorted
+build partitions, a vector of merge-path partition boundaries, and a bank of
+materialization buffers---each of which must also be kept consistent across
+devices, and each of which contributes to the cross-tier transfer bill.
+
+% --- Paragraph 2: Problems with existing methods ---
+% template: extensions of Local SGD that only average parameters / three
+%           challenges: no guarantees, keeping states local accumulates noise
+%           with no re-init, re-initializing destabilizes
+Some multi-GPU joins extend the once-only partitioning idea by keeping every
+structure pinned to whichever device first produced it, which poses three
+difficulties. First, the resulting placement has no correctness or
+load-balance guarantee under skew: a single hot key can pin an unboundedly large
+build partition to one device. Second, keeping the merge-path boundaries
+device-local accumulates a stale, locally computed view of the global key
+distribution and provides no mechanism to re-derive a balanced partitioning when
+a new device is added, rendering such schemes unsuitable for failure-prone
+multi-tenant clusters. Third, recomputing the boundaries from scratch on every
+device after each phase destabilizes the pipeline, since even a brief divergence
+in the boundary vector can desynchronize the two relations' merge paths and
+silently corrupt the join's output cardinality.
+
+% --- Paragraph 3: Local Adam's problem ---
+% template: Local Adam proves periodic sync converges faster, robust to new
+%           workers, BUT syncs all states uniformly, tripling N
+The state-of-the-art P2P-enabled multi-GPU join~\citep{maltry2025multigpu}
+addresses these difficulties by transferring all three structures together at a
+single uniform partitioning cadence, which is provably balanced and robust to
+the addition of new devices. However, by reshuffling the build partitions, the
+boundary vector, and the materialization buffers \emph{at the same period}, it
+moves roughly three times the payload of a once-only partitioning across the
+device boundary---a penalty that falls entirely on the slowest interconnect tier
+when the fabric is heterogeneous. Hence, we aim to answer the following question:
+
+\begin{center}
+\emph{Can independently scheduling the cross-tier transfer of the build
+partitions and the merge-path structures improve interconnect efficiency for
+multi-GPU joins while preserving join correctness and device fault-tolerance
+on heterogeneous accelerator platforms?}
+\end{center}
+
+% --- Paragraph 4: DES-LOC proposal ---
+% template: we propose A, sets independent R for J and M, reduces N by syncing
+%           M less frequently
+As a result of our inquiry, we propose a new join family, \textbf{AJB}, which
+assigns independent cross-tier transfer periods to the build partitions and to
+the merge-path structures. This reduces the volume crossing the slow tier by
+transferring the slowly evolving structures---the merge-path boundaries and the
+materialization buffers---less frequently than the build partitions themselves.
+
+% --- Contributions ---
+% template enumerate: Provable convergence / N reduction / Scalability /
+%                     Hardware robustness
+\paragraph{Contributions.}
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Provable correctness under decoupled cadences.}
+    We prove (Section~\ref{sec:convergence}) that AJB produces exactly the
+    output of a single-device hash join under: an in-expectation balance
+    guarantee for the merge-path partitioning, and a bounded-staleness
+    correctness guarantee for the boundary vector. Our analysis indicates that a
+    higher build-partition transfer frequency permits larger device-local chunk
+    sizes; furthermore, high-probability balance bounds demand that the
+    merge-path boundaries be transferred with a \emph{finite} period whenever the
+    key distribution is non-uniform.
+
+    \item \textbf{Cross-tier volume reduction.}
+    We empirically show that the build partitions require more frequent
+    cross-tier transfer than the merge-path structures, and that transferring the
+    latter less often reduces the slow-tier byte volume ($2\times$ versus the
+    uniform-cadence P2P join and $170\times$ versus eager per-level
+    repartitioning), yielding $1.3$--$2.1\times$ reductions in end-to-end join
+    time on our heterogeneous hardware.
+
+    \item \textbf{Scalability to billion-tuple joins.}
+    We validate AJB on joins of up to $13$\,B tuples, demonstrating output
+    cardinality and selectivity competitive with both the uniform-cadence P2P
+    join and eager repartitioning, while scaling with the number and generation
+    of attached devices.
+
+    \item \textbf{Hardware robustness.}
+    Unlike the pin-local heuristic, AJB never persists a device-local
+    partitioning of the merge-path structures, enabling it to absorb a newly
+    added or recovered device---and to tolerate the stall of one tier---making it
+    suitable for platforms prone to device failure.
+\end{enumerate}
+
+%=============================================================================
+\section{Auerbachs-AJB}
+\label{sec:ajb}
+%=============================================================================
+
+We begin by reviewing the basis for \emph{decoupled cross-tier transfer
+cadences} in heterogeneous-interconnect joins, then describe how AJB composes
+this mechanism with the three-phase sort--merge / hybrid-radix join pipeline.
+
+\subsection{Separation of Structure Timescales}
+\label{sec:timescales}
+
+% --- Paragraph 1: Half-life theory (drift recurrences) ---
+% template: characterize rate of change of optimizer states vs Local Adam;
+%           Adam EMA update u_t, v_t; convergence contingent on (1-beta2)
+We start by characterizing how quickly each relation-resident structure
+\emph{drifts} across a sequence of local partitioning steps, and how this rate of
+change can be exploited to lower cross-tier traffic. Consider the running
+summaries a hybrid join maintains over a window of $K$ device-local chunks: a
+boundary estimate $u_t$ that tracks the cumulative key density along the merge
+path, and a buffer-occupancy estimate $v_t$ that tracks how full the
+materialization banks are,
+\begin{equation}
+u_t = \beta_1\, u_{t-1} + (1-\beta_1)\, g_t
+\quad\text{and}\quad
+v_t = \beta_2\, v_{t-1} + (1-\beta_2)\, g_t \odot g_t,
+\label{eq:ema}
+\end{equation}
+where $g_t$ is the per-chunk key-count increment. For the uniform-cadence P2P
+join, a correct (non-overflowing) merge path is contingent on the
+buffer-occupancy decay satisfying $1-\beta_2 = \tilde{O}(K^{-3/2}R^{-1/2})$,
+where $R$ is the number of partitions: a long local window $K$ or many partitions
+$R$ forces $\beta_2 \to 1$, and conversely a larger $\beta_2$---a more slowly
+filling buffer---permits a longer local window before a cross-tier transfer is
+required.
+
+% --- Paragraph 2: Half-life measure ---
+% template: tau_psi(beta) = ln psi / ln beta; use tau_0.5; values for 0.95,
+%           0.999, 0.9999
+A useful summary measure is the number of local chunks until a structure's
+running estimate decays to a fraction $\psi$ of an injected perturbation,
+$\tau_\psi(\beta) = \frac{\ln \psi}{\ln \beta}$. We use the
+\emph{residency half-life} $\tau_{0.5}$ as our primary measure: it is the number
+of device-local chunks a structure can remain tier-local before half of its
+content must, in expectation, have crossed to another tier. For representative
+decay rates, $\tau_{0.5}(0.95) \approx 13.5$, $\tau_{0.5}(0.999) \approx 692.8$,
+and $\tau_{0.5}(0.9999) \approx 6931$, spanning the fast-drifting build
+partitions through the near-static buffer-occupancy summary.
+
+% --- Paragraph 3: Drift bounds (clipping -> bounded per-step change) ---
+% template: with clipping each gradient component <= rho; unrolling Adam over
+%           K steps gives ||u_{t+K}-u_t||_inf <= 2 rho (1-beta1^K), etc.
+Because each device-local chunk contributes a bounded number of tuples---the
+chunk size is capped by available device memory, so each per-chunk increment
+satisfies $|(g_t)_i| \leq \rho$---unrolling the recurrences in
+Eq.~\eqref{eq:ema} over $K$ local chunks bounds the total drift of each summary
+between two cross-tier transfers:
+\begin{align}
+\|u_{t+K} - u_t\|_\infty &\leq 2\rho\,(1 - \beta_1^{K}),
+\label{eq:drift_u}\\
+\|v_{t+K} - v_t\|_\infty &\leq 2\rho^2\,(1 - \beta_2^{K}).
+\label{eq:drift_v}
+\end{align}
+The boundary estimate, which aggregates raw counts, drifts linearly in the
+clip radius $\rho$; the buffer-occupancy estimate, which aggregates squared
+counts, drifts quadratically but decays far more slowly.
+
+% --- Paragraph 4: Sync frequency and half-life ---
+% template: half-life of a state should inform its sync period; example
+%           tau_0.5(0.95)=13.5, K=256, sync affects few initial local steps
+Equations~\eqref{eq:drift_u}--\eqref{eq:drift_v} imply that the residency
+half-life of a structure should inform its transfer period. For example, when a
+fast-drifting build summary has $\tau_{0.5}(0.95) \approx 13.5$ but the
+configured transfer period is $K = 256$, a cross-tier transfer changes only the
+first few local chunks' view of the partitioning and is then dominated by
+local drift---wasting slow-tier bandwidth on a structure that has long since
+diverged. Matching the period to the half-life is therefore the core
+design lever AJB exposes.
+
+%-----------------------------------------------------------------------------
+\subsection{AJB Algorithm}
+\label{sec:ajb_algorithm}
+%-----------------------------------------------------------------------------
+
+\begin{algorithm}[t]
+\caption{AJB: Bandwidth-Tier-Adaptive Hash Join with Decoupled Cross-Tier Transfer}
+\label{alg:ajb}
+\begin{algorithmic}[1]
+\REQUIRE Build relation $R$, probe relation $S$;
+  initial build partitioning $x_0$;
+  initial merge-path structures $\{s^j_{-1}\}_{j=1}^{N}$
+  (boundary vector, materialization buffers);
+  per-structure transfer rules $\{\textsc{Update}^j\}_{j=1}^{N}$;
+  partition rule $\textsc{Part}$; host re-balancer $\textsc{HostOpt}$;
+  chunk-size cap $\rho$; chunk schedule $\{\eta_t\}$;
+  $T$ chunk groups; $M$ devices; tier topology $P$;
+  transfer periods $K_x, \{K_j\}_{j=1}^{N}$; warmup horizon $T_{\mathrm{warm}}$
+\ENSURE Joined output $x_T$ with materialized ranges $\{s^j_{T-1}\}_{j=1}^{N}$
+
+\medskip
+\STATE \textbf{Topology-aware planning (executed once):}
+\STATE \hspace{1em} Probe the interconnect to classify device pairs into a
+       fast P2P tier (NVLink) and a slow tier (PCIe / host)
+\STATE \hspace{1em} Stratify the build partitions into transfer tiers by
+       drift rate: dense key ranges $\to$ $x$-tier (fast-drifting);
+       merge-path boundaries $\to$ $u$-tier; materialization buffers $\to$
+       $v$-tier (slow-drifting)
+\STATE \hspace{1em} Size device-local chunks to $0.8\times$ free device memory,
+       capped at $\lceil |R|/M \rceil$ per device
+
+\medskip
+\STATE \textbf{Runtime initialization:}
+\STATE \hspace{1em} Instantiate a tier-routed transfer scheduler with periods
+       $K_x, \{K_j\}_{j=1}^{N}$ and warmup horizon $T_{\mathrm{warm}}$
+\STATE \hspace{1em} For each device $m$: replicate the initial partitioning
+       $x^m_0 \gets x_0$ and structures $s^{j,m}_{-1}\gets s^j_{-1}$
+
+\medskip
+\FOR{$t = 0, \ldots, T-1$}
+  \FOR{all devices $m = 0, \ldots, M-1$ \textbf{in parallel}}
+    \STATE Sort / radix-partition local chunk $t$ on device $m$, then
+           binary-search-join it against the co-resident probe range
+    \STATE $\hat{g}^m_t \gets \mathrm{cap}\!\left(\Delta\text{key-count}(x^m_t),\,\rho\right)$
+           \COMMENT{per-range increment, capped by chunk size}
+    \STATE Transfer fence: drain pending fast-tier P2P copies before any
+           slow-tier transfer begins
+    \FOR{$j = 1$ \TO $N$}
+      \IF{$t < T_{\mathrm{warm}}$ \textbf{or} $t \bmod K_j = 0$}
+        \COMMENT{transfer structure $s^j$ across the tier boundary}
+        \STATE $s^{j,m}_t \gets \textsc{Update}^j\!\left(\mathbb{E}_m[s^{j}_{t-1}],\ \hat{g}^m_t\right)$
+      \ELSE
+        \STATE $s^{j,m}_t \gets \textsc{Update}^j\!\left(s^{j,m}_{t-1},\ \hat{g}^m_t\right)$
+               \COMMENT{local step; cross-tier transfer elided}
+      \ENDIF
+    \ENDFOR
+    \IF{$t < T_{\mathrm{warm}}$ \textbf{or} $t \bmod K_x = 0$}
+      \COMMENT{re-balance and transfer the build partitioning}
+      \STATE $x^m_{t+1} \gets \textsc{Part}\!\left(\textsc{HostOpt}(\mathbb{E}_m[x^m_t]),\ \hat{g}^m_t,\ \eta_t,\ \{s^{j,m}_t\}\right)$
+    \ELSE
+      \STATE $x^m_{t+1} \gets \textsc{Part}\!\left(x^m_t,\ \hat{g}^m_t,\ \eta_t,\ \{s^{j,m}_t\}\right)$
+    \ENDIF
+  \ENDFOR
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+% --- Algorithm 1 prose description ---
+% template: As shown in Algorithm 1, A syncs parameters x and states {s^j} at
+%           state-specific intervals; setting N=2, s1=u, s2=v yields A-Adam
+Motivated by the timescale separation above, we formalize AJB as a join pipeline
+that composes a one-time topology-aware partitioning plan with a runtime
+tier-routed transfer schedule. Algorithm~\ref{alg:ajb} specifies the complete
+procedure. As shown there, AJB transfers the build partitioning $x \in
+\mathbb{R}^d$ and the merge-path structures $\{s^j\}_{j=1}^{N}$ across the tier
+boundary at structure-specific intervals $K_x, \{K_j\}_{j=1}^{N}$. Setting $N =
+2$, $s^1_t = u_t$ (the boundary vector) and $s^2_t = v_t$ (the materialization
+buffers), and instantiating the transfer rules with the running summaries of
+Eq.~\eqref{eq:ema}, yields the concrete \emph{AJB--hybrid} instance evaluated in
+this paper.
+
+\paragraph{Planning phase.}
+The plan is computed once, before any tuple is joined. The interconnect is
+probed to classify every device pair as either a fast peer-to-peer tier or a
+slow PCIe/host tier, and the build partitions are stratified into transfer tiers
+by drift rate: dense, fast-changing key ranges form the $x$-tier and are
+transferred at the base period; the merge-path boundary vector forms the
+$u$-tier; and the materialization buffers, whose occupancy changes slowest, form
+the $v$-tier. Device-local chunk sizes are set to occupy a fixed fraction of free
+device memory and capped at an even share of the build relation, so that each
+per-chunk key-count increment is bounded---the $|(g_t)_i| \leq \rho$ condition
+that Eqs.~\eqref{eq:drift_u}--\eqref{eq:drift_v} rely upon.
+
+\paragraph{Runtime phase.}
+At each chunk group $t$, every device sorts (or radix-partitions) its local
+chunk and immediately joins it against the co-resident probe range by binary
+search---an intra-device step that is always executed because it is required for
+the join's correctness. Upon completion, a \emph{transfer fence} drains any
+pending fast-tier peer-to-peer copies before a slow-tier transfer may begin. This
+fence is essential on heterogeneous fabrics: a device on the fast NVLink island
+may otherwise enter a slow-tier transfer while a peer still has P2P copies in
+flight on a shared link, violating the per-link ordering the runtime assumes and
+risking deadlock. The slow-tier traffic is then gated by the tier-routed
+schedule, with each structure's transfer independently triggered by its assigned
+period:
+\begin{itemize}[nosep,leftmargin=*]
+\item \emph{$x$-tier} (build partitions): transferred every $K_x$ chunk groups.
+\item \emph{$u$-tier} (merge-path boundary vector, whose drift follows the
+  first-moment timescale): transferred every $K_u = 3K_x$ chunk groups.
+\item \emph{$v$-tier} (materialization buffers, whose occupancy follows the
+  second-moment timescale): transferred every $K_v = 6K_x$ chunk groups.
+\end{itemize}
+The ratios $K_u/K_x = 3$ and $K_v/K_x = 6$ approximately reflect the residency
+half-lives of the corresponding summaries: the build partitioning is re-balanced
+at the base rate, while the slowly drifting boundary and buffer structures
+tolerate progressively longer local phases. During the warmup horizon
+$T_{\mathrm{warm}}$, all tiers transfer at every chunk group ($K_x = K_u = K_v =
+1$), recovering the uniform-cadence multi-GPU join for initial stability. Slow-tier
+transfers are dispatched asynchronously on a dedicated copy stream, overlapping
+cross-tier communication with the sort and join compute of the next chunk
+group; full-width key accumulation is applied to the boundary counts before
+transfer, avoiding the biased truncation drift that narrow counters would
+introduce on long key ranges.
+
+\paragraph{Composition guarantee.}
+The two transfer families---intra-step fast-tier P2P copies and inter-step
+slow-tier structure transfers---act along orthogonal axes and compose without
+interference. The fast-tier copies ensure that each device's local join result
+is \emph{complete} for its assigned key range; the decoupled slow-tier schedule
+controls only \emph{how often} devices reconcile their partitionings with one
+another. The correctness analysis of Section~\ref{sec:convergence} applies to
+the join output produced after the fast-tier reconciliation, which is an
+exact enumeration of the matches within each device's range; the AJB transfer
+schedule then governs the cross-device merge cadence of these already-correct
+partial results, and the guarantees carry through unchanged.
+
+\paragraph{Relationship to the base join.}
+The formulation applies generically to hash / sort-merge joins parameterized by
+a partition rule $\textsc{Part}$ over $N$ merge-path structures $\{s^j_{-1}\}_{j=1}^{N}$,
+each transferred by a rule $\textsc{Update}^j$. The chunk-size cap is
+$[\mathrm{cap}(X,\rho)]_i = \mathrm{sgn}(X_i)\cdot\min\{|X_i|,\rho\}$. For a
+provably balanced partitioning, $\textsc{HostOpt}$ reduces to the parallel
+multiway-merge re-balancer on the CPU host; extension to a skew-adaptive host
+re-balancer that biases boundaries toward dense ranges is deferred to the
+appendix. Setting $N = 2$ as above and using the boundary / buffer update rules
+yields AJB--hybrid; the construction also accommodates a radix-partitioning
+build phase and a random-order enumeration variant of the merge path, the latter
+drawing on randomized join enumeration~\citep{chen2023renum} to bound the cost of
+re-deriving balanced boundaries after a device is added.
+
+\paragraph{Illustrative example.}
+To highlight the practical benefit of decoupled transfer, a toy
+two-relation join under skewed, noisy key counts shows AJB and the
+uniform-cadence P2P join both converging to the correct, balanced output, while
+the pin-local heuristic---which fixes each partition to its first device---loses
+load balance and the periodic-full-reset heuristic oscillates and overflows its
+buffers. The corresponding figure and a non-uniform-key variant are
+deferred to the evaluation and appendix.
+
+%=============================================================================
+% Sections 3 (Convergence/Correctness Guarantees), 4 (Experimental Design),
+% and 5 (Evaluation) are left for subsequent Claudes per the development plan.
+% The symbol mapping for those sections is fixed in the accompanying
+% mapping file so the cadence/half-life vocabulary stays consistent.
+%=============================================================================
+
+\end{document}
