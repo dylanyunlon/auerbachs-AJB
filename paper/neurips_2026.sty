@@ -1,0 +1,44 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% neurips_2026.sty  (minimal vendored stub)
+%
+% This is NOT the official NeurIPS style file. It provides just enough to make
+% ajb_reconstructed.tex self-contained and compilable (layout + natbib-based
+% \citep/\citet + a no-op \bibliographystyle{neurips_2026} target). Replace
+% with the official neurips_2026.sty for camera-ready submission.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{neurips_2026}[2026/01/01 minimal vendored NeurIPS-style stub]
+
+% --- options accepted (and ignored) for compatibility with the real style ---
+\newif\if@neuripsfinal\@neuripsfinalfalse
+\newif\if@neuripspreprint\@neuripspreprintfalse
+\DeclareOption{final}{\@neuripsfinaltrue}
+\DeclareOption{preprint}{\@neuripspreprinttrue}
+\DeclareOption{nonatbib}{}
+\DeclareOption*{\PackageWarning{neurips_2026}{Unknown option `\CurrentOption'}}
+\ProcessOptions\relax
+
+% --- page geometry approximating the NeurIPS single-column body ---
+\RequirePackage[letterpaper,margin=1in]{geometry}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.6\baselineskip}
+\widowpenalty=10000
+\clubpenalty=10000
+
+% --- citations: the real style ships a natbib-compatible author-year setup ---
+\RequirePackage{natbib}
+\bibliographystyle{plainnat}
+
+% Make \bibliographystyle{neurips_2026} a no-op so the document's own
+% \bibliographystyle line does not error when the real .bst is absent.
+\let\@neurips@orig@bibstyle\bibliographystyle
+\renewcommand{\bibliographystyle}[1]{%
+  \def\@tmp@arg{#1}\def\@tmp@self{neurips_2026}%
+  \ifx\@tmp@arg\@tmp@self\else\@neurips@orig@bibstyle{#1}\fi}
+
+% --- light title formatting ---
+\RequirePackage{titlesec}
+\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+
+\endinput
