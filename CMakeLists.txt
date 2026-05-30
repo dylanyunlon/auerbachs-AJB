@@ -127,3 +127,74 @@ target_include_directories(ajb_benchmark PUBLIC
   third_party/termcolor/include
 )
 target_include_directories(ajb_benchmark SYSTEM PRIVATE)
+
+# =============================================================================
+# AJB JoinREnum test/tool targets (CPU-only, no CUDA required)
+#
+# These wrap the upstream joinrenum test programs with AJB debug
+# instrumentation: scoped timers, structured state dumps, memory
+# reporters, and pass/fail verdicts.
+#
+# Build all:  cmake --build . --target ajb_joinrenum_tests
+# Build one:  cmake --build . --target ajb_test_bucket_pool
+# =============================================================================
+
+find_library(GLPK_LIBRARY glpk)
+
+if(GLPK_LIBRARY)
+  message("-- GLPK found: ${GLPK_LIBRARY}  → building AJB joinrenum tests")
+
+  set(AJB_RENUM_INCLUDE_DIRS
+    ${CMAKE_SOURCE_DIR}/src/joinrenum
+  )
+
+  # --- test targets ---
+  set(AJB_RENUM_TESTS
+    test_bucket_pool
+    test_count_oracle
+    test_enumerator
+    test_index
+    test_join_tree
+    test_rr_access_tree
+    test_unordered_map
+  )
+
+  foreach(test_name ${AJB_RENUM_TESTS})
+    add_executable(ajb_${test_name} "src/joinrenum/tests/${test_name}.cpp")
+    target_include_directories(ajb_${test_name} PRIVATE ${AJB_RENUM_INCLUDE_DIRS})
+    target_link_libraries(ajb_${test_name} PRIVATE ${GLPK_LIBRARY})
+    target_compile_features(ajb_${test_name} PRIVATE cxx_std_17)
+    set_target_properties(ajb_${test_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+  endforeach()
+
+  # --- tool targets ---
+  set(AJB_RENUM_TOOLS
+    gen_co_data
+    run_bpt
+    upper_bound_demo
+    wash_data
+  )
+
+  foreach(tool_name ${AJB_RENUM_TOOLS})
+    add_executable(ajb_${tool_name} "src/joinrenum/tools/${tool_name}.cpp")
+    target_include_directories(ajb_${tool_name} PRIVATE ${AJB_RENUM_INCLUDE_DIRS})
+    target_compile_features(ajb_${tool_name} PRIVATE cxx_std_17)
+    # Only link glpk for tools that need it (gen_co_data uses RangeTree)
+    if(${tool_name} STREQUAL "gen_co_data")
+      target_link_libraries(ajb_${tool_name} PRIVATE ${GLPK_LIBRARY})
+    endif()
+    set_target_properties(ajb_${tool_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+  endforeach()
+
+  # Convenience target to build all joinrenum tests + tools
+  add_custom_target(ajb_joinrenum_tests)
+  foreach(test_name ${AJB_RENUM_TESTS})
+    add_dependencies(ajb_joinrenum_tests ajb_${test_name})
+  endforeach()
+  foreach(tool_name ${AJB_RENUM_TOOLS})
+    add_dependencies(ajb_joinrenum_tests ajb_${tool_name})
+  endforeach()
+
+else()
+  message("-- GLPK not found — skipping AJB joinrenum tests (install libglpk-dev)")
+endif()
