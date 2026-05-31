@@ -148,7 +148,7 @@ if(GLPK_LIBRARY)
     ${CMAKE_SOURCE_DIR}/src/joinrenum
   )
 
-  # --- test targets ---
+  # --- test targets (original AJB-adapted, Claude-8) ---
   set(AJB_RENUM_TESTS
     test_bucket_pool
     test_count_oracle
@@ -167,7 +167,50 @@ if(GLPK_LIBRARY)
     set_target_properties(ajb_${test_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
   endforeach()
 
-  # --- tool targets ---
+  # --- _full test targets (Claude-9: upstream logic + 20% AJB trace/debug) ---
+  #
+  # These preserve the complete upstream test logic and add structured
+  # [AJB_TRACE] / [AJB_STATE] / [AJB_MEM] / [AJB_TIMER] output for
+  # breakpoint-style debugging.  Build one: cmake --build . --target ajb_test_index_full
+  set(AJB_RENUM_TESTS_FULL
+    test_enumerator_full
+    test_index_full
+    test_join_tree_full
+    test_rr_access_tree_full
+    test_count_oracle_full
+    test_bucket_pool_full
+    test_unordered_map_full
+  )
+
+  # Tests that need GLPK
+  set(AJB_FULL_NEEDS_GLPK
+    test_enumerator_full
+    test_index_full
+    test_join_tree_full
+    test_rr_access_tree_full
+    test_count_oracle_full
+    test_bucket_pool_full
+  )
+
+  foreach(test_name ${AJB_RENUM_TESTS_FULL})
+    add_executable(ajb_${test_name} "src/joinrenum/tests/${test_name}.cpp")
+    target_include_directories(ajb_${test_name} PRIVATE ${AJB_RENUM_INCLUDE_DIRS})
+    target_compile_features(ajb_${test_name} PRIVATE cxx_std_17)
+    set_target_properties(ajb_${test_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+    # Link GLPK only where needed
+    list(FIND AJB_FULL_NEEDS_GLPK ${test_name} _glpk_idx)
+    if(NOT _glpk_idx EQUAL -1)
+      target_link_libraries(ajb_${test_name} PRIVATE ${GLPK_LIBRARY})
+    endif()
+  endforeach()
+
+  # --- test_join_baseline (CPU triangle join benchmark, no GLPK) ---
+  add_executable(ajb_test_join_baseline "src/joinrenum/tests/test_join_baseline.cpp")
+  target_include_directories(ajb_test_join_baseline PRIVATE ${AJB_RENUM_INCLUDE_DIRS})
+  target_compile_features(ajb_test_join_baseline PRIVATE cxx_std_17)
+  set_target_properties(ajb_test_join_baseline PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+
+  # --- tool targets (original AJB-adapted, Claude-8) ---
   set(AJB_RENUM_TOOLS
     gen_co_data
     run_bpt
@@ -186,13 +229,47 @@ if(GLPK_LIBRARY)
     set_target_properties(ajb_${tool_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
   endforeach()
 
-  # Convenience target to build all joinrenum tests + tools
-  add_custom_target(ajb_joinrenum_tests)
+  # --- _full tool targets (Claude-9: upstream logic + 20% AJB diagnostics) ---
+  set(AJB_RENUM_TOOLS_FULL
+    gen_co_data_full
+    run_bpt_full
+    upper_bound_full
+    wash_data_full
+  )
+
+  foreach(tool_name ${AJB_RENUM_TOOLS_FULL})
+    add_executable(ajb_${tool_name} "src/joinrenum/tools/${tool_name}.cpp")
+    target_include_directories(ajb_${tool_name} PRIVATE ${AJB_RENUM_INCLUDE_DIRS})
+    target_compile_features(ajb_${tool_name} PRIVATE cxx_std_17)
+    if(${tool_name} STREQUAL "gen_co_data_full")
+      target_link_libraries(ajb_${tool_name} PRIVATE ${GLPK_LIBRARY})
+    endif()
+    set_target_properties(ajb_${tool_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+  endforeach()
+
+  # Convenience targets
+  add_custom_target(ajb_joinrenum_tests)       # original tests
+  add_custom_target(ajb_joinrenum_tests_full)   # _full tests + baseline
+  add_custom_target(ajb_joinrenum_all)          # everything
+
   foreach(test_name ${AJB_RENUM_TESTS})
     add_dependencies(ajb_joinrenum_tests ajb_${test_name})
+    add_dependencies(ajb_joinrenum_all ajb_${test_name})
   endforeach()
   foreach(tool_name ${AJB_RENUM_TOOLS})
     add_dependencies(ajb_joinrenum_tests ajb_${tool_name})
+    add_dependencies(ajb_joinrenum_all ajb_${tool_name})
+  endforeach()
+
+  foreach(test_name ${AJB_RENUM_TESTS_FULL})
+    add_dependencies(ajb_joinrenum_tests_full ajb_${test_name})
+    add_dependencies(ajb_joinrenum_all ajb_${test_name})
+  endforeach()
+  add_dependencies(ajb_joinrenum_tests_full ajb_test_join_baseline)
+  add_dependencies(ajb_joinrenum_all ajb_test_join_baseline)
+  foreach(tool_name ${AJB_RENUM_TOOLS_FULL})
+    add_dependencies(ajb_joinrenum_tests_full ajb_${tool_name})
+    add_dependencies(ajb_joinrenum_all ajb_${tool_name})
   endforeach()
 
 else()

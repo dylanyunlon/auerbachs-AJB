@@ -18,10 +18,35 @@ Claude-5  (skipped)     —                               —
 Claude-6  M126-M150     f612f0d  paper                  Sections 6-7, final assembly
 Claude-7  M001-M150     9a96584  code                   Full upstream port + AJB integration
 Claude-8  M151-M175     d27c9fb  code                   JoinREnum test/tool port + debug
+─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+  ↓ 以下为本轮开发（6 位 Claude 接力）  ↓
+─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+第1位 Claude (Claude-9)   M176-M200   ✅ DONE     Full upstream test/tool migration
+                                                    + breakpoint-style debug infra
+
+第2位 Claude (Claude-10)  M201-M225   ⏳ next     GPU build validation: CMake on
+                                                    CUDA host, fix compilation errors,
+                                                    verify all targets sm_70/80/90
+
+第3位 Claude (Claude-11)  M226-M250   ⏳ next     Benchmark dry-run: ajb_benchmark
+                                                    on 2-GPU, first CSV capture,
+                                                    figure_data_emitter validation
+
+第4位 Claude (Claude-12)  M251-M275   ⏳ next     Experiment execution: full suite
+                                                    (cadence_sweep, vs_upstream,
+                                                    skew_sensitivity), collect CSVs
+
+第5位 Claude (Claude-13)  M276-M300   ⏳ next     Data analysis: figure JSONs,
+                                                    final plots, fill paper Tables
+                                                    1-2 with real measured numbers
+
+第6位 Claude (Claude-14)  M301-M325   ⏳ next     Paper revision: Sections 5-6 with
+                                                    real data, robustness (1/8-GPU,
+                                                    extreme skew), camera-ready polish
 ─────────────────────────────────────────────────────────────────────────────
 ```
 
-## What's Done (through Claude-8, M175)
+## What's Done (through 第1位 Claude / Claude-9, M200)
 
 ### Paper (complete draft)
 - [x] Sections 1-7 fully written in `paper/ajb_reconstructed.tex`
@@ -42,65 +67,123 @@ Claude-8  M151-M175     d27c9fb  code                   JoinREnum test/tool port
 - [x] `src/ajb_benchmark.cu` (548 lines) — unified benchmark driver
 - [x] `src/joinrenum/ajb_renum_adapter.hpp` (341 lines) — REnum↔GPU bridge
 
-### Code — Test & Debug Infrastructure (Claude-8, NEW)
-- [x] 7 test harnesses in `src/joinrenum/tests/` (812 lines total)
-- [x] 4 tool programs in `src/joinrenum/tools/` (278 lines total)
-- [x] 8 debug scripts in `scripts/debug/` (689 lines total)
+### Code — Test & Debug Infrastructure (Claude-8 + Claude-9)
+- [x] 7 test harnesses in `src/joinrenum/tests/` (812 lines, Claude-8)
+- [x] 4 tool programs in `src/joinrenum/tools/` (278 lines, Claude-8)
+- [x] 8 debug scripts in `scripts/debug/` (689 lines, Claude-8)
 - [x] Unified [AJB_*] tag system + `parse_ajb_trace.py` parser
-- [x] CMakeLists.txt: `ajb_joinrenum_tests` convenience target
+
+#### Claude-9: Full Upstream Test Migration ("鲁迅拿来法")
+Strategy: cp upstream originals, then adapt ~20% — inject AJB breakpoint
+trace, structured state dumps, memory snapshots, timing breakdown.
+
+**New _full test files** (upstream logic preserved, +20% AJB diagnostics):
+- [x] `src/joinrenum/tests/test_enumerator_full.cpp` (111 lines) — full Enumerator pipeline + Index stats dump
+- [x] `src/joinrenum/tests/test_index_full.cpp` (148 lines) — Index/Table/CountOracle/JoinTree breakpoints
+- [x] `src/joinrenum/tests/test_join_tree_full.cpp` (102 lines) — JoinTree neighbor structure + validation
+- [x] `src/joinrenum/tests/test_rr_access_tree_full.cpp` (74 lines) — RRAccess(1..AGM) full enumeration dump
+- [x] `src/joinrenum/tests/test_count_oracle_full.cpp` (143 lines) — RangeTree queries + stress test
+- [x] `src/joinrenum/tests/test_bucket_pool_full.cpp` (81 lines) — alloc/free tracking + slot reuse check
+- [x] `src/joinrenum/tests/test_unordered_map_full.cpp` (91 lines) — hash perf + hit-rate analysis
+- [x] `src/joinrenum/tests/test_join_baseline.cpp` (163 lines) — triangle join benchmark + throughput
+
+**New _full tool files:**
+- [x] `src/joinrenum/tools/gen_co_data_full.cpp` (124 lines) — parameterized CLI + distribution analysis
+- [x] `src/joinrenum/tools/run_bpt_full.cpp` (58 lines) — BanPickTree step-by-step trace
+- [x] `src/joinrenum/tools/upper_bound_full.cpp` (77 lines) — STL bound ops + perf benchmark
+- [x] `src/joinrenum/tools/wash_data_full.cpp` (80 lines) — format converter + validation
+
+**Updated existing files (AJB trace injection):**
+- [x] `src/joinrenum/test.cpp` (125 lines) — REnum-BMITU pipeline + [AJB_TRACE] progress
+- [x] `src/joinrenum/testjoin.cpp` (100 lines) — triangle join + timing/memory snapshots
+
+**New debug scripts:**
+- [x] `scripts/debug/build_and_test.sh` (177 lines) — unified build/run for all _full targets
+- [x] `scripts/debug/run_perf_full.sh` (96 lines) — perf profiling pipeline
+- [x] `scripts/debug/draw_upstream.py` (110 lines) — result plotter with CLI
+
+**CMakeLists.txt updates:**
+- [x] Registered all 7 `_full` test targets + `test_join_baseline` (8 new executables)
+- [x] Registered all 4 `_full` tool targets (4 new executables)
+- [x] Added `ajb_joinrenum_tests_full` and `ajb_joinrenum_all` convenience targets
+- [x] GLPK conditional linking per target
 
 ### Code — Experiment Infrastructure
 - [x] `scripts/experiment_specifications.py` — AJB experiments (cadence_sweep, vs_upstream, skew_sensitivity)
 - [x] `scripts/figure_data_emitter.py` — CSV → JSON schema converter
 
-## What's Next — Planned Milestones
+## Debug Trace Convention
+
+All AJB test/tool programs use structured tags for machine-parseable output:
 
 ```
-Future    Milestone     Owner       Scope
-─────────────────────────────────────────────────────────────────────────────
-Claude-9  M176-M200     next        GPU build validation: CMake on CUDA host,
-                                    fix any compilation errors, verify all
-                                    targets build cleanly on sm_70/80/90
-
-Claude-10 M201-M225     next        Benchmark dry-run: run ajb_benchmark on
-                                    2-GPU setup, capture first CSV output,
-                                    validate figure_data_emitter pipeline
-
-Claude-11 M226-M250     next        Experiment execution: run full experiment
-                                    suite (cadence_sweep, vs_upstream,
-                                    skew_sensitivity), collect result CSVs
-
-Claude-12 M251-M275     next        Data analysis: generate figure JSONs,
-                                    produce final plots, fill in paper
-                                    tables with real measured numbers
-
-Claude-13 M276-M300     next        Paper revision: update Sections 5-6 with
-                                    real data, revise claims against actual
-                                    speedup numbers, camera-ready polish
-
-Claude-14 M301-M325     next        Robustness: edge cases (1-GPU, 8-GPU,
-                                    extreme skew θ=0.99), error handling,
-                                    graceful degradation tests
-─────────────────────────────────────────────────────────────────────────────
+[AJB]            Test name, verdict (PASSED/FAILED)
+[AJB_TRACE]      Step-by-step execution trace (like printf breakpoints)
+[AJB_STATE]      Data structure dumps (bucket contents, tree shape, counters)
+[AJB_MEM]        Memory snapshots (RSS, VSize, delta)
+[AJB_TIMER]      Phase timings (build, query, enumeration)
+[AJB_BP]         Named breakpoints for debugging
+[AJB_WARN]       Non-fatal warnings
+[AJB_FAIL]       Fatal errors / assertion failures
 ```
 
-## File Inventory (post Claude-8)
+Filter with: `./test 2>&1 | grep '\[AJB'`
+Parse with: `python3 scripts/debug/parse_ajb_trace.py < output.log`
+
+## File Inventory (post Claude-9)
 
 ```
-src/                         13,976 lines  (72 source files)
+src/                         ~15,900 lines  (85 source files)
   ajb_join/                   1,287 lines  (4 AJB-specific modules)
   common/                     2,xxx lines  (16 utilities, 2 AJB-patched)
   hybrid_sort/                x,xxx lines  (12 sort kernels, upstream)
   merge_join/                   xxx lines  (4 join kernels, upstream)
-  joinrenum/                  7,xxx lines  (18 headers + 7 tests + 4 tools + 4 harnesses)
+  joinrenum/                  ~9,800 lines  (20 headers + 15 tests + 8 tools)
   benchmarks (*.cu)           1,xxx lines  (7 benchmark drivers)
 
-scripts/                      2,509 lines  (14 files)
-  debug/                        689 lines  (8 new debug scripts)
+scripts/                      ~3,200 lines  (17 files)
+  debug/                      ~1,130 lines  (11 debug scripts)
   experiment/analysis           1,820 lines (6 upstream + AJB extensions)
 
 paper/                          tex + sty  (NeurIPS 2026 format)
 docs/                          PLAN.md + PROGRESS.md
+```
+
+## What's Next — 后续 5 位 Claude 的开发计划
+
+```
+角色                      里程碑        状态      核心任务
+─────────────────────────────────────────────────────────────────────────────
+第2位 Claude (Claude-10)  M201-M225   ⏳ next   GPU build validation
+  • CMake configure + build on CUDA host (A6000/H100)
+  • Fix all compilation errors across sm_70/80/90
+  • Verify ajb_benchmark + all joinrenum targets link cleanly
+  • Run _full tests on CPU to confirm debug output pipeline
+
+第3位 Claude (Claude-11)  M226-M250   ⏳ next   Benchmark dry-run
+  • First real ajb_benchmark run on 2-GPU setup
+  • Capture CSV output, validate column names match figure_data_emitter
+  • Run scripts/debug/build_and_test.sh --target test_join_baseline
+  • End-to-end: CSV → figure_data_emitter.py → JSON → plot_experiments.py
+
+第4位 Claude (Claude-12)  M251-M275   ⏳ next   Experiment execution
+  • Full experiment suite: cadence_sweep, vs_upstream, skew_sensitivity
+  • Collect result CSVs for each experiment
+  • Validate AJB trace output: grep '[AJB_TIMER]' for timing consistency
+  • Multi-seed runs for statistical significance (3-5 seeds per config)
+
+第5位 Claude (Claude-13)  M276-M300   ⏳ next   Data analysis + figures
+  • Generate figure JSONs from collected CSVs
+  • Produce final publication-quality plots (Figures 2-5)
+  • Fill in paper Tables 1-2 with real measured numbers
+  • Anomaly detection: flag any result > 2σ from expected
+
+第6位 Claude (Claude-14)  M301-M325   ⏳ next   Paper revision + polish
+  • Update Sections 5-6 with real experimental data
+  • Revise speedup claims against actual numbers
+  • Robustness tests: 1-GPU, 8-GPU, extreme skew θ=0.99
+  • Camera-ready formatting, bibliography check, submission prep
+─────────────────────────────────────────────────────────────────────────────
 ```
 
 ## Known Blockers
