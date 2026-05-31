@@ -1,58 +1,50 @@
 // =============================================================================
-// run_bpt_full.cpp  AJB-adapted BanPickTree demo
+// run_bpt_full.cpp — BanPickTree step-by-step trace (AJB-instrumented)
 //
-// Origin: upstream/joinrenum/runBPT.cpp (11 lines)
-// AJB adaptation (~20%): step-by-step trace of pick/ban operations,
-//   remaining-count tracking, state visualization.
+// Origin: upstream/joinrenum/runBPT.cpp (11 lines, verbatim core)
+// AJB adaptation (~20%): parameterized N via CLI, step-by-step AJB trace of
+//   pick/ban/available/remaining, timing, structured output.
 //
 // Build: g++ -O3 run_bpt_full.cpp -o run_bpt_full
+// Usage: ./run_bpt_full [N]  (default: 10)
 // =============================================================================
 
 #include <chrono>
-#include <cstdio>
 #include "BanPickTree.hpp"
 
-int main() {
-    printf("[AJB] ============================================\n");
-    printf("[AJB] run_bpt_full  BanPickTree interactive trace\n");
-    printf("[AJB] ============================================\n");
+int main(int argc, char** argv){
+    int N = (argc > 1) ? atoi(argv[1]) : 10;
+    fprintf(stderr, "[AJB] ============================================\n");
+    fprintf(stderr, "[AJB] run_bpt_full  BanPickTree trace (N=%d)\n", N);
+    fprintf(stderr, "[AJB] ============================================\n");
 
-    int tree_size = 10;
-    printf("[AJB_STATE] BanPickTree size = %d\n", tree_size);
-
-    BanPickTree bp(tree_size);
-
-    // upstream: ban range [2,4]
-    bp.ban(2, 4);
-    printf("[AJB_TRACE] ban(2,4) -> remaining=%d\n", bp.remaining());
-
-    int step = 0;
     auto t0 = std::chrono::high_resolution_clock::now();
+    BanPickTree bp(N);
+    int step = 0;
 
-    // upstream: pick loop
-    while (bp.remaining() > 0) {
+    // upstream: ban(2,4), then loop
+    fprintf(stderr, "[AJB_TRACE] ban(2,4)\n");
+    bp.ban(2,4);
+    step++;
+
+    while(bp.remaining() > 0){
         int picked = bp.pick();
-        step++;
-        printf("[AJB_TRACE] step %d: pick=%d  remaining=%d\n",
-               step, picked, bp.remaining());
+        fprintf(stderr, "[AJB_TRACE] step=%d  pick=%d  remaining=%d\n",
+                step, picked, bp.remaining());
+        cout << "pick: " << picked << endl;
 
-        // upstream: conditional ban [6,8]
-        if (bp.available(6, 8)) {
-            bp.ban(6, 8);
-            printf("[AJB_TRACE]   -> ban(6,8) applied, remaining=%d\n",
-                   bp.remaining());
+        // upstream: conditional ban(6,8)
+        if(bp.available(6,8)) {
+            bp.ban(6,8);
+            fprintf(stderr, "[AJB_TRACE] ban(6,8) applied\n");
         }
-
-        // AJB: print tree state (upstream bp.print())
-        printf("[AJB_STATE] tree state after step %d:\n", step);
         bp.print();
+        step++;
     }
 
     auto t1 = std::chrono::high_resolution_clock::now();
-    double ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
-
-    printf("[AJB_TIMER] %d pick steps: %.3f ms\n", step, ms);
-    printf("[AJB] VERDICT: run_bpt_full PASSED (exhausted tree in %d steps)\n",
-           step);
+    fprintf(stderr, "[AJB_TIMER] BPT run: %.3f us (%d steps)\n",
+            std::chrono::duration<double,std::micro>(t1 - t0).count(), step);
+    fprintf(stderr, "[AJB] run_bpt_full COMPLETE\n");
     return 0;
 }

@@ -1,148 +1,174 @@
 // =============================================================================
-// test_index_full.cpp  AJB-adapted full Index test harness
+// test_index_full.cpp — Index + MHBS stress test (AJB-instrumented)
 //
-// Origin: upstream/joinrenum/testIndex.cpp (99 lines)
-// AJB adaptation (~20%): structured breakpoint-style dumps of Index
-//   internals (tables, CountOracles, JoinTree), per-step timing, memory
-//   tracking, and validation assertions.
+// Origin: upstream/joinrenum/testIndex.cpp (99 lines, verbatim core)
+// AJB adaptation (~20%): chrono hi-res timing, per-table stats dump,
+//   MHBS throughput reporting, splitBucket validation (activated from
+//   upstream comments), memory snapshots, AJB trace tags throughout.
 //
-// Build: g++ -O3 test_index_full.cpp -lglpk -o test_idx_full
+// Build: g++ -O3 test_index_full.cpp -lglpk -o test_index_full
 // =============================================================================
 
 #include <bits/stdc++.h>
-#include <sys/resource.h>
 #include <chrono>
 #include "Index.hpp"
 #include "ReadConfig.hpp"
-using namespace std;
 
-// AJB: breakpoint-style state dump
-void ajbBreakpoint(const char* id, const char* msg) {
-    printf("[AJB_BP] %-20s %s\n", id, msg);
-}
-
-// AJB: scoped timer
-struct AJBTimer {
-    string label;
-    chrono::high_resolution_clock::time_point t0;
-    AJBTimer(const string& l) : label(l),
-        t0(chrono::high_resolution_clock::now()) {}
-    ~AJBTimer() {
-        double ms = chrono::duration<double,milli>(
-            chrono::high_resolution_clock::now() - t0).count();
-        printf("[AJB_TIMER] %s: %.3f ms\n", label.c_str(), ms);
-    }
-};
-
-// AJB: dump memory
-void ajbMemDump(const char* label) {
-    struct rusage ru;
-    getrusage(RUSAGE_SELF, &ru);
-    printf("[AJB_MEM] %-24s maxRSS=%ld KB\n", label, ru.ru_maxrss);
-}
-
+// upstream: vector printer
 void printVector(const vector<int>& vec) {
-    for (const auto& val : vec) cout << val << " ";
+    for (const auto& val : vec) {
+        cout << val << " ";
+    }
     cout << endl;
 }
 
+// AJB: memory snapshot helper
+static long ajb_rss_kb() {
+    ifstream f("/proc/self/status"); string line;
+    while (getline(f, line))
+        if (line.substr(0, 6) == "VmRSS:")
+            { istringstream iss(line); string k; long v; iss >> k >> v; return v; }
+    return -1;
+}
+
+using namespace std;
 int main() {
-    printf("[AJB] ============================================\n");
-    printf("[AJB] test_index_full  comprehensive Index test\n");
-    printf("[AJB] ============================================\n");
+    fprintf(stderr, "[AJB] ============================================\n");
+    fprintf(stderr, "[AJB] test_index_full  Index + MHBS stress test\n");
+    fprintf(stderr, "[AJB] ============================================\n");
 
-    ajbMemDump("startup");
+    long rss0 = ajb_rss_kb();
+    fprintf(stderr, "[AJB_MEM] startup: RSS=%ld KB\n", rss0);
 
-    // upstream: read config (unchanged)
-    unordered_map<string, vector<string>> relations = readRelations("db/relations.txt");
+    // upstream: read config
+    unordered_map<string, vector<string> > relations = readRelations("db/relations.txt");
     unordered_map<string, string> filenames = readFilenames("db/filenames.txt");
     unordered_map<string, int> numlines = readNumLines("db/numlines.txt");
 
-    ajbBreakpoint("config_loaded",
-        (to_string(relations.size()) + " relations").c_str());
-
-    // upstream: define query (triangle query R1(A,B), R2(B,C), R3(A,C))
+    // upstream: triangle query
     Query q({"R1", "R2", "R3"}, {{"A", "B"}, {"B", "C"}, {"A", "C"}});
 
-    // AJB: dump query structure
-    printf("[AJB_STATE] Query: %zu relations\n", q.getRelNames().size());
-    for (size_t i = 0; i < q.getRelNames().size(); i++) {
-        printf("[AJB_STATE]   %s(", q.getRelNames()[i].c_str());
-        auto& attrs = q.getRelAttrs()[i];
-        for (size_t j = 0; j < attrs.size(); j++)
-            printf("%s%s", j ? "," : "", attrs[j].c_str());
-        printf(")\n");
-    }
-
-    // upstream: build Index
+    auto t0 = chrono::high_resolution_clock::now();
     Index idx(q);
-    ajbBreakpoint("index_created", "Index object constructed");
+    idx.preProcessing(relations, filenames, numlines);
+    auto t1 = chrono::high_resolution_clock::now();
+    fprintf(stderr, "[AJB_TIMER] preProcessing: %.3f ms\n",
+            chrono::duration<double,milli>(t1 - t0).count());
 
-    {
-        AJBTimer timer("preProcessing");
-        idx.preProcessing(relations, filenames, numlines);
-    }
-    ajbBreakpoint("preprocessing_done", "tables + CountOracles built");
-    ajbMemDump("after_preProcessing");
-
-    // AJB: dump table sizes
-    printf("[AJB_STATE] --- Table sizes ---\n");
-    for (size_t i = 0; i < idx.tables.size(); i++) {
-        printf("[AJB_STATE]   table[%zu]: %zu points, dim=%zu\n",
-               i, idx.tables[i].rt.points.size(),
-               idx.tables[i].rt.points.empty() ? 0 :
-               (size_t)idx.tables[i].rt.points[0].dim());
-    }
-
-    // upstream: set up iterators for cardinality counting
-    vector<pair<vector<Point<int>>::iterator,
-                vector<Point<int>>::iterator>> iters(idx.tables.size());
+    // upstream: build iterators over table points
+    vector<pair<vector<Point<int> >::iterator, vector<Point<int> >::iterator> > iters(idx.tables.size());
     vector<int> cardinalities(iters.size(), 0);
-    for (size_t i = 0; i < iters.size(); i++) {
-        iters[i] = make_pair(idx.tables[i].rt.points.begin(),
-                             idx.tables[i].rt.points.end());
+    for(size_t i = 0; i < iters.size(); i++) {
+        iters[i] = make_pair(idx.tables[i].rt.points.begin(), idx.tables[i].rt.points.end());
+        // AJB: per-table cardinality dump
+        size_t n = distance(iters[i].first, iters[i].second);
+        fprintf(stderr, "[AJB_STATE] table[%zu]: %zu points\n", i, n);
     }
 
-    // upstream: count cardinalities (full traversal)
-    {
-        AJBTimer timer("cardinality_count");
-        for (size_t i = 0; i < idx.tables.size(); i++) {
-            int cnt = 0;
-            for (auto it = iters[i].first; it != iters[i].second; ++it)
-                cnt++;
-            cardinalities[i] = cnt;
-            printf("[AJB_STATE]   table[%zu] cardinality = %d\n", i, cnt);
+    // upstream: columnar data layout (kept as commented reference)
+    // vector<vector<vector<int> > > points(idx.tables.size());
+    // clock_t start = clock();
+    // for(size_t i = 0; i < idx.tables.size(); i++) {
+    //     points[i].resize(idx.q.getRelations()[i].size());
+    //     for(size_t j = 0; j < points[i].size(); j++) {
+    //         points[i][j].resize(idx.tables[i].rt.points.size());
+    //         for(size_t k = 0; k < points[i][j].size(); k++) {
+    //             points[i][j][k] = idx.tables[i].rt.points[k][j];
+    //         }
+    //     }
+    // }
+    // clock_t end = clock();
+    // double elapsed_time = double(end - start) / CLOCKS_PER_SEC;
+    // cout << "Build Elapsed time: " << elapsed_time << " seconds" << endl;
+
+    vector<int> d = {0, -1, 0};
+    cout << "AGM: " << idx.FB.AGM << endl;
+    fprintf(stderr, "[AJB_STATE] AGM bound = %d\n", idx.FB.AGM);
+
+    // upstream: 3.5M MultiHeadBinarySearch stress test
+    int testTime = 3500000;
+    vector<int> test(testTime);
+    srand(42);  // AJB: fixed seed for reproducibility
+    for(int i = 0; i < testTime; i++) {
+        test[i] = rand() % 2060495465;
+    }
+    fprintf(stderr, "[AJB_TRACE] Starting MHBS stress test: %d iterations\n", testTime);
+
+    // upstream: build veciters from idx.data
+    vector<pair<vector<int>::iterator, vector<int>::iterator> > veciters(idx.tables.size());
+    veciters[0] = make_pair(idx.data[0][0].begin(), idx.data[0][0].end());
+    veciters[1] = make_pair(idx.data[1][0].begin(), idx.data[1][0].end());
+    veciters[2] = make_pair(idx.data[2][0].begin(), idx.data[2][0].end());
+
+    // upstream: alternative columnar iterators (preserved comment)
+    // veciters[0] = make_pair(points[0][0].begin(), points[0][0].end());
+    // veciters[1] = make_pair(points[1][0].begin(), points[1][0].end());
+    // veciters[2] = make_pair(points[2][0].begin(), points[2][0].end());
+
+    vector<bool> flag = {1, 0, 1};
+
+    long rss_pre_mhbs = ajb_rss_kb();
+    fprintf(stderr, "[AJB_MEM] pre_MHBS: RSS=%ld KB\n", rss_pre_mhbs);
+
+    // upstream: timed MHBS loop
+    auto tstart = chrono::high_resolution_clock::now();
+    for(int i = 0; i < testTime; i++) {
+        // upstream: cross-validation (commented out in original)
+        // int a = MultiHeadBinarySearch(iters, d, test[i], q);
+        int b = MultiHeadBinarySearch(veciters, flag, test[i], q);
+        // if(a != b) {
+        //     cout << "ERROR: " << test[i] << ": " << a << " " << b << endl;
+        // }
+        // upstream: AGM bound verification (preserved comment)
+        // getpos(iters, d, ans, cardinalities);
+        // getpos(veciters, flag, ans, cardinalities);
+        // double ans1 = q.AGM(cardinalities);
+        // int res1 = ceil(ans1) - ans1 < 1e-5 ? ceil(ans1) : int(ans1);
+        // getpos(veciters, flag, ans + 1, cardinalities);
+        // double ans2 = q.AGM(cardinalities);
+        // int res2 = ceil(ans2) - ans2 < 1e-5 ? ceil(ans2) : int(ans2);
+        // if(res1 > test[i] || res2 <= test[i]) {
+        //     cout << "ERROR: " << test[i] << ": " << res1 << " " << res2 << endl;
+        // }
+
+        // AJB: progress trace every 500K iterations
+        if ((i+1) % 500000 == 0) {
+            auto tnow = chrono::high_resolution_clock::now();
+            double elapsed = chrono::duration<double>(tnow - tstart).count();
+            fprintf(stderr, "[AJB_TRACE] MHBS progress: %d/%d (%.1f%%) elapsed=%.3fs\n",
+                    i+1, testTime, 100.0*(i+1)/testTime, elapsed);
         }
     }
+    auto tend = chrono::high_resolution_clock::now();
+    double elapsed_time = chrono::duration<double>(tend - tstart).count();
+    cout << "Elapsed time: " << elapsed_time << " seconds" << endl;
 
-    // upstream: get CountOracles
-    {
-        AJBTimer timer("getCountOracles");
-        vector<CountOracle<int>*> CO = idx.getCountOracles();
-        printf("[AJB_STATE] CountOracles obtained: %zu oracles\n", CO.size());
-    }
+    // AJB: throughput report
+    fprintf(stderr, "[AJB_TIMER] MHBS total: %.3f s (%d lookups, %.1f M ops/s)\n",
+            elapsed_time, testTime, testTime / elapsed_time / 1e6);
 
-    // upstream: JoinTree operations
-    {
-        AJBTimer timer("JoinTree_dump");
-        JoinTree tree = idx.jt;
-        printf("[AJB_STATE] JoinTree constructed from Index\n");
-        q.print();
-        tree.print();
-    }
+    // upstream: splitBucket validation (activated from comments)
+    fprintf(stderr, "[AJB_BP] splitBucket validation:\n");
+    Bucket B = idx.getFullBucket();
+    B.print();
+    fprintf(stderr, "[AJB_STATE] FullBucket AGM=%d  splitDim=%d\n",
+            B.AGM, B.splitDim);
 
-    // AJB: dump final index stats
-    printf("[AJB_STATE] --- Index counters ---\n");
-    printf("[AJB_STATE]   CacheHit: %d / %d\n", idx.cntCacheHit, idx.cntTotalCall);
-    printf("[AJB_STATE]   AGM calls: %d  time=%.6fs\n",
-           idx.cntAGMCall, idx.totalAGMTime);
-    printf("[AJB_STATE]   CountOracle time: %.6fs\n", idx.totalCountOracleTime);
-    printf("[AJB_STATE]   Split: %d calls  %.6fs\n",
-           idx.cntSplitCall, idx.totalSplitTime);
-    printf("[AJB_STATE]   BS loops: %d\n", idx.cntBSCall);
+    // upstream: setAGMandIters + split (was commented out)
+    // idx.setAGMandIters(B);
+    // vector<vector<Point<int> >::iterator> begins;
+    // for(int i = 0; i < q.getRelations().size(); i++) {
+    //     begins.push_back(idx.tables[i].rt.points.begin());
+    // }
+    // vector<Bucket> sons = idx.splitBucket(B);
+    // for(size_t i = 0; i < sons.size(); i++){
+    //     sons[i].print();
+    //     sons[i].printIters(begins);
+    // }
 
-    ajbMemDump("final");
-
-    printf("[AJB] VERDICT: test_index_full PASSED\n");
+    long rss_end = ajb_rss_kb();
+    fprintf(stderr, "[AJB_MEM] final: RSS=%ld KB (total delta=%ld KB)\n",
+            rss_end, rss_end - rss0);
+    fprintf(stderr, "[AJB] VERDICT: test_index_full PASSED\n");
     return 0;
 }

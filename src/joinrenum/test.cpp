@@ -1,10 +1,10 @@
 // =============================================================================
 // test.cpp — REnum-BMITU full pipeline (AJB-instrumented)
 //
-// Origin: upstream/joinrenum/test.cpp (191 lines)
-// AJB adaptation (~20%): [AJB_TRACE] at each enumeration milestone,
-//   structured timer around each phase, per-500 stats dump preserved,
-//   and progress percentage reporting.
+// Origin: upstream/joinrenum/test.cpp (191 lines, verbatim core preserved)
+// AJB adaptation (~20%): [AJB_TRACE] at milestones, chrono timing around
+//   each phase, printInfo extended with BSCall/BoundPrepare/rrtreenode,
+//   progress percentage on stderr, REnum/Sample variants preserved in comments.
 // =============================================================================
 
 #include <iostream>
@@ -18,105 +18,214 @@
 #include "BanPickTree.hpp"
 using namespace std;
 
+
 void printInfo(Index &idx) {
-    // upstream: print all Index counters
-    printf("[AJB_STATE] CacheHit(SplitBucket): %d / %d total\n",
-           idx.cntCacheHit, idx.cntTotalCall);
-    printf("[AJB_STATE] AGM calls: %d  time=%.6fs\n",
-           idx.cntAGMCall, idx.totalAGMTime);
-    printf("[AJB_STATE] CountOracle time: %.6fs\n", idx.totalCountOracleTime);
-    printf("[AJB_STATE] Split: %d calls  time=%.6fs\n",
-           idx.cntSplitCall, idx.totalSplitTime);
-    printf("[AJB_STATE] CacheHit time: %.6fs\n", idx.totalCacheHitTime);
+    // upstream: core stats (verbatim)
+    cout << "Cache Hit of SplitBucket: " << idx.cntCacheHit << " Total Call: " << idx.cntTotalCall << endl;
+    cout << "Total AGM Call: " << idx.cntAGMCall << endl;
+    cout << "Total AGM Time: " << idx.totalAGMTime << endl;
+    cout << "Total Count Oracle Time: " << idx.totalCountOracleTime << endl;
+    cout << "Total Split Time: " << idx.totalSplitTime << endl;
+    cout << "Total Split Call: " << idx.cntSplitCall << endl;
+    cout << "Total Cache Hit Time: " << idx.totalCacheHitTime << endl;
+
+    // AJB: structured dump to stderr for parse_ajb_trace.py
+    fprintf(stderr, "[AJB_STATE] CacheHit(SplitBucket): %d / %d\n",
+            idx.cntCacheHit, idx.cntTotalCall);
+    fprintf(stderr, "[AJB_STATE] AGM calls=%d time=%.6fs\n",
+            idx.cntAGMCall, idx.totalAGMTime);
+    fprintf(stderr, "[AJB_STATE] CountOracle=%.6fs Split=%d/%.6fs CacheHit=%.6fs\n",
+            idx.totalCountOracleTime, idx.cntSplitCall,
+            idx.totalSplitTime, idx.totalCacheHitTime);
+    fprintf(stderr, "[AJB_STATE] BSCall=%d BoundPrepare=%.6fs RRTreeNodes=%d\n",
+            idx.cntBSCall, idx.totalBoundPrepareTime, idx.totalrrtreenode);
+    return;
 }
 
 int main() {
-    printf("[AJB] ============================================\n");
-    printf("[AJB] test.cpp — REnum-BMITU full pipeline\n");
-    printf("[AJB] ============================================\n");
+    fprintf(stderr, "[AJB] ============================================\n");
+    fprintf(stderr, "[AJB] test.cpp — REnum-BMITU full pipeline\n");
+    fprintf(stderr, "[AJB] ============================================\n");
 
-    // upstream: read config
+    // Table<Parcel> tbl;
     unordered_map<string, string> filenames = readFilenames("db/filenames.txt");
     unordered_map<string, int> numlines = readNumLines("db/numlines.txt");
-    unordered_map<string, vector<string>> relations = readRelations("db/relations.txt");
-
-    // upstream: print loaded schema
-    for (auto& [name, vars] : relations) {
-        cout << name << ": ";
-        for (auto& v : vars) cout << v << " ";
+    unordered_map<string, vector<string> > relations = readRelations("db/relations.txt");
+    
+    unordered_map<string, vector<string> >::iterator it = relations.begin();
+    vector<string> query_rels;
+    vector<vector<string> > query_vars;
+    while(it != relations.end()) {
+        query_rels.push_back(it->first);
+        query_vars.push_back(it->second);
+        it++;
+    }
+    for (size_t i = 0; i < query_rels.size(); i++) {
+        cout << query_rels[i] << ": ";
+        for (size_t j = 0; j < query_vars[i].size(); j++) {
+            cout << query_vars[i][j] << " ";
+        }
         cout << endl;
     }
 
-    // upstream: triangle query (hardcoded)
+    // Query q(query_rels, query_vars);
     Query q({"R1", "R2", "R3"}, {{"A", "B"}, {"B", "C"}, {"A", "C"}});
+    // Query q({"R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9"}, {{"x1", "x2"}, {"x2", "x3"}, {"x1", "x3"}, {"x3", "x4"}, {"x4", "x5"}, {"x5", "x6"}, {"x4", "x6"}, {"x1", "x5"}, {"x2", "x6"}});
+    // Query q({"R1", "R2", "R3", "R4", "R5", "R6"}, {{"P", "Q", "R"}, {"Q", "S", "T"}, {"R", "T", "U"}, {"P", "S", "V"}, {"U", "V", "W"}, {"W", "P", "Q"}});
+    // Query q({"R1", "R2", "R3", "R4"}, {{"A", "B", "C", "D"}, {"B", "C", "E", "F"}, {"C", "D", "F", "G"}, {"B", "D", "E", "G"}});
 
-    // upstream: Index + preprocessing
+    // Query q({"L1", "L2", "O1", "O2", "C1", "C2", "S"},
+    // {{"ok1", "pk"},
+    //  {"ok2", "pk"},
+    //  {"ok1", "ck1"},
+    //  {"ok2", "ck2"},
+    //  {"ck1", "nk"},
+    //  {"ck2", "nk"},
+    //  {"sk", "nk"}});
     auto t_pre0 = chrono::high_resolution_clock::now();
     Index idx(q);
     idx.preProcessing(relations, filenames, numlines);
     auto t_pre1 = chrono::high_resolution_clock::now();
-
-    printf("[AJB_TIMER] preprocessing: %.3f ms\n",
-        chrono::duration<double,milli>(t_pre1 - t_pre0).count());
+    fprintf(stderr, "[AJB_TIMER] preProcessing: %.3f ms\n",
+            chrono::duration<double,milli>(t_pre1 - t_pre0).count());
 
     cout << "Variables: ";
-    for (size_t i = 0; i < q.getVarNames().size(); i++)
+    for(size_t i = 0; i < q.getVarNames().size(); i++) {
         cout << q.getVarNames()[i] << " ";
+    }
     cout << endl;
+    // idx.getFullBucket().print();
+    // for(int i = 1; i < 20; i++) {
+    //     vector<int> res = idx.sampleUntilSuccess();
+    //     cout << "Sample " << i << ": ";
+    //     for(int j = 0; j < res.size(); j++) {
+    //         cout << res[j] << " ";
+    //     }
+    //     cout << endl;
+    // }
+    // idx.printBucketInfo(idx.getFullBucket());
+    // idx.printBucketTree(idx.getFullBucket());
+
 
     int cntsuccess = 0, cnt = 0;
+    // for(int i = 1; i <= idx.AGM(); i++) {
+    //         pair<bool, vector<int> > res = idx.randomAccess(idx.getFullBucket(), i);
+    //         cout << i << ": ";
+    //         cout << res.first << "::";
+    //         for(int j = 0; j < res.second.size(); j++) {
+    //             cout << res.second[j] << ",";
+    //         }
+    //         cout << endl;
+    //         if(!res.first) {
+    //             cntfail++;
+    //             i = res.second[1];
+    //         }
+    //         else cntsuccess++;
+    // }
+
+    // vector<int> cars = idx.getCar(idx.getFullBucket());
+    // cout << endl;
+    // if(freopen("res/res_q1_bmitu.txt", "w", stdout) == NULL)cout << "WRITEERR" << endl;
     int step = 20;
-
-    printf("[AJB_STATE] AGM bound = %d\n", idx.AGM());
+    fprintf(stderr, "[AJB_STATE] AGM bound = %d\n", idx.AGM());
     cout << idx.AGM() << endl;
-
-    // upstream: REnum-BMITU algorithm
+    //////////////////////////////REnum-BMITU
     BanPickTree bp(idx.AGM());
-
-    if (freopen("res/result.txt", "w", stdout) == NULL)
+    if(freopen("res/result.txt", "w", stdout) == NULL)
         fprintf(stderr, "[AJB_WARN] Cannot open res/result.txt\n");
 
-    auto start = chrono::high_resolution_clock::now();
-    auto end = chrono::high_resolution_clock::now();
-    chrono::duration<double> elapsed = end - start;
-    double last_pct_report = 0;
-
-    printf("[AJB_TRACE] REnum-BMITU loop starting, AGM=%d\n", idx.AGM());
-
-    while (bp.remaining()) {
+    fprintf(stderr, "[AJB_TRACE] REnum-BMITU loop starting, AGM=%d\n", idx.AGM());
+    auto start = std::chrono::high_resolution_clock::now();
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    double last_percentage = 0;
+    while(bp.remaining()){
         cnt++;
         int s = bp.pick();
-        pair<bool, vector<int>> res = idx.randomAccess_opt(idx.getFullBucket(), s);
-
-        if (res.first) {
+        pair<bool, vector<int> > res = idx.randomAccess_opt(idx.getFullBucket(), s);
+        if(res.first){
             cntsuccess++;
-            if (cntsuccess < step || cntsuccess % step == 0) {
-                end = chrono::high_resolution_clock::now();
-                elapsed = end - start;
-                cout << cntsuccess << ", " << cnt << ", " << bp.remaining()
-                     << ", " << bp.getPercentage() << ", "
-                     << elapsed.count() << endl;
-            }
-            if (cntsuccess % 500 == 0) {
-                printInfo(idx);
-                // AJB: progress trace
-                double pct = bp.getPercentage();
-                fprintf(stderr, "[AJB_TRACE] progress: %d successes, "
-                        "%d total, %.1f%% done, %.3fs\n",
-                        cntsuccess, cnt, pct * 100, elapsed.count());
-            }
+            if(cntsuccess < step || cntsuccess % step == 0){
+            end = std::chrono::high_resolution_clock::now();
+            elapsed = end - start;
+            cout << cntsuccess << ", " << cnt << ", " << bp.remaining() << ", " << bp.getPercentage() << ", " << elapsed.count() << endl;
         }
+            if(cntsuccess % 500 == 0) {
+                printInfo(idx);
+                // AJB: progress trace to stderr
+                fprintf(stderr, "[AJB_TRACE] progress: %d successes, %d total, %.1f%% done, %.3fs\n",
+                        cntsuccess, cnt, bp.getPercentage() * 100, elapsed.count());
+            }
 
-        if (res.first) bp.ban(s, s);
+        }        
+        if(res.first) bp.ban(s,s);
+
         else bp.ban(res.second[0], res.second[1]);
+        // double done = bp.getPercentage();
+        // if(int(done * 100) % 10 == 0 && int(done * 100) != int(last_percentage*100)){
+        //     last_percentage = done;
+        //     end = std::chrono::high_resolution_clock::now();
+        //     elapsed = end - start;
+        //     cout << bp.getPercentage() << ", " << elapsed.count() << endl;
+        //     last_percentage = done;
+        // }
     }
 
-    end = chrono::high_resolution_clock::now();
+
+    // ////////////////////////////////REnum
+    // int N = idx.AGM();
+    // vector<int> A(N,0);
+    // if(freopen("res/res_q1_renum.txt", "w", stdout) == NULL)cout << "WRITEERR" << endl;
+    // random_device rd;
+    // mt19937 gen(rd());
+    // auto start = std::chrono::high_resolution_clock::now();
+    // auto end = std::chrono::high_resolution_clock::now();
+    // std::chrono::duration<double> elapsed = end - start;
+    // int pos, j;
+    // for(int i = 1; i <= N; i++){
+    //     cnt++;
+    //     uniform_int_distribution<> distr(i, N);
+    //     j = distr(gen);
+    //     if(A[j] > 0)pos = A[j];
+    //     else pos = j;
+    //     if(A[i] > 0)A[j] = A[i];
+    //     else A[j] = i;
+    //     pair<bool, vector<int> > res = idx.randomAccess(idx.getFullBucket(), pos);
+    //     if(res.first){
+    //         cntsuccess++;
+    //         end = std::chrono::high_resolution_clock::now();
+    //         elapsed = end - start;
+    //         cout << cntsuccess << ", " << cnt << ", " << elapsed.count() << endl;
+    //     }        
+    // }
+
+    //////////////////////////////Sample
+    // set<vector<int> > S;
+    // if(freopen("res/res_q2_sample.txt", "w", stdout) == NULL)cout << "WRITEERR" << endl;
+    // while(true) {
+    //     cnt++;
+    //     vector<int> s = idx.sampleUntilSuccess();
+    //     if(S.find(s) != S.end()) continue;
+    //     S.insert(s);
+    //     cntsuccess++;
+    //     if(cntsuccess < step || cntsuccess % step == 0){
+    //         end = std::chrono::high_resolution_clock::now();
+    //         elapsed = end - start;
+    //         cout << cntsuccess << ", " << cnt << ", " << elapsed.count() << endl;
+    //     }
+    // }
+    
+    end = std::chrono::high_resolution_clock::now();
     elapsed = end - start;
-    cout << cntsuccess << ", " << cnt << ", " << bp.remaining()
-         << ", " << bp.getPercentage() << ", " << elapsed.count() << endl;
+    cout << cntsuccess << ", " << cnt << ", " << bp.remaining() << ", " << bp.getPercentage() << ", " << elapsed.count() << endl;
 
     printInfo(idx);
+
+    // upstream: additional output (preserved comments)
+    // idx.printBucketTree(idx.getFullBucket());
+    // cout << cntsuccess + 1 << ", " << cnt << ", " << elapsed.count() << endl;
+    // cout << "Success: " << cntsuccess << " Total: " << cnt << endl;
+    // cout << "Total: " << bp.getTotal() << endl;
 
     fprintf(stderr, "[AJB_TIMER] REnum-BMITU total: %.3fs, %d successes / %d probes\n",
             elapsed.count(), cntsuccess, cnt);

@@ -1,77 +1,78 @@
 // =============================================================================
-// upper_bound_full.cpp  AJB-adapted STL lower/upper_bound demo
+// upper_bound_full.cpp — STL bound operations + perf benchmark (AJB-instrumented)
 //
-// Origin: upstream/joinrenum/upb.cpp (13 lines)
-// AJB adaptation (~20%): extended with boundary-case tests, timing
-//   for large sets, and iterator validity checks used in AJB binary
-//   search paths.
+// Origin: upstream/joinrenum/upb.cpp (13 lines, verbatim core)
+// AJB adaptation (~20%): extended with stress test, chrono timing,
+//   edge-case validation, structured trace output.
 //
-// Build: g++ -O3 upper_bound_full.cpp -o ub_full
+// Build: g++ -O3 upper_bound_full.cpp -o upper_bound_full
 // =============================================================================
 
 #include <bits/stdc++.h>
 #include <chrono>
 using namespace std;
 
-int main() {
-    printf("[AJB] ============================================\n");
-    printf("[AJB] upper_bound_full  STL bound operations test\n");
-    printf("[AJB] ============================================\n");
+int main(){
+    fprintf(stderr, "[AJB] ============================================\n");
+    fprintf(stderr, "[AJB] upper_bound_full  STL bound ops test\n");
+    fprintf(stderr, "[AJB] ============================================\n");
 
-    // upstream: basic set with gaps
-    set<int> s = {1, 3, 4, 6, 8};
+    // upstream: basic set with lower_bound/upper_bound (verbatim logic)
+    set<int> s = {};
+    s.insert(1);
+    s.insert(3);
+    s.insert(4);
+    s.insert(6);
+    s.insert(8);
 
-    printf("[AJB_STATE] Set contents: {");
-    for (auto it = s.begin(); it != s.end(); ++it)
-        printf("%s%d", it != s.begin() ? "," : "", *it);
-    printf("}\n");
+    fprintf(stderr, "[AJB_STATE] set contents: {");
+    for(auto it = s.begin(); it != s.end(); ++it)
+        fprintf(stderr, "%s%d", it != s.begin() ? "," : "", *it);
+    fprintf(stderr, "}\n");
 
-    // upstream: lower_bound(4) then decrement
-    auto it = s.lower_bound(4);
-    printf("[AJB_TRACE] lower_bound(4) = %d\n", *it);
-    printf("[AJB_TRACE] --lower_bound(4) = %d\n", *--it);
-    printf("[AJB_TRACE] upper_bound(4) = %d\n", *s.upper_bound(4));
+    // upstream: lower_bound(4) then decrement, upper_bound(4)
+    set<int>::iterator it = s.lower_bound(4);
+    int lb_prev = *--it;
+    int ub = *s.upper_bound(4);
+    cout << lb_prev;
+    cout << ub;
+    cout << endl;
+    fprintf(stderr, "[AJB_TRACE] lower_bound(4)-1 = %d  upper_bound(4) = %d\n", lb_prev, ub);
 
-    // AJB: extended boundary tests relevant to BinarySearch.cpp
-    struct BoundTest {
-        int key;
-        const char* desc;
-    };
-    vector<BoundTest> tests = {
-        {0, "before_min"}, {1, "at_min"}, {5, "in_gap"},
-        {8, "at_max"}, {9, "after_max"},
-    };
-
-    printf("[AJB_STATE] --- Boundary test suite ---\n");
-    for (auto& t : tests) {
-        auto lb = s.lower_bound(t.key);
-        auto ub = s.upper_bound(t.key);
-        printf("[AJB_TRACE] key=%d (%s): lower_bound=%s upper_bound=%s\n",
-               t.key, t.desc,
-               lb != s.end() ? to_string(*lb).c_str() : "END",
-               ub != s.end() ? to_string(*ub).c_str() : "END");
+    // AJB: edge case validation
+    fprintf(stderr, "[AJB_STATE] --- Edge case tests ---\n");
+    struct BoundTest { int key; const char* label; };
+    vector<BoundTest> tests = {{1,"min"}, {8,"max"}, {5,"gap"}, {0,"below_min"}, {9,"above_max"}};
+    for(auto& bt : tests) {
+        auto lb = s.lower_bound(bt.key);
+        auto ub_it = s.upper_bound(bt.key);
+        fprintf(stderr, "[AJB_TRACE] key=%d(%s): lb=%s  ub=%s\n",
+                bt.key, bt.label,
+                lb != s.end() ? to_string(*lb).c_str() : "end",
+                ub_it != s.end() ? to_string(*ub_it).c_str() : "end");
     }
 
-    // AJB: performance test with large sorted set
+    // AJB: stress test with large set
     int N = 1000000;
+    fprintf(stderr, "[AJB_TRACE] Stress test: %d element set\n", N);
     set<int> big;
-    for (int i = 0; i < N; i++) big.insert(i * 2);  // even numbers
+    for(int i = 0; i < N; i++) big.insert(i * 2);  // even numbers
 
-    printf("[AJB_STATE] Large set: %zu elements\n", big.size());
-
+    srand(42);
+    int found = 0;
     auto t0 = chrono::high_resolution_clock::now();
-    int found_lb = 0;
-    for (int i = 0; i < N; i++) {
-        auto r = big.lower_bound(i);
-        if (r != big.end()) found_lb++;
+    for(int i = 0; i < N; i++) {
+        int key = rand() % (N * 2);
+        auto lb = big.lower_bound(key);
+        if(lb != big.end() && *lb == key) found++;
     }
     auto t1 = chrono::high_resolution_clock::now();
-    double ms = chrono::duration<double,milli>(t1 - t0).count();
+    fprintf(stderr, "[AJB_TIMER] %d lookups: %.3f ms (%.1f M ops/s)\n",
+            N, chrono::duration<double,milli>(t1 - t0).count(),
+            N / chrono::duration<double>(t1 - t0).count() / 1e6);
+    fprintf(stderr, "[AJB_STATE] exact_matches=%d/%d (%.1f%%)\n",
+            found, N, 100.0*found/N);
 
-    printf("[AJB_TIMER] %d lower_bound queries: %.3f ms (%.0f ops/ms)\n",
-           N, ms, N / ms);
-    printf("[AJB_STATE] Found (not end): %d / %d\n", found_lb, N);
-
-    printf("[AJB] VERDICT: upper_bound_full PASSED\n");
+    fprintf(stderr, "[AJB] upper_bound_full COMPLETE\n");
     return 0;
 }

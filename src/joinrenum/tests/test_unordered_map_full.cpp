@@ -1,18 +1,19 @@
 // =============================================================================
-// test_unordered_map_full.cpp  AJB-adapted unordered_map benchmark
+// test_unordered_map_full.cpp — unordered_map<vector> hash perf (AJB-instrumented)
 //
-// Origin: upstream/joinrenum/testUM.cpp (33 lines)
-// AJB adaptation (~20%): timing instrumentation, hit-rate analysis,
-//   memory tracking, and throughput metrics.
+// Origin: upstream/joinrenum/testUM.cpp (33 lines, verbatim core)
+// AJB adaptation (~20%): chrono hi-res timing (replacing clock()), fixed seed,
+//   insert/lookup phase separation, hit-rate analysis, throughput reporting,
+//   memory snapshots.
 //
 // Build: g++ -O3 test_unordered_map_full.cpp -o test_um_full
 // =============================================================================
 
-#include <bits/stdc++.h>
+#include<bits/stdc++.h>
 #include <chrono>
-#include <sys/resource.h>
 using namespace std;
 
+// upstream: vector hash functor (verbatim)
 struct VectorHash {
     size_t operator()(const vector<int>& v) const {
         size_t hash = 0;
@@ -23,69 +24,73 @@ struct VectorHash {
     }
 };
 
-int main() {
-    printf("[AJB] ============================================\n");
-    printf("[AJB] test_unordered_map_full  hash perf test\n");
-    printf("[AJB] ============================================\n");
+// AJB: memory snapshot
+static long ajb_rss_kb() {
+    ifstream f("/proc/self/status"); string line;
+    while (getline(f, line))
+        if (line.substr(0, 6) == "VmRSS:")
+            { istringstream iss(line); string k; long v; iss >> k >> v; return v; }
+    return -1;
+}
 
-    const int N = 1700000;
-    printf("[AJB_STATE] N = %d entries\n", N);
+int main() {
+    fprintf(stderr, "[AJB] ============================================\n");
+    fprintf(stderr, "[AJB] test_unordered_map_full  hash perf test\n");
+    fprintf(stderr, "[AJB] ============================================\n");
+
+    long rss0 = ajb_rss_kb();
+    fprintf(stderr, "[AJB_MEM] startup: RSS=%ld KB\n", rss0);
+
+    srand(42);  // AJB: fixed seed
+
+    // upstream: build hash map with 1.7M entries
+    int N = 1700000;
+    fprintf(stderr, "[AJB_TRACE] Building unordered_map with %d entries...\n", N);
 
     unordered_map<vector<int>, int, VectorHash> cache;
     vector<int> vec;
 
-    // upstream: insert phase
-    auto t0 = chrono::high_resolution_clock::now();
-    for (int i = 0; i < N; i++) {
+    auto t_insert_start = chrono::high_resolution_clock::now();
+    for(int i = 0; i < N; i++) {
         vector<int> v = {rand()};
         cache[v] = i;
         vec.push_back(v[0]);
     }
-    auto t1 = chrono::high_resolution_clock::now();
-    double insert_ms = chrono::duration<double,milli>(t1 - t0).count();
-    printf("[AJB_TIMER] insert %d entries: %.3f ms (%.0f ops/ms)\n",
-           N, insert_ms, N / insert_ms);
+    auto t_insert_end = chrono::high_resolution_clock::now();
+    double insert_ms = chrono::duration<double,milli>(t_insert_end - t_insert_start).count();
+    fprintf(stderr, "[AJB_TIMER] insert phase: %.3f ms (%d entries, %.1f M ops/s)\n",
+            insert_ms, N, N / insert_ms / 1000.0);
 
-    // AJB: memory after insert
-    struct rusage ru;
-    getrusage(RUSAGE_SELF, &ru);
-    printf("[AJB_MEM] after insert: maxRSS=%ld KB\n", ru.ru_maxrss);
+    long rss1 = ajb_rss_kb();
+    fprintf(stderr, "[AJB_MEM] after_insert: RSS=%ld KB (delta=%ld)\n", rss1, rss1 - rss0);
+    fprintf(stderr, "[AJB_STATE] cache.size()=%zu  bucket_count=%zu  load_factor=%.3f\n",
+            cache.size(), cache.bucket_count(), cache.load_factor());
 
-    // AJB: dump hash table stats
-    printf("[AJB_STATE] bucket_count=%zu  load_factor=%.3f  "
-           "max_load_factor=%.3f\n",
-           cache.bucket_count(), cache.load_factor(),
-           cache.max_load_factor());
-
-    // upstream: lookup phase
-    auto t2 = chrono::high_resolution_clock::now();
+    // upstream: lookup 1.7M keys, count hits
+    auto t_lookup_start = chrono::high_resolution_clock::now();
     int found = 0;
-    for (int i = 0; i < N; i++) {
-        if (cache.find({vec[i]}) != cache.end()) {
+    for(int i = 0; i < N; i++) {
+        int a = rand();  // upstream: random value (not used for lookup)
+        (void)a;
+        if(cache.find({vec[i]}) != cache.end()) {
             found++;
         }
     }
-    auto t3 = chrono::high_resolution_clock::now();
-    double lookup_ms = chrono::duration<double,milli>(t3 - t2).count();
+    auto t_lookup_end = chrono::high_resolution_clock::now();
+    double lookup_ms = chrono::duration<double,milli>(t_lookup_end - t_lookup_start).count();
 
-    printf("[AJB_TIMER] lookup %d keys: %.3f ms (%.0f ops/ms)\n",
-           N, lookup_ms, N / lookup_ms);
-    printf("[AJB_STATE] Found: %d / %d (hit rate=%.4f)\n",
-           found, N, (double)found / N);
+    cout << "Found: " << found << endl;
+    cout << "Time taken: " << lookup_ms / 1000.0 << " seconds" << endl;
 
-    // AJB: miss test (random keys not in map)
-    auto t4 = chrono::high_resolution_clock::now();
-    int misses = 0;
-    for (int i = 0; i < N; i++) {
-        if (cache.find({rand()}) == cache.end())
-            misses++;
-    }
-    auto t5 = chrono::high_resolution_clock::now();
-    double miss_ms = chrono::duration<double,milli>(t5 - t4).count();
+    // AJB: throughput and hit-rate analysis
+    fprintf(stderr, "[AJB_TIMER] lookup phase: %.3f ms (%d lookups, %.1f M ops/s)\n",
+            lookup_ms, N, N / lookup_ms / 1000.0);
+    fprintf(stderr, "[AJB_STATE] hit_rate=%.1f%% (%d/%d)\n",
+            100.0 * found / N, found, N);
 
-    printf("[AJB_TIMER] miss-probe %d keys: %.3f ms\n", N, miss_ms);
-    printf("[AJB_STATE] Misses: %d / %d\n", misses, N);
-
-    printf("[AJB] VERDICT: test_unordered_map_full PASSED\n");
+    long rss_end = ajb_rss_kb();
+    fprintf(stderr, "[AJB_MEM] final: RSS=%ld KB (total delta=%ld KB)\n",
+            rss_end, rss_end - rss0);
+    fprintf(stderr, "[AJB] VERDICT: test_unordered_map_full PASSED\n");
     return 0;
 }

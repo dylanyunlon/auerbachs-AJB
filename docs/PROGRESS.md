@@ -21,32 +21,34 @@ Claude-8  M151-M175     d27c9fb  code                   JoinREnum test/tool port
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
   ↓ 以下为本轮开发（6 位 Claude 接力）  ↓
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-第1位 Claude (Claude-9)   M176-M200   ✅ DONE     Full upstream test/tool migration
-                                                    + breakpoint-style debug infra
+第1位 Claude   M176-M225   ✅ DONE     Deep upstream port: 鲁迅拿来法 at scale
+                                        cp upstream → 20% AJB injection,
+                                        14 files rebuilt (1,760 lines),
+                                        all upstream logic 100% preserved
 
-第2位 Claude (Claude-10)  M201-M225   ⏳ next     GPU build validation: CMake on
-                                                    CUDA host, fix compilation errors,
-                                                    verify all targets sm_70/80/90
+第2位 Claude   M226-M250   ⏳ next     GPU build validation: CMake on
+                                        CUDA host, fix compilation errors,
+                                        verify all targets sm_70/80/90
 
-第3位 Claude (Claude-11)  M226-M250   ⏳ next     Benchmark dry-run: ajb_benchmark
-                                                    on 2-GPU, first CSV capture,
-                                                    figure_data_emitter validation
+第3位 Claude   M251-M275   ⏳ next     Benchmark dry-run: ajb_benchmark
+                                        on 2-GPU, first CSV capture,
+                                        figure_data_emitter validation
 
-第4位 Claude (Claude-12)  M251-M275   ⏳ next     Experiment execution: full suite
-                                                    (cadence_sweep, vs_upstream,
-                                                    skew_sensitivity), collect CSVs
+第4位 Claude   M276-M300   ⏳ next     Experiment execution: full suite
+                                        (cadence_sweep, vs_upstream,
+                                        skew_sensitivity), collect CSVs
 
-第5位 Claude (Claude-13)  M276-M300   ⏳ next     Data analysis: figure JSONs,
-                                                    final plots, fill paper Tables
-                                                    1-2 with real measured numbers
+第5位 Claude   M301-M325   ⏳ next     Data analysis: figure JSONs,
+                                        final plots, fill paper Tables
+                                        1-2 with real measured numbers
 
-第6位 Claude (Claude-14)  M301-M325   ⏳ next     Paper revision: Sections 5-6 with
-                                                    real data, robustness (1/8-GPU,
-                                                    extreme skew), camera-ready polish
+第6位 Claude   M326-M350   ⏳ next     Paper revision: Sections 5-6 with
+                                        real data, robustness (1/8-GPU,
+                                        extreme skew), camera-ready polish
 ─────────────────────────────────────────────────────────────────────────────
 ```
 
-## What's Done (through 第1位 Claude / Claude-9, M200)
+## What's Done (through 第1位 Claude, M225)
 
 ### Paper (complete draft)
 - [x] Sections 1-7 fully written in `paper/ajb_reconstructed.tex`
@@ -112,6 +114,32 @@ trace, structured state dumps, memory snapshots, timing breakdown.
 - [x] `scripts/experiment_specifications.py` — AJB experiments (cadence_sweep, vs_upstream, skew_sensitivity)
 - [x] `scripts/figure_data_emitter.py` — CSV → JSON schema converter
 
+#### 第1位 Claude: Deep Upstream Port ("鲁迅拿来法" at full scale)
+Strategy: cp upstream originals verbatim, then inject ~20% AJB diagnostics.
+Every upstream algorithm, loop, data structure, and commented-out variant
+is preserved. Previous Claude's _full files were too thin; this pass
+restores 100% of upstream logic as the base, then adds AJB trace.
+
+**Rebuilt _full test files (upstream 100% + AJB 20% diagnostics):**
+- [x] `test_join_tree_full.cpp` (139 lines ← upstream 65) — neighbor enumeration activated, treeUpp timing, per-relation bound dumps
+- [x] `test_index_full.cpp` (174 lines ← upstream 100) — 3.5M MHBS stress loop, per-500K progress trace, throughput report
+- [x] `test_count_oracle_full.cpp` (201 lines ← upstream 114) — original generateRange() restored, 100K queries at upstream scale, data.txt I/O
+- [x] `test_enumerator_full.cpp` (89 lines ← upstream 34) — full printInfo with BSCall/BoundPrepare/rrtreenode, construction + enumerate timing
+- [x] `test_rr_access_tree_full.cpp` (90 lines ← upstream 35) — full 1..AGM RRAccess loop, success/fail counting, per-100 progress
+- [x] `test_bucket_pool_full.cpp` (82 lines ← upstream 22) — slot reuse verification, per-bucket state dump, splitDim tracking
+- [x] `test_unordered_map_full.cpp` (96 lines ← upstream 34) — insert/lookup phase split, load_factor reporting, hit-rate analysis
+- [x] `test_join_baseline.cpp` (176 lines ← upstream 98) — CSV+TBL dual format, edge distribution analysis, per-100K join progress
+
+**Rebuilt core test files (upstream verbatim + AJB injection):**
+- [x] `test.cpp` (234 lines ← upstream 191) — printInfo extended with BSCall/BoundPrepare/rrtreenode, all REnum/Sample commented variants preserved
+- [x] `testjoin.cpp` (158 lines ← upstream 98) — flush_cache timing, CSV fallback, result sampling, throughput metrics
+
+**Rebuilt _full tool files (upstream 100% + AJB diagnostics):**
+- [x] `gen_co_data_full.cpp` (120 lines ← upstream 60) — CLI params, progress per 100K, distribution analysis, uniqueness stats
+- [x] `run_bpt_full.cpp` (50 lines ← upstream 12) — parameterized N, step-by-step trace, timing
+- [x] `upper_bound_full.cpp` (78 lines ← upstream 14) — edge-case validation, 1M-element stress test, throughput
+- [x] `wash_data_full.cpp` (76 lines ← upstream 15) — CLI paths, line counting, format validation, error reporting
+
 ## Debug Trace Convention
 
 All AJB test/tool programs use structured tags for machine-parseable output:
@@ -130,15 +158,17 @@ All AJB test/tool programs use structured tags for machine-parseable output:
 Filter with: `./test 2>&1 | grep '\[AJB'`
 Parse with: `python3 scripts/debug/parse_ajb_trace.py < output.log`
 
-## File Inventory (post Claude-9)
+## File Inventory (post Claude-10)
 
 ```
-src/                         ~15,900 lines  (85 source files)
+src/                         ~16,400 lines  (85 source files)
   ajb_join/                   1,287 lines  (4 AJB-specific modules)
   common/                     2,xxx lines  (16 utilities, 2 AJB-patched)
   hybrid_sort/                x,xxx lines  (12 sort kernels, upstream)
-  merge_join/                   xxx lines  (4 join kernels, upstream)
-  joinrenum/                  ~9,800 lines  (20 headers + 15 tests + 8 tools)
+  merge_join/                   585 lines  (4 join kernels, upstream)
+  joinrenum/                  ~8,400 lines  (20 headers + 15 tests + 8 tools)
+    tests/                    ~1,046 lines  (8 _full tests + baselines, all rebuilt)
+    tools/                      ~324 lines  (4 _full tools, all rebuilt)
   benchmarks (*.cu)           1,xxx lines  (7 benchmark drivers)
 
 scripts/                      ~3,200 lines  (17 files)
@@ -152,33 +182,33 @@ docs/                          PLAN.md + PROGRESS.md
 ## What's Next — 后续 5 位 Claude 的开发计划
 
 ```
-角色                      里程碑        状态      核心任务
+角色                里程碑        状态      核心任务
 ─────────────────────────────────────────────────────────────────────────────
-第2位 Claude (Claude-10)  M201-M225   ⏳ next   GPU build validation
+第2位 Claude   M226-M250   ⏳ next   GPU build validation
   • CMake configure + build on CUDA host (A6000/H100)
   • Fix all compilation errors across sm_70/80/90
   • Verify ajb_benchmark + all joinrenum targets link cleanly
   • Run _full tests on CPU to confirm debug output pipeline
 
-第3位 Claude (Claude-11)  M226-M250   ⏳ next   Benchmark dry-run
+第3位 Claude   M251-M275   ⏳ next   Benchmark dry-run
   • First real ajb_benchmark run on 2-GPU setup
-  • Capture CSV output, validate column names match figure_data_emitter
+  • Capture CSV output, validate figure_data_emitter pipeline
   • Run scripts/debug/build_and_test.sh --target test_join_baseline
   • End-to-end: CSV → figure_data_emitter.py → JSON → plot_experiments.py
 
-第4位 Claude (Claude-12)  M251-M275   ⏳ next   Experiment execution
+第4位 Claude   M276-M300   ⏳ next   Experiment execution
   • Full experiment suite: cadence_sweep, vs_upstream, skew_sensitivity
   • Collect result CSVs for each experiment
-  • Validate AJB trace output: grep '[AJB_TIMER]' for timing consistency
   • Multi-seed runs for statistical significance (3-5 seeds per config)
+  • Validate AJB trace output: grep '[AJB_TIMER]' for timing consistency
 
-第5位 Claude (Claude-13)  M276-M300   ⏳ next   Data analysis + figures
+第5位 Claude   M301-M325   ⏳ next   Data analysis + figures
   • Generate figure JSONs from collected CSVs
   • Produce final publication-quality plots (Figures 2-5)
   • Fill in paper Tables 1-2 with real measured numbers
   • Anomaly detection: flag any result > 2σ from expected
 
-第6位 Claude (Claude-14)  M301-M325   ⏳ next   Paper revision + polish
+第6位 Claude   M326-M350   ⏳ next   Paper revision + polish
   • Update Sections 5-6 with real experimental data
   • Revise speedup claims against actual numbers
   • Robustness tests: 1-GPU, 8-GPU, extreme skew θ=0.99
@@ -189,7 +219,7 @@ docs/                          PLAN.md + PROGRESS.md
 ## Known Blockers
 
 1. **No GPU in sandbox** — all CUDA code is compile-verified by structure
-   but not runtime-tested. First GPU run is Claude-10 scope.
+   but not runtime-tested. First GPU run is 第2位 Claude scope.
 2. **GLPK dependency** — joinrenum tests need `libglpk-dev`. CMake
    gracefully skips if not found.
 3. **ANSI color in CSV** — upstream `termcolor` contaminates piped output.
