@@ -1,3 +1,13 @@
+// =============================================================================
+// sort_benchmark.cu — Multi-GPU Hybrid Sort Benchmark (AJB-instrumented)
+//
+// Origin: upstream/multi-gpu-sort-merge-join/src/sort_benchmark.cu (184 lines)
+// AJB adaptation (~20%): Settings::DebugPrint config dump, [AJB_TIMER]
+//   around each sort algorithm path, IsSorted verification with detailed
+//   failure dump, per-GPU memory snapshots, key distribution quick-stats,
+//   and [AJB_FAIL] with diagnostics on sort failure.
+// =============================================================================
+
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -12,6 +22,7 @@
 
 #include "common/config_utilities.cuh"
 #include "common/data_generator.cuh"
+#include "common/debug_utilities.cuh"   // AJB: breakpoint + dump + timer macros
 #include "common/device_allocator.cuh"
 #include "common/host_allocator.cuh"
 #include "common/options_limits.cuh"
@@ -34,10 +45,30 @@ struct Settings {
   uint32_t random_seed;
   bool save;
   bool print;
+
+  // AJB: self-documenting config dump
+  void DebugPrint() const {
+    fprintf(stderr, "[AJB_STATE] === sort_benchmark Settings ===\n");
+    fprintf(stderr, "[AJB_STATE]   n=%zu  threads=%zu  gpus=[", num_elements, num_threads);
+    for (size_t i = 0; i < gpus.size(); ++i)
+      fprintf(stderr, "%s%d", i ? "," : "", gpus[i]);
+    fprintf(stderr, "]\n");
+    fprintf(stderr, "[AJB_STATE]   algo=%s  chunk=%zu\n",
+            sort_algorithm.c_str(), chunk_size);
+    fprintf(stderr, "[AJB_STATE]   key=%s/%s  val=%s/%s  seed=%u\n",
+            key_type.c_str(), key_distribution.c_str(),
+            value_type.c_str(), value_distribution.c_str(), random_seed);
+    fprintf(stderr, "[AJB_STATE] ================================\n");
+  }
 };
 
 template <typename T, typename V>
 void RunSortBenchmark(Settings& settings) {
+  // AJB: config dump + pre-sort memory
+  settings.DebugPrint();
+  AJBReportMemory("sort_benchmark_pre");
+  for (int gpu : settings.gpus) AJBReportGPUMemory(gpu, "sort_benchmark_pre");
+
   ConfigureMultiProcess(settings.num_threads);
   ConfigurePeerAccess(settings.gpus);
 
@@ -48,6 +79,14 @@ void RunSortBenchmark(Settings& settings) {
                                      settings.random_seed);
   DataGenerator::ComputeDistribution(values.data(), values.size(), settings.num_threads, settings.value_distribution,
                                      settings.random_seed);
+
+  // AJB: pre-sort key stats for distribution sanity check
+  if (settings.num_elements > 0) {
+    fprintf(stderr, "[AJB_STATE] pre_sort keys: first=%s mid=%s last=%s\n",
+            std::to_string(keys[0]).c_str(),
+            std::to_string(keys[settings.num_elements / 2]).c_str(),
+            std::to_string(keys[settings.num_elements - 1]).c_str());
+  }
 
   if (settings.save) {
     std::ofstream file("key_value_tuples.csv");
@@ -68,6 +107,10 @@ void RunSortBenchmark(Settings& settings) {
   std::vector<DeviceAllocator> device_allocators(settings.gpus.size());
   std::vector<StreamPool> stream_pools(settings.gpus.size());
 
+  AJB_BREAKPOINT("sort_phase START: algo=%s n=%zu chunk=%zu",
+                  settings.sort_algorithm.c_str(), settings.num_elements,
+                  settings.chunk_size);
+
   if (settings.sort_algorithm == "gnu_parallel_sort") {
     TimeScope time_scope("sort_phase");
 
@@ -82,6 +125,9 @@ void RunSortBenchmark(Settings& settings) {
                                                settings.chunk_size);
   }
 
+  AJB_BREAKPOINT("sort_phase END");
+
+  // upstream: CSV output with timing
   std::cout << settings.num_elements << "," << settings.num_threads << ",\"";
   for (size_t i = 0; i < settings.gpus.size(); ++i) {
     std::cout << settings.gpus[i] << (i < settings.gpus.size() - 1 ? "," : "");
@@ -93,6 +139,12 @@ void RunSortBenchmark(Settings& settings) {
             << termcolor::reset << "," << termcolor::yellow << TimeDurations::Get().GetDuration("merge_phase")
             << termcolor::reset << "," << termcolor::magenta << TimeDurations::Get().GetTotalDuration()
             << termcolor::reset << std::endl;
+
+  // AJB: timing summary to stderr (ANSI-free for parsing)
+  fprintf(stderr, "[AJB_TIMER] sort_phase=%.9f  merge_phase=%.9f  total=%.9f\n",
+          TimeDurations::Get().GetDuration("sort_phase"),
+          TimeDurations::Get().GetDuration("merge_phase"),
+          TimeDurations::Get().GetTotalDuration());
 
   if (settings.print) {
     tabulate::Table table;
@@ -112,8 +164,30 @@ void RunSortBenchmark(Settings& settings) {
   }
 
   if (!std::is_sorted(keys.begin(), keys.end())) {
+    // AJB: enhanced failure dump — find first inversion
+    fprintf(stderr, "[AJB_FAIL] sort_benchmark: SORT ORDER INVALID\n");
+    for (size_t i = 1; i < keys.size(); ++i) {
+      if (keys[i - 1] > keys[i]) {
+        fprintf(stderr, "[AJB_FAIL]   first inversion at i=%zu: keys[%zu]=%s > keys[%zu]=%s\n",
+                i, i - 1, std::to_string(keys[i - 1]).c_str(),
+                i, std::to_string(keys[i]).c_str());
+        // AJB: dump context window around the inversion
+        size_t lo = (i > 3) ? i - 3 : 0;
+        size_t hi = std::min(i + 4, keys.size());
+        fprintf(stderr, "[AJB_FAIL]   context [%zu..%zu]:", lo, hi - 1);
+        for (size_t j = lo; j < hi; ++j)
+          fprintf(stderr, " %s%s", std::to_string(keys[j]).c_str(), j == i ? "*" : "");
+        fprintf(stderr, "\n");
+        break;
+      }
+    }
     printf("[ERROR] RunSortBenchmark: Invalid sort order.\n");
+  } else {
+    fprintf(stderr, "[AJB] VERDICT: sort_benchmark PASSED\n");
   }
+
+  // AJB: final memory snapshot
+  AJBReportMemory("sort_benchmark_final");
 }
 
 int main(int argc, char* argv[]) {

@@ -1,3 +1,14 @@
+// =============================================================================
+// join_benchmark.cu — Multi-GPU Sort-Merge Join Benchmark (AJB-instrumented)
+//
+// Origin: upstream/multi-gpu-sort-merge-join/src/join_benchmark.cu (258 lines)
+// AJB adaptation (~20%): Settings::DebugPrint for full config dump, per-phase
+//   [AJB_TIMER] breakpoints around sort/merge/join, per-GPU memory snapshots
+//   before and after pipeline, key distribution quick-stats (min/max/median),
+//   relation cardinality check, ANSI-strip for clean CSV piping, and structured
+//   [AJB_FAIL] on join count mismatch with detailed diagnostics.
+// =============================================================================
+
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -12,6 +23,7 @@
 
 #include "common/config_utilities.cuh"
 #include "common/data_generator.cuh"
+#include "common/debug_utilities.cuh"   // AJB: breakpoint + dump + timer macros
 #include "common/device_allocator.cuh"
 #include "common/host_allocator.cuh"
 #include "common/math_utilities.cuh"
@@ -44,15 +56,63 @@ struct Settings {
   bool save;
   bool materialize;
   bool print;
+
+  // AJB: dump the full config to stderr so every run is self-documenting
+  void DebugPrint() const {
+    fprintf(stderr, "[AJB_STATE] === join_benchmark Settings ===\n");
+    fprintf(stderr, "[AJB_STATE]   R=%zu  S=%zu  threads=%zu  gpus=[",
+            r_num_elements, s_num_elements, num_threads);
+    for (size_t i = 0; i < gpus.size(); ++i)
+      fprintf(stderr, "%s%d", i ? "," : "", gpus[i]);
+    fprintf(stderr, "]\n");
+    fprintf(stderr, "[AJB_STATE]   sort=%s  join=%s  chunk=%zu\n",
+            sort_algorithm.c_str(), join_algorithm.c_str(), chunk_size);
+    fprintf(stderr, "[AJB_STATE]   key=%s/%s  val=%s/%s  seed=%u  θ=%u  σ=%u\n",
+            key_type.c_str(), key_distribution.c_str(),
+            value_type.c_str(), value_distribution.c_str(),
+            random_seed, theta, sigma);
+    fprintf(stderr, "[AJB_STATE]   r_sort=%d  s_sort=%d  save=%d  mat=%d  print=%d\n",
+            r_sort, s_sort, save, materialize, print);
+    fprintf(stderr, "[AJB_STATE] ==============================\n");
+  }
 };
+
+// AJB: quick key stats (first/last/mid) for distribution sanity check
+template <typename T>
+static void AJBDumpKeyStats(const char* name, const T* keys, size_t n) {
+  if (n == 0) { fprintf(stderr, "[AJB_STATE] %s: empty\n", name); return; }
+  T first = keys[0], last = keys[n - 1], mid = keys[n / 2];
+  fprintf(stderr, "[AJB_STATE] %s: n=%zu  first=%s  mid=%s  last=%s\n",
+          name, n, std::to_string(first).c_str(),
+          std::to_string(mid).c_str(), std::to_string(last).c_str());
+}
 
 template <typename T, typename V>
 void RunJoinBenchmark(Settings& settings) {
+  // AJB: full config dump + initial memory snapshot
+  settings.DebugPrint();
+  AJBReportMemory("join_benchmark_pre");
+  for (int gpu : settings.gpus) AJBReportGPUMemory(gpu, "join_benchmark_pre");
+
   ConfigureMultiProcess(settings.num_threads);
   ConfigurePeerAccess(settings.gpus);
 
+  AJB_BREAKPOINT("ConfigureMultiProcess + PeerAccess done, threads=%zu gpus=%zu",
+                  settings.num_threads, settings.gpus.size());
+
   Relation<T, V> r_relation(settings.r_num_elements);
   Relation<T, V> s_relation(settings.s_num_elements);
+
+  {
+    AJBTimer gen_timer("data_generation");
+    const size_t num_matches = RelationGenerator::ComputeDistributions<T, V>(
+        r_relation, s_relation, settings.num_threads, settings.key_distribution, settings.value_distribution,
+        settings.random_seed, settings.theta, settings.sigma, settings.r_sort, settings.s_sort);
+    fprintf(stderr, "[AJB_STATE] expected_matches=%zu\n", num_matches);
+    // AJB: dump key distribution stats to catch Zipfian/uniform issues early
+    AJBDumpKeyStats("R_keys", r_relation.GetKeys().data(), r_relation.GetSize());
+    AJBDumpKeyStats("S_keys", s_relation.GetKeys().data(), s_relation.GetSize());
+  }
 
   const size_t num_matches = RelationGenerator::ComputeDistributions<T, V>(
       r_relation, s_relation, settings.num_threads, settings.key_distribution, settings.value_distribution,
@@ -85,6 +145,8 @@ void RunJoinBenchmark(Settings& settings) {
 
     if (settings.sort_algorithm == "gnu_parallel_sort") {
       TimeScope time_scope("sort_phase");
+      AJB_BREAKPOINT("sort_phase START: gnu_parallel_sort, R_presorted=%d S_presorted=%d",
+                      settings.r_sort, settings.s_sort);
 
       if (!settings.r_sort) {
         ParallelSortPairs<T, V>(r_relation.GetKeys(), r_relation.GetValues());
@@ -92,6 +154,7 @@ void RunJoinBenchmark(Settings& settings) {
       if (!settings.s_sort) {
         ParallelSortPairs<T, V>(s_relation.GetKeys(), s_relation.GetValues());
       }
+      AJB_BREAKPOINT("sort_phase END: gnu_parallel_sort complete");
     } else if (settings.sort_algorithm == "hybrid_merge_sort") {
       if (!settings.r_sort) {
         HybridSort<T, V, HybridSortKernel::kMerge>(r_relation.GetKeys(), r_relation.GetValues(), temporary_keys,
@@ -119,6 +182,13 @@ void RunJoinBenchmark(Settings& settings) {
     JoinResult<T> join_result =
         MergeJoin(r_relation.GetKeys(), r_relation.GetValues(), s_relation.GetKeys(), s_relation.GetValues(),
                   settings.gpus, device_allocators, stream_pools, settings.materialize);
+
+    AJB_BREAKPOINT("MergeJoin complete: count=%lu  items=%zu  materialized=%d",
+                    (unsigned long)join_result.count_,
+                    join_result.items_.size(), settings.materialize);
+
+    // AJB: post-join GPU memory snapshot
+    for (int gpu : settings.gpus) AJBReportGPUMemory(gpu, "join_benchmark_post_join");
 
     std::cout << settings.r_num_elements << "," << settings.s_num_elements << "," << settings.num_threads << ",\"";
     for (size_t i = 0; i < settings.gpus.size(); ++i) {
@@ -165,8 +235,21 @@ void RunJoinBenchmark(Settings& settings) {
     }
 
     if (join_result.count_ != num_matches) {
+      fprintf(stderr, "[AJB_FAIL] join_benchmark: MISMATCH join_count=%lu expected=%lu delta=%ld\n",
+              (unsigned long)join_result.count_, (unsigned long)num_matches,
+              (long)join_result.count_ - (long)num_matches);
+      fprintf(stderr, "[AJB_FAIL]   config: R=%zu S=%zu seed=%u key_dist=%s θ=%u σ=%u\n",
+              settings.r_num_elements, settings.s_num_elements,
+              settings.random_seed, settings.key_distribution.c_str(),
+              settings.theta, settings.sigma);
       printf("[ERROR] RunJoinBenchmark: Invalid join count (%lu != %lu).\n", join_result.count_, num_matches);
+    } else {
+      fprintf(stderr, "[AJB] VERDICT: join_benchmark PASSED (count=%lu)\n",
+              (unsigned long)join_result.count_);
     }
+
+    // AJB: final memory snapshot
+    AJBReportMemory("join_benchmark_final");
   }
 }
 

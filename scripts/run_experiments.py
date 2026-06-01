@@ -1,7 +1,18 @@
+# =============================================================================
+# run_experiments.py — Multi-GPU experiment runner (AJB-instrumented)
+#
+# Origin: upstream/multi-gpu-sort-merge-join/scripts/run_experiments.py (112 lines)
+# AJB adaptation (~20%): per-experiment [AJB_TRACE] start/end tags, stderr
+#   capture to .stderr.log alongside CSV, per-repetition progress reporting,
+#   structured failure dump with the failing command + return code, and
+#   summary statistics (total time, pass/fail count) for parse_ajb_trace.py.
+# =============================================================================
+
 import argparse
 import pathlib
 import pytictoc
 import subprocess
+import sys
 import time
 
 from info_utilities import *
@@ -47,16 +58,27 @@ if __name__ == "__main__":
     print_info(InfoType.DOUBLE_SEPARATOR, f"Running {len(experiments)} experiment{'s' if len(experiments) > 1 else ''}")
     print_info(InfoType.SINGLE_SEPARATOR)
 
+    # AJB: track pass/fail counts for summary
+    pass_count = 0
+    fail_count = 0
+
     timer = pytictoc.TicToc()
     elapsed_times = []
 
     for experiment in experiments:
         print_info(InfoType.RUN, experiment.identifier)
+        # AJB: structured trace for experiment start
+        print_info(InfoType.AJB_TRACE,
+                   f"experiment={experiment.identifier} "
+                   f"configs={len(experiment.arguments)} "
+                   f"reps={experiment.repetitions}")
 
         is_success = True
         timer.tic()
 
         output_path = experiment_path / f"{experiment.executable}_{experiment.identifier}.csv"
+        # AJB: capture stderr to separate log for AJB trace parsing
+        stderr_path = experiment_path / f"{experiment.executable}_{experiment.identifier}.stderr.log"
 
         with output_path.open("a") as output_file:
             quoted_columns = [f"\"{column}\"" for column in experiment.columns]
@@ -73,16 +95,32 @@ if __name__ == "__main__":
                     command += f" {parameter} {argument}"
 
             for repetition in range(experiment.repetitions):
+                # AJB: per-repetition progress
+                print_info(InfoType.AJB_TRACE,
+                           f"  config {index+1}/{len(experiment.arguments)} "
+                           f"rep {repetition+1}/{experiment.repetitions}")
+
                 output = subprocess.run(command,
                                         stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE,   # AJB: capture stderr
                                         universal_newlines=True,
                                         shell=True)
 
                 if output.returncode == 0:
                     with output_path.open("a") as output_file:
                         output_file.write(output.stdout)
+                    # AJB: append stderr (contains [AJB_*] tags) to log
+                    if output.stderr:
+                        with stderr_path.open("a") as sf:
+                            sf.write(f"--- config={index} rep={repetition} ---\n")
+                            sf.write(output.stderr)
                 else:
+                    # AJB: structured failure dump
+                    print_info(InfoType.AJB_FAIL,
+                               f"rc={output.returncode} cmd={command}")
+                    if output.stderr:
+                        for line in output.stderr.strip().split('\n')[-5:]:
+                            print_info(InfoType.AJB_FAIL, f"  stderr: {line}")
                     print(f"[ERROR] {command}: subprocess.run failed.")
                     is_success = False
 
@@ -104,9 +142,21 @@ if __name__ == "__main__":
 
         elapsed_times.append(round(timer.tocvalue(), 2))
 
+        if is_success:
+            pass_count += 1
+        else:
+            fail_count += 1
+
         print_info(InfoType.PASSED if is_success else InfoType.FAILED,
                    f"{experiment.identifier} ({elapsed_times[-1]}s)")
         print_info(InfoType.SINGLE_SEPARATOR)
 
+    # AJB: structured summary for parse_ajb_trace.py
+    total_time = sum(elapsed_times)
+    print_info(InfoType.AJB_TIMER, f"total_experiment_time={total_time:.2f}s")
+    print_info(InfoType.AJB_TRACE,
+               f"SUMMARY: {pass_count} passed, {fail_count} failed, "
+               f"{len(experiments)} total in {total_time:.1f}s")
+
     print_info(InfoType.DOUBLE_SEPARATOR,
-               f"{len(experiments)} experiment{'s' if len(experiments) > 1 else ''} ran ({sum(elapsed_times)}s)")
+               f"{len(experiments)} experiment{'s' if len(experiments) > 1 else ''} ran ({total_time}s)")

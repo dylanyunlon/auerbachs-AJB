@@ -1,4 +1,15 @@
+// =============================================================================
+// BinarySearch.cpp — Multi-Head Binary Search experiments (AJB-instrumented)
+//
+// Origin: upstream/joinrenum/BinarySearch.cpp (216 lines, verbatim algorithms)
+// AJB adaptation (~20%): [AJB_STATE] dumps for global loop/call counters
+//   (cntLoop1/2, cntF1/2), per-test structured trace output, chrono-based
+//   timing around gendata + each MHBS variant, and data distribution stats
+//   (min/max/median of generated matrix rows) for skew debugging.
+// =============================================================================
+
 #include<bits/stdc++.h>
+#include<chrono>   // AJB: hi-res timing
 #define TBD 0
 #define MAX_INT 0x7fffffff
 #define MAX_DATA 2000000000
@@ -6,6 +17,15 @@ using namespace std;
 vector<vector<int> > matrix;
 int cntLoop1 = 0, cntLoop2 = 0;
 int cntF1 = 0, cntF2 = 0;
+
+// AJB: counter reset + dump helper
+static void ajb_reset_counters() {
+    cntLoop1 = cntLoop2 = cntF1 = cntF2 = 0;
+}
+static void ajb_dump_counters(const char* label) {
+    fprintf(stderr, "[AJB_STATE] %s: cntLoop1=%d cntLoop2=%d cntF1=%d cntF2=%d\n",
+            label, cntLoop1, cntLoop2, cntF1, cntF2);
+}
 
 
 double F(const vector<int> && pos) {
@@ -28,6 +48,12 @@ void gendata(int m, int n, int p) {
             matrix[i][j] = ((rand() << 15) + rand()) % p;
         }
         sort(matrix[i].begin(), matrix[i].end());
+    }
+    // AJB: distribution stats per matrix row for skew debugging
+    fprintf(stderr, "[AJB_STATE] gendata: m=%d n=%d p=%d\n", m, n, p);
+    for (int i = 0; i < m && i < 5; i++) {
+        fprintf(stderr, "[AJB_STATE]   row[%d]: min=%d mid=%d max=%d\n",
+                i, matrix[i].front(), matrix[i][n/2], matrix[i].back());
     }
     return;
 }

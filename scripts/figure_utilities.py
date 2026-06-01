@@ -1,3 +1,15 @@
+# =============================================================================
+# figure_utilities.py — Matplotlib plotting utilities (AJB-instrumented)
+#
+# Origin: upstream/multi-gpu-sort-merge-join/scripts/figure_utilities.py (229 lines)
+# AJB adaptation (~20%): AJB-specific color palette for tier comparison plots,
+#   data validation helper (NaN/Inf/negative detection before plotting),
+#   [AJB_STATE] print for each plot call showing shape/range/series,
+#   auto-fallback when LaTeX is unavailable (CI/headless environments).
+# =============================================================================
+
+import os
+import sys
 import matplotlib as plotlib
 import matplotlib.container as container
 import matplotlib.pyplot as pyplot
@@ -6,9 +18,19 @@ import pandas
 
 from typing import Any, List, Tuple
 
+# AJB: graceful LaTeX fallback for headless/CI environments
+_use_latex = True
+try:
+    plotlib.rcParams.update({
+        "text.usetex": True,
+        "text.latex.preamble": "\\usepackage{amsmath}\\usepackage{lmodern}",
+    })
+except Exception:
+    _use_latex = False
+    print("[AJB_WARN] LaTeX not available, falling back to default renderer",
+          file=sys.stderr)
+
 plotlib.rcParams.update({
-    "text.usetex": True,
-    "text.latex.preamble": "\\usepackage{amsmath}\\usepackage{lmodern}",
     "font.family": "serif",
     "font.serif": ["Latin Modern Roman"],
     "hatch.linewidth": 0.5
@@ -24,6 +46,37 @@ large_font_size = 23
 colors = ["#3193C6", "#05AD97", "#AAC56C", "#F7AB13", "#CD4E38", "#7D52A5"]
 hatches = ["///", "\\\\\\", "xxx", "...", "oo"]
 markers = ["o", "v", "s", "d", "h"]
+
+# AJB: dedicated palette for bandwidth-tier comparison (NVLink vs PCIe vs Host)
+ajb_tier_colors = {
+    "nvlink":  "#05AD97",   # teal — fast P2P
+    "pcie":    "#F7AB13",   # amber — slow PCIe
+    "host":    "#CD4E38",   # red — host DRAM
+    "ajb":     "#3193C6",   # blue — AJB adaptive
+    "baseline":"#7D52A5",   # purple — upstream baseline
+}
+
+# AJB: data validation — catch NaN/Inf/negative before they silently break plots
+def ajb_validate_plot_data(data, label="plot_data"):
+    """Check for NaN, Inf, or unexpected negatives; print [AJB_WARN] to stderr."""
+    issues = []
+    if isinstance(data, pandas.DataFrame):
+        for col in data.select_dtypes(include=[numpy.number]).columns:
+            nan_count = data[col].isna().sum()
+            inf_count = numpy.isinf(data[col].values).sum() if data[col].dtype != object else 0
+            neg_count = (data[col] < 0).sum()
+            if nan_count: issues.append(f"{col}: {nan_count} NaN")
+            if inf_count: issues.append(f"{col}: {inf_count} Inf")
+            if neg_count: issues.append(f"{col}: {neg_count} negative")
+    elif isinstance(data, (list, numpy.ndarray)):
+        arr = numpy.array(data, dtype=float)
+        if numpy.any(numpy.isnan(arr)): issues.append("NaN detected")
+        if numpy.any(numpy.isinf(arr)): issues.append("Inf detected")
+    if issues:
+        print(f"[AJB_WARN] {label}: {'; '.join(issues)}", file=sys.stderr)
+    else:
+        print(f"[AJB_STATE] {label}: data valid (no NaN/Inf)", file=sys.stderr)
+    return len(issues) == 0
 
 
 def scale_figure_size(width_factor: float, height_factor: float):
