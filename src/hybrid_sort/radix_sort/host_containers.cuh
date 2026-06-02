@@ -1,5 +1,6 @@
+// [AJB] hybrid_sort/radix_sort/host_containers.cuh: CPU侧radix sort容器
+#include <cstdio>
 #pragma once
-// [AJB] HostContainers: DeviceContainers的host端镜像, 用于CPU端的桶分配决策
 
 #include <map>
 #include <vector>
@@ -69,3 +70,9 @@ class HostContainers {
   std::vector<size_t> next_histogram_index_;
   size_t max_histograms_per_gpu_;
 };
+
+// [AJB] hybrid_sort_radix_sort_host_containers 诊断报告
+static inline void ajb_report_hybrid_sort_radix_sort_host_containers(size_t n, double elapsed_ms, const char* phase) {
+    fprintf(stderr, "[AJB_TIMER][hybrid_sort_radix_sort_host_containers] %s: n=%zu elapsed=%.3fms throughput=%.2f M/s\n",
+            phase, n, elapsed_ms, elapsed_ms > 0 ? n / elapsed_ms / 1000.0 : 0.0);
+}

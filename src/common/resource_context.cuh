@@ -1,5 +1,7 @@
+// [AJB] ResourceContext: moderngpu的context适配器
+// 把mgpu的alloc/free转接到DeviceAllocator
+// mgpu的sort/merge kernel通过这个context获取临时显存
 #pragma once
-// [AJB] ResourceContext: moderngpu的context适配器, 把mgpu的alloc/free转接到DeviceAllocator
 
 #include <moderngpu/context.hxx>
 
@@ -29,3 +31,9 @@ struct ResourceContext : public mgpu::standard_context_t {
  private:
   DeviceAllocator& device_allocator_;
 };
+
+#include <cstdio>
+// [AJB] context创建跟踪
+static inline void ajb_report_context_create(int device_id, const char* tag) {
+    fprintf(stderr, "[AJB_TRACE][ResourceContext] created for device %d (%s)\n", device_id, tag);
+}

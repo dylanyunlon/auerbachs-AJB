@@ -1,3 +1,6 @@
+// [AJB] ParallelAlgorithms: thrust/cub的wrapper
+// 包含scan, sort, merge等GPU并行原语
+// 这些是hybrid_sort和merge_join的底层building blocks
 #pragma once
 
 #include <vector>
@@ -47,8 +50,19 @@ void ParallelMergePairs(PinnedVector<T>& in_keys, PinnedVector<V>& in_values, Pi
 
   KeyValueZipIter<T, V> out_begin_zip_iter(out_keys.begin(), out_values.begin());
 
-  // [AJB] CPU端k-way归并: 如果chunk_groups很多,这里是瓶颈
-  fprintf(stderr, "[AJB_TRACE][Parallel] %zu-way merge, total %zu elements\n", num_chunk_groups, num_elements);
   __gnu_parallel::multiway_merge(zip_iter_pairs.begin(), zip_iter_pairs.end(), out_begin_zip_iter, num_elements,
                                  std::less<>());
 }
+
+#include <cstdio>
+// [AJB] parallel op计时宏
+#define AJB_PARALLEL_TIMED(op_name, code) do {                                  \
+    cudaEvent_t _s, _e;                                                         \
+    cudaEventCreate(&_s); cudaEventCreate(&_e);                                 \
+    cudaEventRecord(_s);                                                        \
+    { code; }                                                                   \
+    cudaEventRecord(_e); cudaEventSynchronize(_e);                              \
+    float _ms; cudaEventElapsedTime(&_ms, _s, _e);                              \
+    fprintf(stderr, "[AJB_TIMER][Parallel] %s: %.3fms\n", op_name, _ms);        \
+    cudaEventDestroy(_s); cudaEventDestroy(_e);                                 \
+} while(0)

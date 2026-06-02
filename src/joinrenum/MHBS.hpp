@@ -1,9 +1,23 @@
 #include <vector>
-// [AJB] MHBS: Multi-Hash Bucket Splitting — setAGMandIters中hash分桶来估AGM bound
+// [AJB] MHBS: Multi-Head Binary Search — 多relation同时二分, 找splitDim的最优split point
+// 这是setAGM的核心子程序, 在每次bucket分裂时被调用
 #include <cmath>
 #include "AGM.hpp"
 using namespace std;
 
+// [AJB] MHBS诊断
+static thread_local struct {
+    long long calls = 0;
+    long long iterations = 0;     // while循环总轮数
+    long long early_returns = 0;  // 单元素range直接返回的次数
+    int       max_rels = 0;       // 见过的最大rels.size()
+    void dump(const char* tag = "MHBS") {
+        fprintf(stderr, "[AJB_STATE][%s] calls=%lld iters=%lld early_ret=%lld max_rels=%d avg_iters=%.1f\n",
+                tag, calls, iterations, early_returns, max_rels,
+                calls > 0 ? (double)iterations / calls : 0.0);
+    }
+    void reset() { calls = iterations = early_returns = 0; max_rels = 0; }
+} ajb_mhbs_stats;
 
 void getpos(const vector<pair<vector<int>::iterator, vector<int>::iterator> > &iters, const vector<pair<vector<int>::iterator, vector<int>::iterator> > &bounds, const vector<bool> &flag, const int t, vector<int> &pos) {
     for (int i = 0; i < iters.size(); i++) {
@@ -13,6 +27,8 @@ void getpos(const vector<pair<vector<int>::iterator, vector<int>::iterator> > &i
 }
 
 int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::iterator> > &iters, const vector<bool> &flag, vector<int> &rels, const long long target, Query &q) {
+    ajb_mhbs_stats.calls++;
+    if((int)rels.size() > ajb_mhbs_stats.max_rels) ajb_mhbs_stats.max_rels = rels.size();
     vector<pair<vector<int>::iterator, vector<int>::iterator> > bounds = iters;
     vector<vector<int>::iterator> itermid(iters.size());
     vector<int> pos(iters.size());
@@ -20,12 +36,21 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
     int mini, maxi, cnt = 0;
     long long upp;
     double res;
+    // [AJB_TRACE] MHBS entry: target是本次搜索的AGM bound目标
+    if(ajb_mhbs_stats.calls <= 10)
+        fprintf(stderr, "[AJB_TRACE][MHBS] #%lld: target=%lld rels=%zu iters_sizes=[",
+                ajb_mhbs_stats.calls, target, rels.size());
     for(int i = 0; i < iters.size(); i++) {
+        if(ajb_mhbs_stats.calls <= 10){
+            if(i) fprintf(stderr, ",");
+            fprintf(stderr, "%ld", iters[i].second - iters[i].first);
+        }
         if(!flag[i]) {
             pos[i] = iters[i].second - iters[i].first;
             cnt++;
         }
         else if(iters[i].second - iters[i].first <= 1) {
+            ajb_mhbs_stats.early_returns++;
             getpos(iters, bounds, flag, *iters[i].first + 1, tmppos);
             res = q.AGM(tmppos);
             upp = ceil(res) - res < 1e-5 ? ceil(res) : (long long)(res);
@@ -38,7 +63,11 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
             pos[i] = itermid[i] - iters[i].first;
         }
     }
+    if(ajb_mhbs_stats.calls <= 10) fprintf(stderr, "]\n");
+    int loop_iters = 0;
     while(cnt < iters.size()) {
+        loop_iters++;
+        ajb_mhbs_stats.iterations++;
         mini = -1, maxi = -1;
         for(size_t i : rels){
             if(bounds[i].second - bounds[i].first <= 1) continue;
@@ -84,5 +113,8 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
     for(int i = 0; i < iters.size(); i++) {
         if(bounds[i].second != iters[i].second) ans = min(ans, *bounds[i].second);
     }
+    // [AJB_TRACE] MHBS converged: 轮数多说明值域跨度大
+    if(loop_iters > 50 || ajb_mhbs_stats.calls <= 10)
+        fprintf(stderr, "[AJB_TRACE][MHBS] converged: iters=%d ans=%d\n", loop_iters, ans);
     return ans;
 }

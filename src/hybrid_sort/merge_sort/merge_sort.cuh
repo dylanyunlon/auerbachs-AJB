@@ -1,3 +1,21 @@
+// [AJB] merge_sort.cuh: GPU merge sort — 小数据量时比radix sort更高效
+// 多轮merge: 先warp内排序, 然后成倍merge直到全局有序
+// 在hybrid_sort里, 数据量小于阈值时走这条路径
+#include <cstdio>
+
+// [AJB] merge sort诊断
+static thread_local struct {
+    long long sort_calls = 0;
+    long long total_elements = 0;
+    long long merge_rounds = 0;  // 总merge轮次
+    int max_gpus = 0;
+    void dump(const char* tag = "MergeSort") {
+        fprintf(stderr, "[AJB_STATE][%s] calls=%lld elements=%lld rounds=%lld gpus=%d\n",
+                tag, sort_calls, total_elements, merge_rounds, max_gpus);
+    }
+    void reset() { sort_calls = total_elements = merge_rounds = 0; max_gpus = 0; }
+} ajb_msort_stats;
+
 #pragma once
 
 #include <array>
@@ -48,6 +66,7 @@ size_t FindPivot(ResourceManager<T, V>& resource_manager, const std::vector<int>
                                  cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
 
   SelectPivot<T><<<1, 1, 0, stream_pool.GetStream(0)>>>(chunk_size, num_partitions, local_virtual_partition,
+      // [AJB_TRACE] merge sort kernel launch
                                                         remote_virtual_partition, device_pivot);
 
   CheckCudaError(
@@ -141,6 +160,7 @@ std::array<int, 2> SwapPartitions(ResourceManager<T, V>& resource_manager, const
   }
 
   return gpus_to_merge;
+  fprintf(stderr, "[AJB_BP][MergeSort] complete\n");
 }
 
 template <typename T, typename V>
@@ -204,6 +224,10 @@ void MergePartitions(ResourceManager<T, V>& resource_manager, const std::vector<
 template <typename T, typename V>
 std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_values, const size_t num_elements,
                                 ResourceManager<T, V>& resource_manager, std::vector<int> gpus) {
+  ajb_msort_stats.sort_calls++;
+  ajb_msort_stats.total_elements += num_elements;
+  if((int)gpus.size() > ajb_msort_stats.max_gpus) ajb_msort_stats.max_gpus = gpus.size();
+  fprintf(stderr, "[AJB_BP][MergeSort] start: n=%zu gpus=%zu\n", num_elements, gpus.size());
   size_t num_fillers = (num_elements % gpus.size() != 0) ? (gpus.size() - num_elements % gpus.size()) : 0;
   size_t chunk_size = (num_elements + num_fillers) / gpus.size();
 
@@ -214,9 +238,6 @@ std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_va
   }
 
   const size_t num_gpus = gpus.size();
-  // [AJB] merge sort: 先每GPU独立thrust排序,再树形跨GPU归并
-  fprintf(stderr, "[AJB_BP][MergeSort] n=%zu gpus=%zu chunk=%zu fillers=%zu\n",
-          num_elements, num_gpus, chunk_size, num_fillers);
 
 #pragma omp parallel for num_threads(num_gpus)
   for (size_t i = 0; i < num_gpus; ++i) {

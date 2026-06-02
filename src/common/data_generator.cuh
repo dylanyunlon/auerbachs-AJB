@@ -50,13 +50,6 @@ class DataGenerator {
     } else if (distribution_type == "unique_partial_key_range") {
       ComputeUniquePartialKeyRangeDistribution<T>(begin, num_elements, num_threads, random_seed);
     }
-    // [AJB] 分布采样: 打印头/中/尾3个值和极值,验证分布参数是否生效
-    if (num_elements >= 3) {
-      T v0 = begin[0], vm = begin[num_elements/2], vn = begin[num_elements-1];
-      fprintf(stderr, "[AJB_STATE][DataGen] dist=%s n=%zu  head=%llu mid=%llu tail=%llu  seed=%u\n",
-              distribution_type.c_str(), num_elements,
-              (unsigned long long)v0, (unsigned long long)vm, (unsigned long long)vn, random_seed);
-    }
     std::this_thread::sleep_for(std::chrono::milliseconds(kSleepDuration));
   }
 
@@ -318,3 +311,28 @@ class DataGenerator {
   static constexpr uint64_t kSkewMax = std::numeric_limits<uint32_t>::max();
   static constexpr double kSkewTheta = 0.2;
 };
+
+// [AJB] 数据生成诊断: 输出key分布的前/中/尾统计
+#include <cstdio>
+#include <algorithm>
+template<typename T>
+static inline void ajb_report_generated_data(const T* data, size_t n, const char* tag) {
+    if(n == 0) return;
+    T first = data[0], mid = data[n/2], last = data[n-1];
+    fprintf(stderr, "[AJB_STATE][DataGen] %s: n=%zu first=%lld mid=%lld last=%lld\n",
+            tag, n, (long long)first, (long long)mid, (long long)last);
+}
+// [AJB] skew检测: 检查Zipf分布的实际偏斜度
+template<typename T>
+static inline void ajb_report_key_distribution(const T* keys, size_t n, const char* tag) {
+    if(n < 10) return;
+    // 采样1000个位置统计重复率
+    size_t sample_size = std::min(n, (size_t)1000);
+    size_t step = n / sample_size;
+    size_t duplicates = 0;
+    for(size_t i = step; i < n; i += step)
+        if(keys[i] == keys[i - step]) duplicates++;
+    double dup_rate = (double)duplicates / (sample_size > 1 ? sample_size - 1 : 1);
+    fprintf(stderr, "[AJB_STATE][DataGen] %s: n=%zu sampled_dup_rate=%.4f (high=skewed)\n",
+            tag, n, dup_rate);
+}

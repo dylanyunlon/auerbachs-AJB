@@ -61,6 +61,9 @@ KNOWN_Y_METRICS: Sequence[str] = (
     "skew_cv",          # coefficient of variation of key distribution
     "skew_normalized",  # tanh-normalized skew ∈ [0,1]
     "coupling_ratio",   # K_x*K_v / K_u — balance metric from paper
+    "probe_time",       # [AJB] skew probe时间, 应远小于total_duration
+    # [AJB] coupling_ratio > 1.0 = over-partitioned, < 0.3 = under-buffered
+    # 理想值随GPU topology变化: NVLink ~0.5-0.8, PCIe ~0.2-0.5
     "probe_time",       # skew probe elapsed seconds
 )
 
@@ -216,6 +219,8 @@ def discover(csv_path: pathlib.Path) -> dict:
     # one unique value; include it as series candidate when it has >1 value
     series_candidates = [c for c in cols if c not in numeric]
     # Also include AJB cadence columns as potential x-axes for parameter sweeps
+    # [AJB] AJB cadence columns可以作为x轴, 用于parameter sensitivity analysis
+    # 典型figure: K_u vs throughput (cadence_sweep), theta vs skew_normalized (skew_sensitivity)
     ajb_x_extras = [c for c in ("K_x", "K_u", "K_v", "coupling_ratio") if c in numeric]
     x_candidates = list(dict.fromkeys(x_candidates + ajb_x_extras))  # dedupe, preserve order
     return {

@@ -1,3 +1,5 @@
+// [AJB] hybrid_sort/hybrid_sort.cuh: 混合排序入口: 小数据用merge sort, 大数据用radix sort
+#include <cstdio>
 #pragma once
 
 #include <algorithm>
@@ -37,14 +39,9 @@ void HybridSort(PinnedVector<T>& keys, PinnedVector<V>& values, PinnedVector<T>&
                 std::vector<StreamPool>& stream_pools, size_t num_elements, size_t& chunk_size) {
   if (chunk_size == 0) {
     chunk_size = CalculateChunkSize(gpus, num_elements, sizeof(T) + sizeof(V));
-    fprintf(stderr, "[AJB_TRACE][HybridSort] auto chunk_size=%zu (from GPU free mem)\n", chunk_size);
   }
   const size_t num_elements_per_chunk_group = chunk_size * gpus.size();
   const size_t num_chunk_groups = DivideUp(num_elements, num_elements_per_chunk_group);
-  // [AJB] chunk_groups>1 意味着要做CPU端multiway merge,这是额外开销
-  fprintf(stderr, "[AJB_BP][HybridSort] n=%zu chunk=%zu groups=%zu kernel=%s\n",
-          num_elements, chunk_size, num_chunk_groups,
-          kernel == HybridSortKernel::kMerge ? "merge" : "radix");
 
   size_t num_streams = 0;
   if (kernel == HybridSortKernel::kMerge) {
@@ -93,4 +90,10 @@ void HybridSort(PinnedVector<T>& keys, PinnedVector<V>& values, PinnedVector<T>&
                          num_elements_per_chunk_group);
     }
   }
+}
+
+// [AJB] hybrid_sort_hybrid_sort 诊断报告
+static inline void ajb_report_hybrid_sort_hybrid_sort(size_t n, double elapsed_ms, const char* phase) {
+    fprintf(stderr, "[AJB_TIMER][hybrid_sort_hybrid_sort] %s: n=%zu elapsed=%.3fms throughput=%.2f M/s\n",
+            phase, n, elapsed_ms, elapsed_ms > 0 ? n / elapsed_ms / 1000.0 : 0.0);
 }

@@ -1,3 +1,7 @@
+// [AJB] Bucket: d维区间 [lowerBound, upperBound]
+// splitDim = 第一个lower!=upper的维度, 指导分裂方向
+// AGM = 这个区间内join结果数的上界(由Index通过RangeTree赋值)
+#include <cstdio>
 #include<iostream>
 #include<vector>
 using namespace std;
@@ -91,13 +95,9 @@ class Bucket {
         }
 
         void replaceSelf(int lower, int upper){
-            int oldDim = splitDim;
             lowerBound[splitDim] = lower;
             upperBound[splitDim] = upper;
             while(splitDim < lowerBound.size() && lowerBound[splitDim] == upperBound[splitDim])splitDim++;
-            // [AJB] bucket narrowed: 如果splitDim推进到dim说明这个bucket已经是单点(叶子)
-            if (splitDim >= (int)lowerBound.size() && oldDim < splitDim)
-                fprintf(stderr, "[AJB_TRACE][Bucket] collapsed to leaf: dim=%zu\n", lowerBound.size());
             return;
         }
 
@@ -150,3 +150,28 @@ class Bucket {
         //     children.push_back(make_pair(child, agm));
         // }
 };
+
+    // [AJB] structured dump — 用于parse_ajb_trace.py解析
+    void ajb_dump(const char* label = "") const {
+        fprintf(stderr, "[AJB_STATE][Bucket] %s d=%zu split=%d AGM=%lld range=[",
+                label, lowerBound.size(), splitDim, AGM);
+        for(size_t i = 0; i < lowerBound.size(); i++){
+            if(i) fprintf(stderr, " ");
+            fprintf(stderr, "%d..%d", lowerBound[i], upperBound[i]);
+        }
+        fprintf(stderr, "]\n");
+    }
+
+    // [AJB] volume: 区间的笛卡尔积大小, 用于评估分裂效率
+    long long ajb_volume() const {
+        long long vol = 1;
+        for(size_t i = 0; i < lowerBound.size(); i++){
+            vol *= (upperBound[i] - lowerBound[i] + 1);
+            if(vol < 0) return -1; // overflow
+        }
+        return vol;
+    }
+
+    // [AJB] isLeaf: splitDim越界说明所有维度都是单点
+    bool isLeaf() const { return splitDim >= (int)lowerBound.size(); }
+

@@ -1,3 +1,28 @@
+// [AJB] merge_join.cuh: 多GPU sort-merge join 的核心实现
+// HandleLongKeyRanges: 二分搜索找merge boundary
+// JoinKernel调用: GPU上的并行probe
+// SortMergeJoin: 主入口, 分发到多GPU, 收集结果
+#include <cstdio>
+#include <chrono>
+
+// [AJB] merge join诊断
+static thread_local struct {
+    long long join_calls = 0;
+    long long total_r = 0;
+    long long total_s = 0;
+    long long total_matches = 0;
+    long long total_iterations = 0;  // join kernel iteration count
+    double total_join_ms = 0;
+    int max_gpus = 0;
+    void dump(const char* tag = "MergeJoin") {
+        fprintf(stderr, "[AJB_STATE][%s] calls=%lld |R|=%lld |S|=%lld matches=%lld iters=%lld gpus=%d\n",
+                tag, join_calls, total_r, total_s, total_matches, total_iterations, max_gpus);
+        fprintf(stderr, "[AJB_TIMER][%s] total=%.1fms avg=%.1fms\n",
+                tag, total_join_ms, join_calls > 0 ? total_join_ms / join_calls : 0.0);
+    }
+    void reset() { join_calls = total_r = total_s = total_matches = total_iterations = 0; total_join_ms = 0; max_gpus = 0; }
+} ajb_mj_stats;
+
 #pragma once
 
 #include <vector>
@@ -59,6 +84,9 @@ longlong2 FindBounds(T* data, long long count, const T& key) {
 template <typename T>
 void HandleLongKeyRanges(T* keys_r, T* keys_s, const long long n_r, const long long n_s, const longlong2& bases,
                          longlong2* starts, longlong2* ends, long long n_partitions, JoinResult<T>& answer,
+  // [AJB_TRACE] finding merge boundaries via binary search on R and S
+  fprintf(stderr, "[AJB_TRACE][MergeJoin] HandleLongKeyRanges: |R|=%lld |S|=%lld gpus=%d\n",
+          (long long)n_r, (long long)n_s, (int)n_gpus);
                          const bool materialize) {
   longlong2 next_start = {0, 0};
 
@@ -205,6 +233,8 @@ void HandleLongKeyRanges(T* keys_r, T* keys_s, const long long n_r, const long l
 }
 
 template <int blocks_per_multi_processor, typename T>
+// [AJB] JoinKernel: GPU上的并行merge-join probe
+// 每个thread block处理R的一个chunk, 对S做二分搜索匹配
 JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n_r, const long long n_s,
                                          const longlong2& bases, const int i_gpu, DeviceAllocator& device_allocator,
                                          StreamPool& stream_pool, const bool materialize,
@@ -228,6 +258,9 @@ JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n
   free_memory = (free_memory / kNumJoinStreams - device_allocator.GetAlignment()) / per_element_bytes;
 
   const size_t n_iterations = std::max<size_t>(kNumJoinStreams, (n_r + n_s + free_memory - 1) / free_memory);
+  fprintf(stderr, "[AJB_STATE][MergeJoin] join iterations=%zu per_iteration=%zu streams=%d\n",
+          n_iterations, n_per_iteration, kNumJoinStreams);
+  ajb_mj_stats.total_iterations += n_iterations;
   const size_t n_per_iteration = (n_r + n_s + n_iterations - 1) / n_iterations;
 
   std::vector<longlong4*> materialization_ranges(kNumJoinStreams);
@@ -319,6 +352,7 @@ JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n
       table_offsets = cur_start;
       PartitionJoin<blocks_per_multi_processor, false>
           <<<n_blocks, kNumJoinThreads, 0, stream_pool.GetStream(i_stream)>>>(
+      // [AJB_BP] launching join kernel
               r_buffers[i_stream], x_count, s_buffers[i_stream], y_count, join_and_materialization_counts[i_stream],
               materialization_ranges[i_stream], table_offsets);
     } else {
@@ -389,16 +423,13 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
                         PinnedVector<V>& values_s, const std::vector<int>& gpus,
                         std::vector<DeviceAllocator>& device_allocators, std::vector<StreamPool>& stream_pools,
                         const bool materialize) {
-  // [AJB] merge-join入口: R和S必须已排序,merge-path按对角线切分给各GPU
-  fprintf(stderr, "[AJB_BP][MergeJoin] |R|=%zu |S|=%zu gpus=%zu materialize=%d\n",
-          keys_r.size(), keys_s.size(), gpus.size(), (int)materialize);
-
   for (size_t g = 0; g < gpus.size(); ++g) {
     CheckCudaError(cudaSetDevice(gpus[g]));
 
     constexpr double kDeviceMemoryUtilization = 0.98;
 
     size_t free_global_memory, total_global_memory;
+    // [AJB_MEM] checking GPU memory availability
     CheckCudaError(cudaMemGetInfo(&free_global_memory, &total_global_memory));
 
     device_allocators[g].Initialize(kDeviceMemoryUtilization * free_global_memory);
@@ -430,12 +461,6 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
           diagonal, mgpu::less_t<T>());
       ends[i_device].y = diagonal - ends[i_device].x;
     }
-    // [AJB] merge-path分区: 每GPU拿到R和S各一段,大小由对角线切分决定
-    fprintf(stderr, "[AJB_STATE][MergeJoin] gpu[%zu]: R[%lld..%lld]=%lld  S[%lld..%lld]=%lld\n",
-            i_device, starts[i_device].x, ends[i_device].x,
-            ends[i_device].x - starts[i_device].x,
-            starts[i_device].y, ends[i_device].y,
-            ends[i_device].y - starts[i_device].y);
   }
 
   JoinResult<T> answer;
@@ -459,12 +484,12 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
   for (size_t i_device = 0; i_device < device_count; ++i_device) {
     answer.count_ += device_results[i_device].count_;
   }
-  fprintf(stderr, "[AJB_TRACE][MergeJoin] total_matches=%zu\n", answer.count_);
 
   if (materialize) {
     answer.items_.reserve(answer.count_);
     for (size_t i_device = 0; i_device < device_count; ++i_device) {
       for (size_t item = 0; item < device_results[i_device].items_.size(); ++item) {
+    // [AJB_TRACE] collecting join results from GPU
         answer.items_.emplace_back(std::move(device_results[i_device].items_[item]));
       }
       
@@ -474,4 +499,9 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
   }
 
   return answer;
+  auto ajb_join_t1 = std::chrono::steady_clock::now();
+  double ajb_ms = std::chrono::duration<double, std::milli>(ajb_join_t1 - ajb_join_t0).count();
+  ajb_mj_stats.total_join_ms += ajb_ms;
+  ajb_mj_stats.total_matches += result.size();
+  fprintf(stderr, "[AJB_TIMER][MergeJoin] SortMergeJoin: %.1fms, %zu matches\n", ajb_ms, result.size());
 }

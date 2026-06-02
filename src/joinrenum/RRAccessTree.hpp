@@ -1,4 +1,28 @@
 #include "Index.hpp"
+// [AJB] RRAccessTree: Relaxed Random Access Tree — joinrenum的核心数据结构
+// RRAccess(k) 在AGM空间[1,AGM]上做随机访问, 返回第k个join结果
+// 变体: BTI(批量TI), MTI(合并TI), LTI(较大TI), HalfCache, NoCache
+// 这棵树在运行时动态展开(lazy split), 分裂时调用Index::Split
+
+// [AJB] RRAccessTree运行时诊断
+static thread_local struct {
+    long long rraccess_calls = 0;    // 总RRAccess调用数
+    long long rraccess_hits = 0;     // 找到结果的次数
+    long long rraccess_misses = 0;   // 落入empty区域的次数
+    long long node_creates = 0;      // 新建RRAccessTreeNode次数
+    long long total_children = 0;    // 所有新建节点的children总数
+    int max_depth = 0;               // 递归最大深度
+    long long nocache_splits = 0;    // NoCache路径上的Split次数
+    long long halfcache_boundary = 0; // 命中cache boundary的次数
+    void dump(const char* tag = "RRAccessTree") {
+        fprintf(stderr, "[AJB_STATE][%s] calls=%lld hits=%lld misses=%lld nodes=%lld children=%lld max_depth=%d\n",
+                tag, rraccess_calls, rraccess_hits, rraccess_misses, node_creates, total_children, max_depth);
+        fprintf(stderr, "[AJB_STATE][%s] nocache_splits=%lld halfcache_boundary=%lld\n",
+                tag, nocache_splits, halfcache_boundary);
+    }
+    void reset() { rraccess_calls = rraccess_hits = rraccess_misses = node_creates = total_children = 0; max_depth = 0; nocache_splits = halfcache_boundary = 0; }
+} ajb_rrt_stats;
+
 
 
 /**
@@ -61,11 +85,21 @@ public:
             emptySize -= this->children_buckets[i].AGM;
         }
         children_pointers = vector<RRAccessTreeNode*>(this->children_buckets.size(), NULL);
+        // [AJB_TRACE] 节点创建: emptySize=AGM-sum(children.AGM), 如果emptySize很大说明这层空洞多
+        ajb_rrt_stats.node_creates++;
+        ajb_rrt_stats.total_children += this->children_buckets.size();
     }
 
     void print() {
         cout << "AGM: " << B->AGM << ", size: " << children_buckets.size() << ", ";
         B->print();
+    }
+
+    // [AJB] node级别的结构dump: emptySize比例反映空洞率
+    void ajb_dump(int depth = 0) {
+        fprintf(stderr, "[AJB_STATE][RRTreeNode] depth=%d AGM=%lld empty=%lld children=%zu empty_ratio=%.4f\n",
+                depth, B->AGM, emptySize, children_buckets.size(),
+                B->AGM > 0 ? (double)emptySize / B->AGM : 0.0);
     }
 };
 
@@ -87,6 +121,8 @@ public:
         }
         // cout << endl;
         children_pointers = vector<RRAccessTreeNode_Pool*>(this->children_bids.size(), NULL);
+        ajb_rrt_stats.node_creates++;
+        ajb_rrt_stats.total_children += this->children_bids.size();
     }
 };
 
@@ -109,6 +145,7 @@ private:
      * @return The total empty size of the rightmost subtree, including the current node's empty size.
      */
     long long getEmptyRight(Bucket &B, RRAccessTreeNode* &node) {
+        // [AJB_TRACE] getEmptyRight: 计算最右子树的空洞大小
         if (B.AGM < 0) idx.setAGMandIters(B);
         if (B.getSplitDim() == B.getDim()) return 1 - B.AGM;
         if (!node) {
@@ -124,6 +161,7 @@ private:
         return node->emptySize + emptyright;
     }
 
+    // [AJB] decreaseTrivialLowBound: 递归计算最右路径的空洞, 用于设置trivialInterval下界
     void decreaseTrivialLowBound(Bucket &B, RRAccessTreeNode* &node, long long &lowbound) {
         if (B.AGM < 0) idx.setAGMandIters(B);
         if (B.getSplitDim() == B.getDim()){
@@ -146,7 +184,8 @@ private:
         return;
     }
 
-    bool RRAccess_opt(long long k, Bucket &B, RRAccessTreeNode* &node, long long offset = 0) {
+    bool RRAccess_opt(long long k, Bucket &B, RRAccessTreeNode* &node, long long offset = 0, int _ajb_depth = 0) {
+        if(_ajb_depth > ajb_rrt_stats.max_depth) ajb_rrt_stats.max_depth = _ajb_depth;
         if(B.getSplitDim() == B.getDim()){
             result = B.getLowerBound();
             idx.totalrrtreenode --;
@@ -171,7 +210,7 @@ private:
         for(int i = 0; i < node->children_buckets.size(); i++) {
             childAGM = node->children_buckets[i].AGM;
             if(offset + temp + childAGM >= k){
-                return RRAccess_opt(k, node->children_buckets[i], node->children_pointers[i], offset + temp);
+                return RRAccess_opt(k, node->children_buckets[i], node->children_pointers[i], offset + temp, _ajb_depth + 1);
             }
             else temp += childAGM;
         }
@@ -180,6 +219,7 @@ private:
 
 
     bool RRAccess(long long k, Bucket &B, RRAccessTreeNode* &node, long long offset = 0) {
+        // [AJB] MTI recursive body — 最后一个child特殊处理(合并TI)
         if(B.getSplitDim() == B.getDim()){
             result = B.getLowerBound();
             return true;
@@ -212,14 +252,17 @@ private:
         
         if(!res && trivialIntervals[0].second == offset + B.AGM - node->emptySize){
             trivialIntervals[0].second = offset + B.AGM;
+            // [AJB_TRACE] TI expansion: 合并空洞区间, 提高ban效率
         }
         return res;
     }
 
 
+    // [AJB] RRAccess_low (LTI): 较大的trivial interval, TI = [AGM-emptySize+1, AGM]
     bool RRAccess_low(long long k, Bucket &B, RRAccessTreeNode* &node, long long offset = 0) {
         if(B.getSplitDim() == B.getDim()){
             result = B.getLowerBound();
+            ajb_rrt_stats.rraccess_hits++;
             return true;
         }
         if(B.AGM < 0) idx.setAGMandIters(B);
@@ -243,12 +286,15 @@ private:
         trivialIntervals[0].first = offset + B.AGM - node->emptySize + 1;
         trivialIntervals[0].second = offset + B.AGM;
         numti = 1;
+        ajb_rrt_stats.rraccess_misses++;
         return false;
     }
 
+    // [AJB] RRAccess_verylow: 最保守的TI, trivialInterval=[k,k]
     bool RRAccess_verylow(long long k, Bucket &B, RRAccessTreeNode* &node, long long offset = 0) {
         if(B.getSplitDim() == B.getDim()){
             result = B.getLowerBound();
+            ajb_rrt_stats.rraccess_hits++;
             return true;
         }
         if(B.AGM < 0) idx.setAGMandIters(B);
@@ -277,6 +323,7 @@ private:
 
     
     long long getEmptyRight_NoCache(Bucket &B) {
+        // [AJB_TRACE] getEmptyRight_NoCache: 无缓存版本, 每次都重新Split
         if (B.AGM < 0) idx.setAGMandIters(B);
         if (B.getSplitDim() == B.getDim()) return 1 - B.AGM;
         
@@ -292,8 +339,12 @@ private:
     }
 
 
+    // [AJB] HalfCache: depth <= cacheHeightBound的节点缓存, 超过的走NoCache
     long long getEmptyRight_HalfCache(Bucket &B, RRAccessTreeNode* &node, int depth = 0) {
-        if(depth > cacheHeightBound) return 0;
+        if(depth > cacheHeightBound) {
+            // [AJB_TRACE] cache boundary hit at depth=%d
+            return 0;
+        }
         if (B.AGM < 0) idx.setAGMandIters(B);
         if (B.getSplitDim() == B.getDim()) return 1 - B.AGM;
         if(!node) {
@@ -315,9 +366,14 @@ private:
     }
 
     bool RRAccess_HalfCache(long long k, Bucket &B, RRAccessTreeNode* &node, long long offset = 0, int depth = 0) {
-        if(depth > cacheHeightBound) return RRAccess_NoCache(k, B, offset, depth);
+        if(depth > ajb_rrt_stats.max_depth) ajb_rrt_stats.max_depth = depth;
+        if(depth > cacheHeightBound) {
+            ajb_rrt_stats.halfcache_boundary++;
+            return RRAccess_NoCache(k, B, offset, depth);
+        }
         if(B.getSplitDim() == B.getDim()){
             result = B.getLowerBound();
+            ajb_rrt_stats.rraccess_hits++;
             return true;
         }
         if(B.AGM < 0) idx.setAGMandIters(B);
@@ -343,7 +399,11 @@ private:
     }
 
     bool RRAccess_HalfCache_basic(long long k, int bid, RRAccessTreeNode_Pool* &node, long long BAGM, long long offset = 0, int depth = 0) {
-        if(depth > cacheHeightBound) return RRAccess_NoCache_basic(k, pool[bid], offset, depth);
+        if(depth > ajb_rrt_stats.max_depth) ajb_rrt_stats.max_depth = depth;
+        if(depth > cacheHeightBound) {
+            ajb_rrt_stats.halfcache_boundary++;
+            return RRAccess_NoCache_basic(k, pool[bid], offset, depth);
+        }
         if(!node && pool[bid].getSplitDim() == pool[bid].getDim()){
             result = pool[bid].getLowerBound();
             return true;
@@ -372,7 +432,11 @@ private:
 
 
     bool RRAccess_HalfCache(long long k, int bid, RRAccessTreeNode_Pool* &node, long long BAGM, long long offset = 0, int depth = 0) {
-        if(depth > cacheHeightBound) return RRAccess_NoCache(k, pool[bid], offset, depth);
+        if(depth > ajb_rrt_stats.max_depth) ajb_rrt_stats.max_depth = depth;
+        if(depth > cacheHeightBound) {
+            ajb_rrt_stats.halfcache_boundary++;
+            return RRAccess_NoCache(k, pool[bid], offset, depth);
+        }
         if(!node && pool[bid].getSplitDim() == pool[bid].getDim()){
             result = pool[bid].getLowerBound();
             return true;
@@ -403,11 +467,14 @@ private:
 
 
     bool RRAccess_NoCache(long long k, Bucket &B, long long offset = 0, int depth = 0) {
+        if(depth > ajb_rrt_stats.max_depth) ajb_rrt_stats.max_depth = depth;
         if(B.getSplitDim() == B.getDim()){
             result = B.getLowerBound();
+            ajb_rrt_stats.rraccess_hits++;
             return true;
         }
         if(B.AGM < 0) idx.setAGMandIters(B);
+        ajb_rrt_stats.nocache_splits++;
         vector<Bucket> children = move(idx.Split(B));
 
         long long childAGM, temp = 0;
@@ -425,13 +492,18 @@ private:
         numti++;
         trivialIntervals[numti - 1].first = offset + B.AGM - getEmptyRight_NoCache(B) + 1;
         trivialIntervals[numti - 1].second = offset + B.AGM;
+        ajb_rrt_stats.rraccess_misses++;
+        // [AJB_TRACE] NoCache miss: TI=[%lld, %lld] depth=%d
         
         return false;
     }
 
+    // [AJB] NoCache_basic: 最简版本, TI只设为[temp+1, B.AGM], 不计算getEmptyRight
     bool RRAccess_NoCache_basic(long long k, Bucket &B, long long offset = 0, int depth = 0) {
+        if(depth > ajb_rrt_stats.max_depth) ajb_rrt_stats.max_depth = depth;
         if(B.getSplitDim() == B.getDim()){
             result = B.getLowerBound();
+            ajb_rrt_stats.rraccess_hits++;
             return true;
         }
         if(B.AGM < 0) idx.setAGMandIters(B);
@@ -456,7 +528,7 @@ private:
 
 public:
     long long AGM;
-    int cacheHeightBound = 20;//written by shell code
+    int cacheHeightBound = 20; // [AJB] HalfCache的缓存深度限制, 超过此深度走NoCache
     RRAccessTreeNode* root = NULL;
     RRAccessTreeNode_Pool* root_pool = NULL;
     Index idx;
@@ -501,6 +573,8 @@ public:
         idx.preProcessing(relations, filenames, numlines);
         AGM = idx.AGM();
         pool.newCopy(idx.FB);
+        // [AJB_BP] RRAccessTree ready: AGM是整个枚举空间的大小
+        fprintf(stderr, "[AJB_BP][RRAccessTree] constructed: AGM=%lld cacheHeightBound=%d\n", AGM, cacheHeightBound);
         // cout << "AGM: " << AGM << endl;
     }
 
@@ -533,6 +607,11 @@ public:
         return idx.getFullBucket();
     }
 
+    // [AJB] reset统计, 用于多轮benchmark
+    void ajb_reset_stats() {
+        ajb_rrt_stats.reset();
+    }
+
 
     /**
      * @brief Performs a relaxed-random-access operation on the tree.
@@ -550,40 +629,44 @@ public:
      */
     bool RRAccess_MTI(long long k) {
         numti = 0;
+        ajb_rrt_stats.rraccess_calls++;
         return RRAccess(k, idx.FB, root, 0);
     }
 
     bool RRAccess_BTI(long long k) {
         numti = 0;
-        // [AJB] BTI: k should be in [1, AGM]. k>AGM means BanPickTree picked an invalid position
-        if (k < 1 || k > AGM)
-            fprintf(stderr, "[AJB_WARN][RRAccess_BTI] k=%lld out of [1, AGM=%lld]\n", k, AGM);
+        ajb_rrt_stats.rraccess_calls++;
         return RRAccess_opt(k, idx.FB, root, 0);
     }
 
     bool RRAccess_LTI(long long k) {
         numti = 0;
+        ajb_rrt_stats.rraccess_calls++;
         return RRAccess_low(k, idx.FB, root, 0);
     }
 
     bool RRAccess(long long k) {
         numti = 0;
+        ajb_rrt_stats.rraccess_calls++;
         return RRAccess_verylow(k, idx.FB, root, 0);
     }
 
     bool RRAccess_HalfCache(long long k) {
         numti = 0;
+        ajb_rrt_stats.rraccess_calls++;
         bool res = RRAccess_HalfCache(k, idx.FB, root);
         return res;
     }
 
     bool RRAccess_HalfCache_Pool(long long k) {
         numti = 0;
+        ajb_rrt_stats.rraccess_calls++;
         return RRAccess_HalfCache(k, 0, root_pool, AGM);
     }
 
     bool RRAccess_HalfCache_Pool_basic(long long k) {
         numti = 0;
+        ajb_rrt_stats.rraccess_calls++;
         return RRAccess_HalfCache_basic(k, 0, root_pool, AGM);
     }
 
@@ -603,5 +686,12 @@ public:
     
     void print() {
         print(root);
+    }
+
+    // [AJB] dump运行时统计
+    void ajb_dump_stats() {
+        ajb_rrt_stats.dump();
+        fprintf(stderr, "[AJB_STATE][RRAccessTree] AGM=%lld cacheH=%d numti=%d\n",
+                AGM, cacheHeightBound, numti);
     }
 };

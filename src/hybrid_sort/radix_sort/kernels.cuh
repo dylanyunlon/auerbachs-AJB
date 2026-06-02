@@ -1,5 +1,19 @@
+// [AJB] hybrid_sort/radix_sort/kernels.cuh: Radix sort GPU kernel: 按digit桶排序
+// [AJB] hybrid_sort_radix_sort_kernels 运行时诊断
+#include <cstdio>
+static thread_local struct {
+    long long kernel_launches = 0;
+    long long total_elements = 0;
+    double total_time_ms = 0.0;
+    void dump(const char* tag = "hybrid_sort_radix_sort_kernels") {
+        fprintf(stderr, "[AJB_STATE][%s] launches=%lld elements=%lld total_time=%.3fms avg=%.3fms\n",
+                tag, kernel_launches, total_elements, total_time_ms,
+                kernel_launches > 0 ? total_time_ms / kernel_launches : 0.0);
+    }
+    void reset() { kernel_launches = total_elements = 0; total_time_ms = 0.0; }
+} ajb_hybrid_sort_radix_sort_kernels_stats;
+
 #pragma once
-// [AJB] 基数排序GPU kernel: ComputeHistogram做局部计数, ScatterKeyValuePairs做桶内重排
 
 #include <stdio.h>
 
@@ -295,4 +309,10 @@ __global__ void DetermineBucketToGpuMapping(uint64_t* mgpu_striped_prefix_sums, 
       }
     }
   }
+}
+
+// [AJB] hybrid_sort_radix_sort_kernels 诊断报告
+static inline void ajb_report_hybrid_sort_radix_sort_kernels(size_t n, double elapsed_ms, const char* phase) {
+    fprintf(stderr, "[AJB_TIMER][hybrid_sort_radix_sort_kernels] %s: n=%zu elapsed=%.3fms throughput=%.2f M/s\n",
+            phase, n, elapsed_ms, elapsed_ms > 0 ? n / elapsed_ms / 1000.0 : 0.0);
 }

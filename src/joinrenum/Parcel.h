@@ -1,5 +1,20 @@
+// [AJB] Parcel: 单列数据容器 (一个int vector), Table的组成单位
+// 支持排序、merge操作, 是Index构建的基础
+#include <cstdio>
+
+// [AJB] Parcel操作诊断
+static thread_local struct {
+    long long sort_calls = 0;
+    long long merge_calls = 0;
+    long long total_elements = 0;
+    void dump(const char* tag = "Parcel") {
+        fprintf(stderr, "[AJB_STATE][%s] sorts=%lld merges=%lld total_elems=%lld\n",
+                tag, sort_calls, merge_calls, total_elements);
+    }
+    void reset() { sort_calls = merge_calls = total_elements = 0; }
+} ajb_parcel_stats;
+
 #ifndef RANDOMORDERENUMERATION_PARCEL_H
-// [AJB] Parcel: 单列数据容器, Table的组成单位
 #define RANDOMORDERENUMERATION_PARCEL_H
 
 #include <iostream>

@@ -1,5 +1,6 @@
+// [AJB] hybrid_sort/radix_sort/device_containers.cuh: GPU侧radix sort数据容器
+#include <cstdio>
 #pragma once
-// [AJB] DeviceContainers: 管理每GPU每个spanning bucket的设备端histogram buffer
 
 #include <map>
 #include <vector>
@@ -89,3 +90,9 @@ class DeviceContainers {
   const size_t epsilon_;
   const size_t gamma_;
 };
+
+// [AJB] hybrid_sort_radix_sort_device_containers 诊断报告
+static inline void ajb_report_hybrid_sort_radix_sort_device_containers(size_t n, double elapsed_ms, const char* phase) {
+    fprintf(stderr, "[AJB_TIMER][hybrid_sort_radix_sort_device_containers] %s: n=%zu elapsed=%.3fms throughput=%.2f M/s\n",
+            phase, n, elapsed_ms, elapsed_ms > 0 ? n / elapsed_ms / 1000.0 : 0.0);
+}

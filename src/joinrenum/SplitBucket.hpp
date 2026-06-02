@@ -1,6 +1,21 @@
+// [AJB] SplitBucket: Bucket分裂策略
+// Split把一个Bucket在splitDim上按MHBS找到的split point切成子Bucket
+// iters[i] = relation i 在splitDim维度上的值域(已排序列的iterator range)
+#include <cstdio>
+
+// [AJB] Split诊断
+static thread_local struct {
+    long long split_calls = 0;
+    long long children_total = 0;
+    void dump(const char* tag = "SplitBucket") {
+        fprintf(stderr, "[AJB_STATE][%s] calls=%lld children=%lld avg=%.2f\n",
+                tag, split_calls, children_total,
+                split_calls > 0 ? (double)children_total / split_calls : 0.0);
+    }
+    void reset() { split_calls = children_total = 0; }
+} ajb_split_stats;
+
 #include<iostream>
-// [AJB] Bucket: 多维区间 [lower, upper]^d, splitDim=第一个lower≠upper的维度
-// AGM由Index通过RangeTree查询赋值, 是这个区间内join结果数的上界
 #include<vector>
 using namespace std;
 

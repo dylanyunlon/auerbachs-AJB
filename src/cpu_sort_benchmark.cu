@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -9,12 +10,14 @@
 
 #include "common/config_utilities.cuh"
 #include "common/data_generator.cuh"
-#include "common/debug_utilities.cuh"    // AJB: breakpoints + memory reporting
 #include "common/key_value_pair.cuh"
 #include "common/options_limits.cuh"
 #include "common/parallel_algorithms.cuh"
 #include "common/pinned_vector.cuh"
 #include "common/profile_utilities.cuh"
+
+// [AJB] cpu_sort_benchmark: benchmark entry point
+// 诊断注入: 在main()入口、每个benchmark循环、结果输出前后加breakpoint
 
 const std::string kKeyDistributionType = "uniform";
 const std::string kValueDistributionType = "sorted";
@@ -31,10 +34,6 @@ struct Settings {
 
 template <typename T, typename V>
 void RunCpuSortBenchmark(Settings& settings) {
-  AJB_BREAKPOINT("[cpu_sort] start: n=%zu algo=%s", settings.num_elements, settings.cpu_sort_algorithm.c_str());
-  AJBTimer timer_total("cpu_sort_total");
-  AJBReportMemory("cpu_sort_benchmark_start");
-
   ConfigureMultiProcess(settings.num_threads);
 
   PinnedVector<T> keys(settings.num_elements);
@@ -88,13 +87,11 @@ void RunCpuSortBenchmark(Settings& settings) {
   if (!std::is_sorted(keys.begin(), keys.end())) {
     printf("[ERROR] RunCpuSortBenchmark: Invalid order.\n");
   }
-
-  AJBReportMemory("cpu_sort_benchmark_end");
-  AJB_BREAKPOINT("[cpu_sort] done: n=%zu elapsed=%.6fs", settings.num_elements, timer_total.ElapsedSec());
-  TimeDurations::Get().PrintAllDurations();
 }
 
 int main(int argc, char* argv[]) {
+  fprintf(stderr, "[AJB_BP][cpu_sort_benchmark] benchmark start\n", argv[0]);
+  auto ajb_bench_start = std::chrono::steady_clock::now();
   cxxopts::Options options("cpu_sort_benchmark");
 
   options.set_width(250);
@@ -129,7 +126,11 @@ int main(int argc, char* argv[]) {
       !OptionsLimits::IsValidType(s.value_type) || !OptionsLimits::IsValidRandomSeed(s.random_seed) ||
       parse_result["help"].as<bool>()) {
     std::cout << options.help() << std::endl;
-    return 0;
+    auto ajb_bench_end = std::chrono::steady_clock::now();
+  double ajb_total_sec = std::chrono::duration<double>(ajb_bench_end - ajb_bench_start).count();
+  fprintf(stderr, "[AJB_TIMER][cpu_sort_benchmark] total benchmark: %.3fs\n", ajb_total_sec);
+  fprintf(stderr, "[AJB_BP][cpu_sort_benchmark] benchmark end\n");
+  return 0;
   }
 
   if (s.key_type == "int" && s.value_type == "int") {
@@ -142,5 +143,9 @@ int main(int argc, char* argv[]) {
     RunCpuSortBenchmark<double, double>(s);
   }
 
+  auto ajb_bench_end = std::chrono::steady_clock::now();
+  double ajb_total_sec = std::chrono::duration<double>(ajb_bench_end - ajb_bench_start).count();
+  fprintf(stderr, "[AJB_TIMER][cpu_sort_benchmark] total benchmark: %.3fs\n", ajb_total_sec);
+  fprintf(stderr, "[AJB_BP][cpu_sort_benchmark] benchmark end\n");
   return 0;
 }

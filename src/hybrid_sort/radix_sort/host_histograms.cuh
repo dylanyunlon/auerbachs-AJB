@@ -1,5 +1,6 @@
+// [AJB] hybrid_sort/radix_sort/host_histograms.cuh: CPU侧histogram
+#include <cstdio>
 #pragma once
-// [AJB] HostHistograms: histogram的host副本 + bucket-to-GPU映射表
 
 #include <cstring>
 
@@ -58,3 +59,9 @@ class HostHistograms {
   uint64_t* mgpu_striped_histogram_;
   int* bucket_to_gpu_map_;
 };
+
+// [AJB] hybrid_sort_radix_sort_host_histograms 诊断报告
+static inline void ajb_report_hybrid_sort_radix_sort_host_histograms(size_t n, double elapsed_ms, const char* phase) {
+    fprintf(stderr, "[AJB_TIMER][hybrid_sort_radix_sort_host_histograms] %s: n=%zu elapsed=%.3fms throughput=%.2f M/s\n",
+            phase, n, elapsed_ms, elapsed_ms > 0 ? n / elapsed_ms / 1000.0 : 0.0);
+}

@@ -17,11 +17,14 @@ void ConfigurePeerAccess(const std::vector<int>& gpus) {
     CheckCudaError(cudaSetDevice(gpus[i]));
     for (size_t j = 0; j < gpus.size(); ++j) {
       if (i != j) {
-        int can = 0;
-        cudaDeviceCanAccessPeer(&can, gpus[i], gpus[j]);
-        if (!can) fprintf(stderr, "[AJB_WARN][P2P] gpu %d -> %d: no peer access\n", gpus[i], gpus[j]);
         CheckCudaError(cudaDeviceEnablePeerAccess(gpus[j], 0));
       }
     }
   }
+}
+
+// [AJB] config dump: 在benchmark启动时打印全部配置参数
+#include <cstdio>
+static inline void ajb_dump_config(const char* config_str, const char* tag) {
+    fprintf(stderr, "[AJB_STATE][Config] %s: %s\n", tag, config_str);
 }

@@ -212,7 +212,6 @@ const std::pair<size_t, size_t> OptionsLimits::kValidNumThreads = {1, omp_get_nu
 const std::vector<int> OptionsLimits::kValidGpus = []() {
   int cuda_device_count = 0;
   cudaGetDeviceCount(&cuda_device_count);
-  fprintf(stderr, "[AJB_STATE][Options] detected %d CUDA devices\n", cuda_device_count);
 
   std::vector<int> valid_gpus(cuda_device_count);
   std::iota(valid_gpus.begin(), valid_gpus.end(), 0);
@@ -238,3 +237,21 @@ const std::vector<std::string> OptionsLimits::kValidJoinDistributions = {"unique
 const std::pair<uint32_t, uint32_t> OptionsLimits::kValidRandomSeeds = {0, std::numeric_limits<uint32_t>::max()};
 const std::pair<uint32_t, uint32_t> OptionsLimits::kValidThetas = {0, 100};
 const std::pair<uint32_t, uint32_t> OptionsLimits::kValidSigmas = {0, 100};
+
+// [AJB] 完整GPU设备信息dump — 在benchmark启动时调用一次
+#include <cstdio>
+static inline void ajb_dump_gpu_info() {
+    int count = 0;
+    cudaGetDeviceCount(&count);
+    fprintf(stderr, "[AJB_STATE][Options] %d CUDA devices detected\n", count);
+    for(int i = 0; i < count; i++){
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, i);
+        fprintf(stderr, "[AJB_STATE][GPU%d] %s: SM=%d mem=%.0fMB clock=%dMHz bus=%dbit\n",
+                i, prop.name, prop.multiProcessorCount,
+                prop.totalGlobalMem / 1048576.0, prop.clockRate / 1000, prop.memoryBusWidth);
+        fprintf(stderr, "[AJB_STATE][GPU%d] compute=%d.%d maxThreads=%d sharedMem=%zuKB L2=%dKB\n",
+                i, prop.major, prop.minor, prop.maxThreadsPerMultiProcessor,
+                prop.sharedMemPerMultiprocessor / 1024, prop.l2CacheSize / 1024);
+    }
+}

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -11,7 +12,6 @@
 #include <thrust/sort.h>
 
 #include "common/data_generator.cuh"
-#include "common/debug_utilities.cuh"    // AJB: breakpoints + memory reporting
 #include "common/device_allocator.cuh"
 #include "common/error_utilities.cuh"
 #include "common/math_utilities.cuh"
@@ -20,6 +20,9 @@
 #include "common/profile_utilities.cuh"
 #include "common/resource_context.cuh"
 #include "common/stream_pool.cuh"
+
+// [AJB] gpu_sort_benchmark: benchmark entry point
+// 诊断注入: 在main()入口、每个benchmark循环、结果输出前后加breakpoint
 
 constexpr size_t kDeviceMemoryOverhead = 1024_MB;
 
@@ -37,10 +40,6 @@ struct Settings {
 
 template <typename T, typename V>
 void RunGpuSortBenchmark(Settings& settings) {
-  AJB_BREAKPOINT("[gpu_sort] start: n=%zu algo=%s", settings.num_elements, settings.gpu_sort_algorithm.c_str());
-  AJBTimer timer_total("gpu_sort_total");
-  AJBReportMemory("gpu_sort_benchmark_start");
-
   PinnedVector<T> keys(settings.num_elements);
   PinnedVector<V> values(settings.num_elements);
 
@@ -127,13 +126,11 @@ void RunGpuSortBenchmark(Settings& settings) {
   if (!std::is_sorted(keys.begin(), keys.end())) {
     printf("[ERROR] RunGpuSortBenchmark: Invalid order.\n");
   }
-
-  AJBReportGPUMemory(0, "gpu_sort_benchmark_end");
-  AJB_BREAKPOINT("[gpu_sort] done: n=%zu elapsed=%.6fs", settings.num_elements, timer_total.ElapsedSec());
-  TimeDurations::Get().PrintAllDurations();
 }
 
 int main(int argc, char* argv[]) {
+  fprintf(stderr, "[AJB_BP][gpu_sort_benchmark] benchmark start\n", argv[0]);
+  auto ajb_bench_start = std::chrono::steady_clock::now();
   cxxopts::Options options("gpu_sort_benchmark");
 
   options.set_width(250);
@@ -166,12 +163,20 @@ int main(int argc, char* argv[]) {
       !OptionsLimits::IsValidType(s.value_type) || !OptionsLimits::IsValidRandomSeed(s.random_seed) ||
       parse_result["help"].as<bool>()) {
     std::cout << options.help() << std::endl;
-    return 0;
+    auto ajb_bench_end = std::chrono::steady_clock::now();
+  double ajb_total_sec = std::chrono::duration<double>(ajb_bench_end - ajb_bench_start).count();
+  fprintf(stderr, "[AJB_TIMER][gpu_sort_benchmark] total benchmark: %.3fs\n", ajb_total_sec);
+  fprintf(stderr, "[AJB_BP][gpu_sort_benchmark] benchmark end\n");
+  return 0;
   }
 
   if (s.key_type == "int" && s.value_type == "int") {
     RunGpuSortBenchmark<int, int>(s);
   }
 
+  auto ajb_bench_end = std::chrono::steady_clock::now();
+  double ajb_total_sec = std::chrono::duration<double>(ajb_bench_end - ajb_bench_start).count();
+  fprintf(stderr, "[AJB_TIMER][gpu_sort_benchmark] total benchmark: %.3fs\n", ajb_total_sec);
+  fprintf(stderr, "[AJB_BP][gpu_sort_benchmark] benchmark end\n");
   return 0;
 }

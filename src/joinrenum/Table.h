@@ -1,3 +1,9 @@
+// [AJB] Table: columnar relation storage
+// readFromFile读CSV/TBL格式, 支持'|'和','分隔符
+// 每列存为一个vector<int>, 是CountOracle/Index的数据来源
+#include <cstdio>
+#include <chrono>
+
 //
 // Created by shai.zeevi on 04/06/2019.
 //
@@ -9,7 +15,6 @@
 #include <vector>
 #include <fstream>
 #include <unordered_map>
-// [AJB] Table: columnar relation storage, readFromFile reads CSV/TBL
 #include <unordered_set>
 #include <assert.h>
 #include "iostream"

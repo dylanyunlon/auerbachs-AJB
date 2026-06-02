@@ -5,7 +5,22 @@
 #include<glpk.h>
 #include <cmath>
 #include <set>
+#include <chrono>
+#include <numeric>
 using namespace std;
+
+// [AJB] AGM诊断计数器 — 跟踪LP求解次数和耗时
+static thread_local struct {
+    long long agm_calls = 0;
+    long long lp_solves = 0;
+    double    lp_total_ms = 0.0;
+    long long shortcut_hits = 0;  // 走hardcoded公式而非LP
+    void dump(const char* tag = "AGM") {
+        fprintf(stderr, "[AJB_STATE][%s] calls=%lld lp_solves=%lld shortcut_hits=%lld lp_time=%.3fms\n",
+                tag, agm_calls, lp_solves, shortcut_hits, lp_total_ms);
+    }
+    void reset() { agm_calls = lp_solves = shortcut_hits = 0; lp_total_ms = 0.0; }
+} ajb_agm_stats;
 class Query{
     private:
     
@@ -87,6 +102,30 @@ class Query{
             initRels();
             initLP();
             updateCars(cardinalities);
+            // [AJB_BP] Query schema dump — 当你需要确认join图是否正确连接
+            fprintf(stderr, "[AJB_BP][Query] constructed: %zu relations, %zu variables\n",
+                    this->relations.size(), variables.size());
+            for(size_t i = 0; i < this->relations.size(); i++){
+                fprintf(stderr, "[AJB_STATE][Query]   R%zu(%s): arity=%zu",
+                        i, relationNames[i].c_str(), this->relations[i].size());
+                if(i < cardinalities.size()) fprintf(stderr, " card=%d", cardinalities[i]);
+                fprintf(stderr, " vars=[");
+                for(size_t j = 0; j < this->relations[i].size(); j++){
+                    if(j) fprintf(stderr, ",");
+                    fprintf(stderr, "x%d", this->relations[i][j]);
+                }
+                fprintf(stderr, "]\n");
+            }
+            // [AJB_STATE] variable→relation adjacency（用于调试relsofVar是否正确）
+            for(size_t v = 0; v < relsofVar.size(); v++){
+                fprintf(stderr, "[AJB_STATE][Query]   x%zu(%s) in %zu rels: [",
+                        v, variableNames[v].c_str(), relsofVar[v].size());
+                for(size_t j = 0; j < relsofVar[v].size(); j++){
+                    if(j) fprintf(stderr, ",");
+                    fprintf(stderr, "R%d", relsofVar[v][j]);
+                }
+                fprintf(stderr, "]\n");
+            }
         }
 
         ~Query(){
@@ -155,6 +194,14 @@ class Query{
             }
             // convert set to vector
             vector<int> neighborVec(neighbors.begin(), neighbors.end());
+            // [AJB_TRACE] 邻居发现 — 用于验证join graph connectivity
+            fprintf(stderr, "[AJB_TRACE][Query] neighbors(R%d, k=%d): %zu rels [",
+                    x, k, neighborVec.size());
+            for(size_t i = 0; i < neighborVec.size(); i++){
+                if(i) fprintf(stderr, ",");
+                fprintf(stderr, "R%d", neighborVec[i]);
+            }
+            fprintf(stderr, "]\n");
             return neighborVec; // return the vector of neighbors
         }
 
@@ -177,6 +224,7 @@ class Query{
         }
 
         double AGM(vector<int> &cars){
+            ajb_agm_stats.agm_calls++;
             for (int i = 0; i < cars.size(); i++)if(cars[i] <= 0)return 0;
             // if(true) { /////TPC-DS
             //     double ans0 = sqrt((long long) cars[1] * cars[2]) * sqrt((long long) cars[3] * cars[4]);
@@ -195,6 +243,7 @@ class Query{
             // return min(ans1, min(ans2, ans3));
             ////// Q_T
             if(true){
+                ajb_agm_stats.shortcut_hits++;
                 // return sqrt(cars[0]) * sqrt(cars[1]) * sqrt(cars[2]);
                 double ans0 = sqrt((long long) cars[0] * cars[1]) * sqrt(cars[2]);
                 double ans1 = (double)cars[0] * cars[1],
@@ -238,6 +287,8 @@ class Query{
             // }
             if(true) return cars[0] * pow(cars[1], 0.5) * pow(cars[2], 0.5) * pow(cars[3], 0.5);
             // start = std::chrono::high_resolution_clock::now();
+            ajb_agm_stats.lp_solves++;
+            auto ajb_lp_t0 = std::chrono::high_resolution_clock::now();
             initLP();
             // elapsed = std::chrono::high_resolution_clock::now() - start;
             // lpinitTime += elapsed.count();
@@ -257,6 +308,12 @@ class Query{
             double res = glp_get_obj_val(lp);
 
             glp_delete_prob(lp);
+            auto ajb_lp_t1 = std::chrono::high_resolution_clock::now();
+            ajb_agm_stats.lp_total_ms += std::chrono::duration<double, std::milli>(ajb_lp_t1 - ajb_lp_t0).count();
+            // [AJB_TRACE] LP path taken — 如果这行大量输出说明hardcoded shortcut没生效
+            if(ajb_agm_stats.lp_solves <= 5 || ajb_agm_stats.lp_solves % 1000 == 0)
+                fprintf(stderr, "[AJB_TRACE][AGM] LP #%lld: obj=%.6f → AGM=%.1f\n",
+                        ajb_agm_stats.lp_solves, res, pow(2, res));
             // std::cout << "Optimal objective value: " << res << std::endl;
             // for (int i = 1; i <= 3; ++i) {
             //     double xi = glp_get_col_prim(lp, i);

@@ -1,4 +1,20 @@
 using namespace std;
+// [AJB] CountOracle: sorted point array + prefix-sum cnt for range counting
+// sumCnt(pl,pr) = O(log n) via binary search, 是treeUpp的核心瓶颈
+
+// [AJB] CountOracle诊断
+static thread_local struct {
+    long long sumcnt_calls = 0;
+    long long sumcnt_zero  = 0;  // 返回0的次数 = empty range
+    long long count_calls  = 0;
+    long long range_calls  = 0;
+    void dump(const char* tag = "CountOracle") {
+        fprintf(stderr, "[AJB_STATE][%s] sumCnt=%lld(zero=%lld) count=%lld getRange=%lld\n",
+                tag, sumcnt_calls, sumcnt_zero, count_calls, range_calls);
+    }
+    void reset() { sumcnt_calls = sumcnt_zero = count_calls = range_calls = 0; }
+} ajb_co_stats;
+
 /**
 * A point in euclidean space.
 *
@@ -125,6 +141,16 @@ public:
         }
         cout << (*this)[dim() - 1] << ") : " << cnt << endl;
     }
+
+    // [AJB] structured dump to stderr for machine parsing
+    void ajb_dump(const char* label = "") const {
+        fprintf(stderr, "[AJB_STATE][Point] %s dim=%lu cnt=%lld coords=[", label, dim(), cnt);
+        for(unsigned long i = 0; i < dim(); i++){
+            if(i) fprintf(stderr, ",");
+            fprintf(stderr, "%d", (*this)[i]);
+        }
+        fprintf(stderr, "]\n");
+    }
 };
 
 template<typename T>
@@ -166,22 +192,41 @@ public:
         // upperbound = Point<T>(uppervec);
         sort(points.begin(), points.end());
         this->points = points;
-        // [AJB] CountOracle: 点数=关系大小, dim=属性数, 后续range query的搜索空间
-        fprintf(stderr, "[AJB_STATE][CountOracle] %zu points, dim=%lu\n", points.size(), points[0].dim());
+        // [AJB_BP] CountOracle constructed: 点数+维度+值域是debug的第一站
+        fprintf(stderr, "[AJB_BP][CountOracle] built: %zu points, dim=%lu, bounds=[",
+                points.size(), points[0].dim());
+        for(unsigned long d = 0; d < points[0].dim(); d++){
+            if(d) fprintf(stderr, " ");
+            fprintf(stderr, "%d..%d", lowerbound[d], upperbound[d]);
+        }
+        fprintf(stderr, "]\n");
+        // [AJB_STATE] prefix-sum验证: 最后一个point的cnt应该等于total
+        if(!points.empty()){
+            fprintf(stderr, "[AJB_STATE][CountOracle] last_prefix_cnt=%lld (should be total weighted count)\n",
+                    this->points.back().cnt);
+        }
     }
 
     int sumCnt(const Point<T> &pl, const Point<T> &pr) {
+        ajb_co_stats.sumcnt_calls++;
         vector<Point<int> >::iterator itl = lower_bound(points.begin(), points.end(), pl);
         vector<Point<int> >::iterator itr = upper_bound(points.begin(), points.end(), pr);
-        if(itr == points.begin())return 0;
-        else if(itl == points.begin())return (itr - 1)->cnt;
-        else return (itr - 1)->cnt - (itl - 1)->cnt;
+        int result;
+        if(itr == points.begin()) result = 0;
+        else if(itl == points.begin()) result = (itr - 1)->cnt;
+        else result = (itr - 1)->cnt - (itl - 1)->cnt;
+        if(result == 0) ajb_co_stats.sumcnt_zero++;
+        return result;
     }
 
     int sumCnt(const vector<Point<int> >::iterator &itl, const vector<Point<int> >::iterator &itr) {
-        if(itr == points.begin())return 0;
-        else if(itl == points.begin())return (itr - 1)->cnt;
-        else return (itr - 1)->cnt - (itl - 1)->cnt;
+        ajb_co_stats.sumcnt_calls++;
+        int result;
+        if(itr == points.begin()) result = 0;
+        else if(itl == points.begin()) result = (itr - 1)->cnt;
+        else result = (itr - 1)->cnt - (itl - 1)->cnt;
+        if(result == 0) ajb_co_stats.sumcnt_zero++;
+        return result;
     }
 
     
@@ -198,6 +243,7 @@ public:
      * @return The number of points within the specified range.
      */
     int count(Point<T> pl, Point<T> pr) {
+        ajb_co_stats.count_calls++;
         return upper_bound(points.begin(), points.end(), pr) - lower_bound(points.begin(), points.end(), pl);
     }
 
@@ -230,6 +276,7 @@ public:
         Point<T> pr,
         typename vector<Point<T> >::iterator itl,
         typename vector<Point<T> >::iterator itr) {
+        ajb_co_stats.range_calls++;
         return make_pair(lower_bound(itl, itr, pl) - points.begin(), upper_bound(itl, itr, pr) - points.begin());
     }
 
@@ -253,6 +300,7 @@ public:
     pair<int, int> getRange(
         Point<T> pl,
         Point<T> pr) {
+        ajb_co_stats.range_calls++;
         return make_pair(lower_bound(points.begin(), points.end(), pl) - points.begin(), upper_bound(points.begin(), points.end(), pr) - points.begin());
     }
 
@@ -311,6 +359,15 @@ public:
         for (int i = 0; i < points.size(); i++) {
             points[i].print();
         }
+    }
+
+    // [AJB] dump前N个和后N个point到stderr, 用于验证排序正确性
+    void ajb_dump_endpoints(int n = 3) const {
+        int total = points.size();
+        fprintf(stderr, "[AJB_STATE][CountOracle] %d points, showing first/last %d:\n", total, n);
+        for(int i = 0; i < min(n, total); i++) points[i].ajb_dump("  head");
+        if(total > 2*n) fprintf(stderr, "[AJB_STATE][CountOracle]   ... (%d omitted)\n", total - 2*n);
+        for(int i = max(n, total - n); i < total; i++) points[i].ajb_dump("  tail");
     }
 
 };

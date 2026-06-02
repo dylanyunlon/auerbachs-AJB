@@ -46,6 +46,20 @@
 #include <cmath>
 #include <algorithm>
 
+// [AJB] RangeTree诊断: 追踪查询热度和构建开销
+static thread_local struct {
+    long long build_calls = 0;
+    long long query_calls = 0;
+    long long total_points_inserted = 0;
+    long long total_query_results = 0;
+    int max_dim = 0;
+    void dump(const char* tag = "RangeTree") {
+        fprintf(stderr, "[AJB_STATE][%s] builds=%lld queries=%lld points_inserted=%lld query_results=%lld max_dim=%d\n",
+                tag, build_calls, query_calls, total_points_inserted, total_query_results, max_dim);
+    }
+    void reset() { build_calls = query_calls = total_points_inserted = total_query_results = 0; max_dim = 0; }
+} ajb_rt_stats;
+
 namespace RangeTree {
 
     /**
@@ -915,6 +929,8 @@ namespace RangeTree {
             }
         }
 
+        // [AJB] Fractional Cascade: O(log^{d-1} n)查询的关键优化
+        // 把d维查询分解为1维二分搜索+指针跟踪
         void rightFractionalCascade(const std::vector<T>& upper,
                                    int geqInd,
                                    int leqInd,
@@ -966,6 +982,7 @@ namespace RangeTree {
         * @param withLower
         * @param nodes
         */
+        // [AJB] Canonical nodes: 找到覆盖查询区间的最少节点集合
         void leftCanonicalNodes(const std::vector<T>& lower,
                                 std::vector<std::shared_ptr<RangeTreeNode<T,S> > >& nodes) {
             if (isLeaf) {
@@ -1127,10 +1144,16 @@ namespace RangeTree {
         *
         * @param points the points from which to create a RangeTree
         */
+        // [AJB_BP] RangeTree construction: 输入点数和维度
         RangeTree(const std::vector<Point<T,S> >& points): savedPoints(copyPointsToHeap(points)),
                                                            savedPointsRaw(getRawPointers(savedPoints)) {
             //calculate the lower and upper bounds of the points in each dimension
             int dim = points[0].dim();
+            ajb_rt_stats.build_calls++;
+            ajb_rt_stats.total_points_inserted += points.size();
+            if(dim > ajb_rt_stats.max_dim) ajb_rt_stats.max_dim = dim;
+            // [AJB_BP] RangeTree building: 点数和维度决定了树的大小和查询复杂度
+            fprintf(stderr, "[AJB_BP][RangeTree] build: %zu points, dim=%d\n", points.size(), dim);
             dimensionsLowerBound = points[0].asVector();
             dimensionsUpperBound = points[0].asVector();
             for (int i = 0; i < points.size(); i++) {
@@ -1209,7 +1232,10 @@ namespace RangeTree {
             if (lower.size() != upper.size()) {
                 throw std::logic_error("upper and lower in countInRange must have the same length.");
             }
-            return root->countInRange(lower, upper);
+            ajb_rt_stats.query_calls++;
+            int ajb_result2 = root->countInRange(lower, upper);
+            ajb_rt_stats.total_query_results += ajb_result2;
+            return ajb_result2;
         }
 
         /**
@@ -1251,6 +1277,16 @@ namespace RangeTree {
 
         void print() const {
             root->print(0);
+        }
+
+        // [AJB] 查询统计dump
+        static void ajb_dump_stats() {
+            ajb_rt_stats.dump();
+        }
+
+        // [AJB] 获取树的基数(不同点数)
+        int ajb_cardinality() const {
+            return getCardinality();
         }
     };
 

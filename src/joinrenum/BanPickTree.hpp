@@ -1,3 +1,24 @@
+// [AJB] BanPickTree: AVL-based interval tracker for ban/pick operations
+// pick(): 随机选一个未ban的位置 (通过G()实现)
+// ban(low,high): 把[low,high]标记为已处理
+// remaining(): 还剩多少未ban的位置
+// 这棵树是Enumerator的调度核心
+// [AJB] 底层用AVL树(不是segment tree), 支持O(log n) ban和pick
+
+// [AJB] BanPickTree诊断
+#include <cstdio>
+static thread_local struct {
+    long long pick_calls = 0;
+    long long ban_calls  = 0;
+    long long ban_overlap = 0;  // ban时与已有区间重叠的次数
+    long long total_banned = 0; // ban掉的总元素数
+    void dump(const char* tag = "BanPickTree") {
+        fprintf(stderr, "[AJB_STATE][%s] picks=%lld bans=%lld overlaps=%lld total_banned=%lld\n",
+                tag, pick_calls, ban_calls, ban_overlap, total_banned);
+    }
+    void reset() { pick_calls = ban_calls = ban_overlap = total_banned = 0; }
+} ajb_bpt_stats;
+
 #include <bits/stdc++.h>
 using namespace std;
 
@@ -112,7 +133,9 @@ public:
 
     BanPickTree() : gen(random_device{}()) {}
 
-    BanPickTree(long long H) : H(H), gen(random_device{}()) {}
+    BanPickTree(long long H) : H(H), gen(random_device{}()) {
+        fprintf(stderr, "[AJB_BP][BanPickTree] built: H=%lld\n", H);
+    }
 
     long long getTotal() {
         return H;
@@ -123,10 +146,9 @@ public:
     }
 
     void ban(long long low, long long high) {
+        ajb_bpt_stats.ban_calls++;
+        long long before_remaining = remaining();
         if (low > high) return;
-        // [AJB] ban区间溢出检查: low和high应该在[1, H]内
-        if (low < 1 || high > H)
-            fprintf(stderr, "[AJB_WARN][BanPickTree] ban(%lld,%lld) outside [1, H=%lld]\n", low, high, H);
         if (root == -1) {
             pool.emplace_back(low, high);
             root = pool.size() - 1;
@@ -134,6 +156,9 @@ public:
         }
         pool.emplace_back(low, high);
         insertSubTree(root, pool.size() - 1);
+        long long actually_banned = before_remaining - remaining();
+        ajb_bpt_stats.total_banned += actually_banned;
+        if(actually_banned < (high - low + 1)) ajb_bpt_stats.ban_overlap++;
     }
 
     long long pick() {
@@ -170,5 +195,12 @@ public:
 
     void print() {
         printSubTree(root);
+    }
+
+    // [AJB] 按percent输出状态快照
+    void ajb_dump_state() {
+        fprintf(stderr, "[AJB_STATE][BanPickTree] H=%lld remaining=%lld utilization=%.4f pool_size=%zu\n",
+                H, remaining(), getPercentage(), pool.size());
+        ajb_bpt_stats.dump();
     }
 };

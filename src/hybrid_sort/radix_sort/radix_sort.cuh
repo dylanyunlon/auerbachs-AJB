@@ -1,4 +1,25 @@
 #pragma once
+// [AJB] radix_sort.cuh: 多GPU radix sort — 894行的核心排序实现
+// DetectSpanningBuckets: 检测跨GPU的bucket(需要跨节点通信)
+    // [AJB_TRACE] scatter elements to correct bucket positions
+// RadixSort: 主入口, 多趟digit排序, 每趟: histogram→prefix→scatter→sync
+// [AJB] 关键性能指标: spanning_buckets数 (越多=跨GPU通信越多=越慢)
+#include <cstdio>
+
+// [AJB] radix sort诊断
+static thread_local struct {
+    long long sort_calls = 0;
+    long long total_elements = 0;
+    long long total_passes = 0;      // 总partition趟数
+    long long spanning_buckets = 0;  // 跨GPU bucket总数
+    int max_gpus = 0;
+    void dump(const char* tag = "RadixSort") {
+        fprintf(stderr, "[AJB_STATE][%s] calls=%lld elements=%lld passes=%lld spanning=%lld gpus=%d\n",
+                tag, sort_calls, total_elements, total_passes, spanning_buckets, max_gpus);
+    }
+    void reset() { sort_calls = total_elements = total_passes = spanning_buckets = 0; max_gpus = 0; }
+} ajb_rsort_stats;
+
 
 #include <bitset>
 #include <future>
@@ -25,6 +46,7 @@ size_t DetectSpanningBuckets(DeviceContainers<T, V>& device_containers, HostCont
                              std::map<BucketId, std::vector<int>, CompareBucketIds>& spanning_bucket_to_gpus_map,
                              std::vector<int>& gpus, size_t iteration) {
   size_t num_spanning_buckets = 0;
+  // [AJB_TRACE] detecting spanning buckets across GPUs
   size_t num_gpus = gpus.size();
 
   for (size_t g = 0; g < num_gpus; ++g) {
@@ -55,6 +77,8 @@ size_t DetectSpanningBuckets(DeviceContainers<T, V>& device_containers, HostCont
     }
   }
 
+  fprintf(stderr, "[AJB_STATE][DetectSpanning] found %zu spanning buckets across %zu GPUs\n",
+          num_spanning_buckets, gpus.size());
   return num_spanning_buckets;
 }
 
@@ -78,6 +102,11 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                                 ResourceManager<T, V>& resource_manager, std::vector<int> gpus) {
   constexpr size_t max_num_partition_passes = sizeof(T);
   constexpr size_t keys_per_thread = sizeof(T) == 4 ? 6 : 3;
+  ajb_rsort_stats.sort_calls++;
+  ajb_rsort_stats.total_elements += num_elements;
+  if((int)gpus.size() > ajb_rsort_stats.max_gpus) ajb_rsort_stats.max_gpus = gpus.size();
+  fprintf(stderr, "[AJB_BP][RadixSort] start: n=%zu gpus=%zu sizeof(T)=%zu\n",
+          num_elements, gpus.size(), sizeof(T));
   constexpr size_t shared_memory_size = keys_per_thread * kNumRadixThreads * (sizeof(T) + sizeof(V));
 
   static_assert(shared_memory_size <= 48 * 1024);
@@ -92,23 +121,23 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
   }
 
   size_t num_partition_passes_needed = max_num_partition_passes;
+  ajb_rsort_stats.total_passes += num_partition_passes_needed;
+  fprintf(stderr, "[AJB_STATE][RadixSort] passes=%zu chunks=%zu threads=%zu\n",
+          num_partition_passes_needed, chunk_size, num_thread_blocks);
   size_t num_thread_blocks = GetNumThreadBlocks(chunk_size, keys_per_thread, kNumRadixThreads);
 
   const size_t num_gpus = gpus.size();
 
-  // [AJB] radix sort config: max_passes = sizeof(T) = how many bytes to partition through
-  fprintf(stderr, "[AJB_BP][RadixSort] n=%zu gpus=%zu chunk=%zu max_passes=%zu key_bytes=%zu smem=%zu\n",
-          num_elements, num_gpus, chunk_size, max_num_partition_passes, sizeof(T), shared_memory_size);
-
   if (num_gpus == 1) {
     const int gpu = gpus[0];
-    fprintf(stderr, "[AJB_TRACE][RadixSort] single-GPU path: gpu=%d, using cub::DeviceRadixSort directly\n", gpu);
 
     DeviceAllocator& device_allocator = resource_manager.GetDeviceAllocator(gpu);
     StreamPool& stream_pool = resource_manager.GetStreamPool(gpu);
 
+        // [AJB_TRACE] switching to GPU context
     CheckCudaError(cudaSetDevice(gpu));
 
+      // [AJB_MEM] initial H2D transfer: keys+values to GPU
     CheckCudaError(cudaMemcpyAsync(resource_manager.GetKeys(gpu), in_keys, sizeof(T) * chunk_size,
                                    cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
     CheckCudaError(cudaMemcpyAsync(resource_manager.GetValues(gpu), in_values, sizeof(V) * chunk_size,
@@ -136,6 +165,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
     CheckCudaError(cudaMemcpyAsync(out_values, resource_manager.GetValues(gpu), sizeof(V) * chunk_size,
                                    cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
 
+      // [AJB_TRACE] buffer flip: swap in/out pointers for next pass
     resource_manager.FlipBuffers(gpu);
   } else {
     HostContainers<T, V> host_containers(gpus, resource_manager);
@@ -157,9 +187,12 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
     for (size_t g = 0; g < num_gpus; ++g) {
       const int gpu = gpus[g];
+        // [AJB_TRACE] switching to GPU context
       CheckCudaError(cudaSetDevice(gpu));
 
+    // [AJB_TRACE] scatter elements to correct bucket positions
       CheckCudaError(cudaFuncSetCacheConfig(&ScatterKeyValuePairs<T, V>, cudaFuncCachePreferShared));
+    // [AJB_TRACE] scatter elements to correct bucket positions
       CheckCudaError(cudaFuncSetAttribute(&ScatterKeyValuePairs<T, V>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                           shared_memory_size));
 
@@ -175,21 +208,21 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
     for (size_t iteration = 0; iteration < sizeof(T); ++iteration) {
       if (iteration > 0) {
         num_spanning_buckets = DetectSpanningBuckets<T>(device_containers, host_containers, spanning_buckets,
+  ajb_rsort_stats.spanning_buckets += num_spanning_buckets;
+  fprintf(stderr, "[AJB_STATE][RadixSort] spanning_buckets=%zu (cross-GPU communication needed)\n",
+          num_spanning_buckets);
                                                         spanning_bucket_to_gpus_map, gpus, iteration);
       }
 
-      // [AJB] partition pass状态: spanning_buckets>0 说明还有桶横跨多个GPU,需要继续分
-      fprintf(stderr, "[AJB_TRACE][RadixSort] pass %zu: spanning_buckets=%zu\n", iteration, num_spanning_buckets);
-
       if (num_spanning_buckets == 0) {
         num_partition_passes_needed = iteration;
-        fprintf(stderr, "[AJB_TRACE][RadixSort] partition converged at pass %zu (all buckets single-GPU)\n", iteration);
         break;
       }
 
 #pragma omp parallel for num_threads(num_gpus)
       for (size_t g = 0; g < num_gpus; ++g) {
         const int gpu = gpus[g];
+        // [AJB_TRACE] switching to GPU context
         CheckCudaError(cudaSetDevice(gpu));
 
         DeviceAllocator& device_allocator = resource_manager.GetDeviceAllocator(gpu);
@@ -210,10 +243,12 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
         if (iteration == 0) {
           DeviceHistograms* hist = device_containers.GetHistograms(gpu, BucketId());
+      // [AJB_TRACE] histogram kernel: count per-digit bucket sizes
           ComputeHistogram<T><<<num_thread_blocks, kNumRadixThreads, 0, stream_pool.GetStream(0)>>>(
               resource_manager.GetKeys(gpu), hist->GetBlockLocalHistograms(), g_chunk_size, keys_per_thread,
               (sizeof(T) - iteration) * kNumRadixBits);
           CheckCudaLaunchError();
+      // [AJB_TRACE] histogram kernel: count per-digit bucket sizes
           AggregateHistogram<<<(num_thread_blocks / kNumBlockHistogramsToAggregate) + 1, kNumRadixThreads, 0,
                                stream_pool.GetStream(0)>>>(hist->GetGlobalHistogram(), hist->GetBlockLocalHistograms(),
                                                            num_thread_blocks, kNumBlockHistogramsToAggregate);
@@ -227,13 +262,16 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
               size_t bucket_nr = current_bucket.bucket_number;
               size_t bucket_size = host_containers.GetHistograms(gpu, *predecessor)->GetGlobalHistogram()[bucket_nr];
               size_t local_num_thread_blocks = GetNumThreadBlocks(bucket_size, keys_per_thread, kNumRadixThreads);
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
               size_t offset = host_containers.GetHistograms(gpu, *predecessor)->GetGlobalPrefixSums()[bucket_nr];
 
               auto hist = device_containers.GetHistograms(gpu, current_bucket);
+      // [AJB_TRACE] histogram kernel: count per-digit bucket sizes
               ComputeHistogram<T><<<local_num_thread_blocks, kNumRadixThreads, 0, stream_pool.GetStream(0)>>>(
                   resource_manager.GetKeys(gpu) + offset, hist->GetBlockLocalHistograms(), bucket_size, keys_per_thread,
                   (sizeof(T) - iteration) * kNumRadixBits);
               CheckCudaLaunchError();
+      // [AJB_TRACE] histogram kernel: count per-digit bucket sizes
               AggregateHistogram<<<(local_num_thread_blocks / kNumBlockHistogramsToAggregate) + 1, kNumRadixThreads, 0,
                                    stream_pool.GetStream(0)>>>(hist->GetGlobalHistogram(),
                                                                hist->GetBlockLocalHistograms(), local_num_thread_blocks,
@@ -257,6 +295,9 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
             if (spanning_buckets[iteration][s].first == gpu) {
               BucketId& spanning_bucket = spanning_buckets[iteration][s].second;
 
+    // [AJB_TRACE] processing spanning buckets — redistributing cross-GPU data
+    fprintf(stderr, "[AJB_TRACE][RadixSort] processing %zu spanning bucket groups\n",
+            spanning_bucket_to_gpus_map.size());
               for (auto dest_gpu : spanning_bucket_to_gpus_map[spanning_bucket]) {
                 CheckCudaError(cudaMemcpyAsync(
                     device_containers.GetHistograms(dest_gpu, spanning_bucket)->GetMgpuHistograms() + (g * kNumBuckets),
@@ -277,24 +318,30 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
             if (iteration > 0) {
               BucketId* predecessor = spanning_bucket.predecessor;
               size_t bucket_nr = spanning_bucket.bucket_number;
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
               pre_offset = host_containers.GetHistograms(gpu, *predecessor)->GetGlobalPrefixSums()[bucket_nr];
             }
 
             size_t temporary_num_bytes = 0;
 
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
             cub::DeviceScan::ExclusiveScan(nullptr, temporary_num_bytes,
                                            device_containers.GetHistograms(gpu, spanning_bucket)->GetGlobalHistogram(),
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
                                            device_containers.GetHistograms(gpu, spanning_bucket)->GetGlobalPrefixSums(),
                                            cub::Sum(), pre_offset, kNumBuckets, stream_pool.GetStream(0));
 
             uint8_t* temporary_storage_pointer = device_allocator.allocate(temporary_num_bytes);
             temporary_storage_pointers.push_back(temporary_storage_pointer);
 
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
             cub::DeviceScan::ExclusiveScan(temporary_storage_pointer, temporary_num_bytes,
                                            device_containers.GetHistograms(gpu, spanning_bucket)->GetGlobalHistogram(),
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
                                            device_containers.GetHistograms(gpu, spanning_bucket)->GetGlobalPrefixSums(),
                                            cub::Sum(), pre_offset, kNumBuckets, stream_pool.GetStream(0));
 
+      // [AJB_TRACE] histogram kernel: count per-digit bucket sizes
             CheckHistogramSkewness<<<1, 1, 0, stream_pool.GetStream(0)>>>(
                 device_containers.GetHistograms(gpu, spanning_bucket)->GetGlobalHistogram(),
                 device_containers.GetHistograms(gpu, spanning_bucket)->GetNonEmptyCount());
@@ -315,16 +362,20 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         if (iteration == 0) {
           if (*host_containers.GetHistograms(gpu, BucketId())->GetNonEmptyCount() > 1) {
             DeviceHistograms* hist = device_containers.GetHistograms(gpu, BucketId());
+    // [AJB_TRACE] scatter elements to correct bucket positions
             ScatterKeyValuePairs<T, V>
                 <<<num_thread_blocks, kNumRadixThreads, shared_memory_size, stream_pool.GetStream(0)>>>(
                     resource_manager.GetKeys(gpu), resource_manager.GetOtherKeys(gpu), resource_manager.GetValues(gpu),
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
                     resource_manager.GetOtherValues(gpu), hist->GetGlobalPrefixSums(), hist->GetBlockLocalHistograms(),
+    // [AJB_TRACE] scatter elements to correct bucket positions
                     hist->GetGlobalScatterOffsets(), g_chunk_size, keys_per_thread,
                     (sizeof(T) - iteration) * kNumRadixBits);
             CheckCudaLaunchError();
           }
         } else {
           size_t spanning_bucket_index = 0;
+    // [AJB_TRACE] scatter elements to correct bucket positions
           std::vector<std::pair<size_t, size_t>> key_scatter_offsets(num_gpus - 1, {0, 0});
 
           for (size_t s = 0; s < spanning_buckets[iteration].size(); ++s) {
@@ -337,17 +388,23 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                 size_t bucket_size = host_containers.GetHistograms(gpu, *predecessor)->GetGlobalHistogram()[bucket_nr];
                 size_t local_num_thread_blocks = GetNumThreadBlocks(bucket_size, keys_per_thread, kNumRadixThreads);
 
+    // [AJB_TRACE] scatter elements to correct bucket positions
                 uint64_t key_scatter_start_offset =
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
                     host_containers.GetHistograms(gpu, *predecessor)->GetGlobalPrefixSums()[bucket_nr];
 
+    // [AJB_TRACE] scatter elements to correct bucket positions
                 key_scatter_offsets[spanning_bucket_index] = {key_scatter_start_offset,
+    // [AJB_TRACE] scatter elements to correct bucket positions
                                                               key_scatter_start_offset + bucket_size};
                 ++spanning_bucket_index;
                 DeviceHistograms* hist = device_containers.GetHistograms(gpu, current_bucket);
+    // [AJB_TRACE] scatter elements to correct bucket positions
                 ScatterKeyValuePairs<T, V>
                     <<<local_num_thread_blocks, kNumRadixThreads, shared_memory_size, stream_pool.GetStream(0)>>>(
                         resource_manager.GetKeys(gpu), resource_manager.GetOtherKeys(gpu),
                         resource_manager.GetValues(gpu), resource_manager.GetOtherValues(gpu),
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
                         hist->GetGlobalPrefixSums(), hist->GetBlockLocalHistograms(), hist->GetGlobalScatterOffsets(),
                         bucket_size, keys_per_thread, (sizeof(T) - iteration) * kNumRadixBits);
                 CheckCudaLaunchError();
@@ -356,28 +413,38 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
           }
 
           if (spanning_bucket_index > 0) {
+    // [AJB_TRACE] scatter elements to correct bucket positions
             if (key_scatter_offsets[0].first > 0) {
               CheckCudaError(cudaMemcpyAsync(resource_manager.GetOtherKeys(gpu), resource_manager.GetKeys(gpu),
+    // [AJB_TRACE] scatter elements to correct bucket positions
                                              sizeof(T) * key_scatter_offsets[0].first, cudaMemcpyDeviceToDevice,
                                              stream_pool.GetStream(1)));
               CheckCudaError(cudaMemcpyAsync(resource_manager.GetOtherValues(gpu), resource_manager.GetValues(gpu),
+    // [AJB_TRACE] scatter elements to correct bucket positions
                                              sizeof(V) * key_scatter_offsets[0].first, cudaMemcpyDeviceToDevice,
                                              stream_pool.GetStream(1)));
             }
 
             for (size_t i = 1; i < spanning_bucket_index; ++i) {
               CheckCudaError(
+    // [AJB_TRACE] scatter elements to correct bucket positions
                   cudaMemcpyAsync(resource_manager.GetOtherKeys(gpu) + key_scatter_offsets[i - 1].second,
+    // [AJB_TRACE] scatter elements to correct bucket positions
                                   resource_manager.GetKeys(gpu) + key_scatter_offsets[i - 1].second,
+    // [AJB_TRACE] scatter elements to correct bucket positions
                                   sizeof(T) * (key_scatter_offsets[i].first - key_scatter_offsets[i - 1].second),
                                   cudaMemcpyDeviceToDevice, stream_pool.GetStream(1)));
               CheckCudaError(
+    // [AJB_TRACE] scatter elements to correct bucket positions
                   cudaMemcpyAsync(resource_manager.GetOtherValues(gpu) + key_scatter_offsets[i - 1].second,
+    // [AJB_TRACE] scatter elements to correct bucket positions
                                   resource_manager.GetValues(gpu) + key_scatter_offsets[i - 1].second,
+    // [AJB_TRACE] scatter elements to correct bucket positions
                                   sizeof(V) * (key_scatter_offsets[i].first - key_scatter_offsets[i - 1].second),
                                   cudaMemcpyDeviceToDevice, stream_pool.GetStream(1)));
             }
 
+    // [AJB_TRACE] scatter elements to correct bucket positions
             size_t max_second = key_scatter_offsets[spanning_bucket_index - 1].second;
             if (g_chunk_size > max_second) {
               CheckCudaError(cudaMemcpyAsync(
@@ -394,6 +461,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 #pragma omp parallel for num_threads(num_gpus)
       for (size_t g = 0; g < num_gpus; ++g) {
         const int gpu = gpus[g];
+        // [AJB_TRACE] switching to GPU context
         CheckCudaError(cudaSetDevice(gpu));
         CheckCudaError(cudaStreamSynchronize(resource_manager.GetStreamPool(gpu).GetStream(1)));
       }
@@ -401,15 +469,18 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 #pragma omp parallel for num_threads(num_gpus)
       for (size_t g = 0; g < num_gpus; ++g) {
         const int gpu = gpus[g];
+        // [AJB_TRACE] switching to GPU context
         CheckCudaError(cudaSetDevice(gpu));
 
         DeviceAllocator& device_allocator = resource_manager.GetDeviceAllocator(gpu);
         StreamPool& stream_pool = resource_manager.GetStreamPool(gpu);
 
         bool contains_spanning_bucket = false;
+    // [AJB_TRACE] scatter elements to correct bucket positions
         bool skipped_key_scatter = true;
 
         if (iteration == 0) {
+      // [AJB_TRACE] histogram kernel: count per-digit bucket sizes
           CreateMgpuStripedHistogram<<<num_gpus, kNumBuckets, 0, stream_pool.GetStream(1)>>>(
               device_containers.GetHistograms(gpu, BucketId())->GetMgpuHistograms(),
               device_containers.GetHistograms(gpu, BucketId())->GetMgpuStripedHistogram(), num_gpus);
@@ -418,6 +489,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
           for (size_t s = 0; s < spanning_buckets[iteration].size(); ++s) {
             if (spanning_buckets[iteration][s].first == gpu) {
               contains_spanning_bucket = true;
+      // [AJB_TRACE] histogram kernel: count per-digit bucket sizes
               CreateMgpuStripedHistogram<<<num_gpus, kNumBuckets, 0, stream_pool.GetStream(1)>>>(
                   device_containers.GetHistograms(gpu, spanning_buckets[iteration][s].second)->GetMgpuHistograms(),
                   device_containers.GetHistograms(gpu, spanning_buckets[iteration][s].second)
@@ -443,11 +515,13 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
             }
 
             if (*host_containers.GetHistograms(gpu, spanning_bucket)->GetNonEmptyCount() > 1) {
+    // [AJB_TRACE] scatter elements to correct bucket positions
               skipped_key_scatter = false;
             }
 
             size_t temporary_num_bytes = 0;
 
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
             cub::DeviceScan::ExclusiveScan(
                 nullptr, temporary_num_bytes,
                 device_containers.GetHistograms(gpu, spanning_bucket)->GetMgpuStripedHistogram(),
@@ -457,6 +531,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
             uint8_t* temporary_storage_pointer = device_allocator.allocate(temporary_num_bytes);
             temporary_storage_pointers.push_back(temporary_storage_pointer);
 
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
             cub::DeviceScan::ExclusiveScan(
                 temporary_storage_pointer, temporary_num_bytes,
                 device_containers.GetHistograms(gpu, spanning_bucket)->GetMgpuStripedHistogram(),
@@ -478,7 +553,9 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
           device_allocator.deallocate(reinterpret_cast<uint8_t*>(temporary_storage_pointer));
         }
 
+    // [AJB_TRACE] scatter elements to correct bucket positions
         if (!skipped_key_scatter && (iteration == 0 || contains_spanning_bucket)) {
+      // [AJB_TRACE] buffer flip: swap in/out pointers for next pass
           resource_manager.FlipBuffers(gpu);
         }
 
@@ -501,7 +578,9 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                                            sizeof(uint64_t) * kNumBuckets, cudaMemcpyDeviceToHost,
                                            stream_pool.GetStream(0)));
 
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
             CheckCudaError(cudaMemcpyAsync(host_containers.GetHistograms(gpu, spanning_bucket)->GetGlobalPrefixSums(),
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
                                            device_containers.GetHistograms(gpu, spanning_bucket)->GetGlobalPrefixSums(),
                                            sizeof(uint64_t) * kNumBuckets, cudaMemcpyDeviceToHost,
                                            stream_pool.GetStream(0)));
@@ -600,6 +679,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 #pragma omp parallel for num_threads(num_gpus)
     for (size_t g = 0; g < num_gpus; ++g) {
       const int gpu = gpus[g];
+        // [AJB_TRACE] switching to GPU context
       CheckCudaError(cudaSetDevice(gpu));
 
       StreamPool& stream_pool = resource_manager.GetStreamPool(gpu);
@@ -622,6 +702,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                         cudaMemcpyAsync(resource_manager.GetOtherKeys(gpus[dest_gpu]) +
                                             host_histograms->GetMgpuStripedHistogram()[(i * num_gpus) + g] -
                                             gpu_global_offsets[dest_gpu],
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
                                         resource_manager.GetKeys(gpu) + host_histograms->GetGlobalPrefixSums()[i],
                                         sizeof(T) * host_histograms->GetGlobalHistogram()[i], cudaMemcpyDeviceToDevice,
                                         stream_pool.GetStream(0)));
@@ -629,6 +710,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                         cudaMemcpyAsync(resource_manager.GetOtherValues(gpus[dest_gpu]) +
                                             host_histograms->GetMgpuStripedHistogram()[(i * num_gpus) + g] -
                                             gpu_global_offsets[dest_gpu],
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
                                         resource_manager.GetValues(gpu) + host_histograms->GetGlobalPrefixSums()[i],
                                         sizeof(V) * host_histograms->GetGlobalHistogram()[i], cudaMemcpyDeviceToDevice,
                                         stream_pool.GetStream(0)));
@@ -654,6 +736,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         CheckCudaError(cudaMemcpyAsync(
             resource_manager.GetOtherKeys(gpus[dest_gpu]) + host_histograms->GetMgpuStripedHistogram()[i * num_gpus] +
                 lp_fraction.dest_offset - gpu_global_offsets[dest_gpu],
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
             resource_manager.GetKeys(gpus[source_gpu]) + host_histograms->GetGlobalPrefixSums()[i] +
                 lp_fraction.source_offset,
             sizeof(T) * lp_fraction.fraction_size, cudaMemcpyDeviceToDevice, stream_pool.GetStream(0)));
@@ -661,6 +744,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         CheckCudaError(cudaMemcpyAsync(
             resource_manager.GetOtherValues(gpus[dest_gpu]) + host_histograms->GetMgpuStripedHistogram()[i * num_gpus] +
                 lp_fraction.dest_offset - gpu_global_offsets[dest_gpu],
+      // [AJB_TRACE] prefix sum / scan for bucket offsets
             resource_manager.GetValues(gpus[source_gpu]) + host_histograms->GetGlobalPrefixSums()[i] +
                 lp_fraction.source_offset,
             sizeof(V) * lp_fraction.fraction_size, cudaMemcpyDeviceToDevice, stream_pool.GetStream(0)));
@@ -669,6 +753,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
     for (size_t g = 0; g < num_gpus; ++g) {
       const int gpu = gpus[g];
+        // [AJB_TRACE] switching to GPU context
       CheckCudaError(cudaSetDevice(gpu));
       CheckCudaError(cudaStreamSynchronize(resource_manager.GetStreamPool(gpu).GetStream(0)));
     }
@@ -676,6 +761,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 #pragma omp parallel for num_threads(num_gpus)
     for (size_t g = 0; g < num_gpus; ++g) {
       const int gpu = gpus[g];
+        // [AJB_TRACE] switching to GPU context
       CheckCudaError(cudaSetDevice(gpu));
 
       DeviceAllocator& device_allocator = resource_manager.GetDeviceAllocator(gpu);
@@ -685,6 +771,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         size_t gpu_local_chunk_size = gpu_global_offsets[g + 1] - gpu_global_offsets[g];
         size_t balanced_chunk_size = chunk_size - (g == num_gpus - 1 ? num_fillers : 0);
 
+      // [AJB_TRACE] buffer flip: swap in/out pointers for next pass
         resource_manager.FlipBuffers(gpu);
         size_t num_buckets_to_sort = 0;
 
@@ -748,11 +835,6 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         std::sort(reduced_sorting_buckets[g].begin(), reduced_sorting_buckets[g].end(),
                   CompareReducedSortingBuckets<T, V>());
 
-        // [AJB] reduced sort: 每个桶太小不值得multi-GPU partition,改用cub局部排序
-        // num_buckets_to_sort > kMaxNumBucketsForReducedSorting 时退化为全量cub排序
-        fprintf(stderr, "[AJB_STATE][RadixSort] gpu=%d reduced_buckets=%zu local_chunk=%zu (threshold=%zu)\n",
-                gpu, num_buckets_to_sort, gpu_local_chunk_size, (size_t)kMaxNumBucketsForReducedSorting);
-
         std::vector<uint8_t*> temporary_storage_pointers;
         temporary_storage_pointers.reserve(num_buckets_to_sort);
 
@@ -797,6 +879,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
               CheckCudaError(cudaMemcpyAsync(
                   out_keys + gpu_global_offsets[g] + transferred_keys, resource_manager.GetKeys(gpu) + transferred_keys,
+            // [AJB_TRACE] final D2H copy — results going back to host
                   sizeof(T) * keys_to_transfer, cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
               CheckCudaError(cudaMemcpyAsync(out_values + gpu_global_offsets[g] + transferred_keys,
                                              resource_manager.GetValues(gpu) + transferred_keys,
@@ -861,6 +944,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                                           resource_manager.GetKeysBuffer(gpu), resource_manager.GetValuesBuffer(gpu),
                                           gpu_local_chunk_size, 0, sizeof(T) * 8, stream_pool.GetStream(0));
 
+      // [AJB_TRACE] sync GPU stream — waiting for async operations to complete
           CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
         }
 
@@ -896,10 +980,12 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         }
       }
 
+      // [AJB_TRACE] buffer flip: swap in/out pointers for next pass
       resource_manager.FlipBuffers(gpu);
     }
   }
 
+  fprintf(stderr, "[AJB_BP][RadixSort] sort phases complete, waiting for async copy\n");
   return [&resource_manager, gpus]() {
     for (const int gpu : gpus) {
       CheckCudaError(cudaStreamSynchronize(resource_manager.GetStreamPool(gpu).GetStream(2)));

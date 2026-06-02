@@ -2,7 +2,22 @@
 #include "RRAccessTree.hpp"
 #include <sys/resource.h>
 #include <ctime>
+#include <chrono>
 using namespace std;
+
+// [AJB] Enumerator诊断: 追踪enumerate过程中的成功率、ban效率、内存增长
+static thread_local struct {
+    long long total_attempts = 0;
+    long long total_success  = 0;
+    long long total_bans     = 0;
+    double    last_hit_rate  = 0.0;
+    double    peak_rss_mb    = 0.0;
+    void dump(const char* tag = "Enumerator") {
+        fprintf(stderr, "[AJB_STATE][%s] attempts=%lld success=%lld bans=%lld hit_rate=%.4f peak_rss=%.1fMB\n",
+                tag, total_attempts, total_success, total_bans, last_hit_rate, peak_rss_mb);
+    }
+    void reset() { total_attempts = total_success = total_bans = 0; last_hit_rate = peak_rss_mb = 0.0; }
+} ajb_enum_stats;
 
 size_t getMemoryUsage() {
     std::ifstream stat_stream("/proc/self/status");
@@ -43,13 +58,17 @@ public:
         unordered_map<string, int> numlines) :
         access_tree(relations, filenames, numlines, treeflag),
         // bp(min(access_tree.AGM, access_tree.idx.jt.treeUpp(access_tree.idx.FB))) {}   
-        bp(access_tree.AGM) {access_tree.idx.treeflag = treeflag;}
+        bp(access_tree.AGM) {
+        access_tree.idx.treeflag = treeflag;
+        // [AJB_BP] Enumerator ready: AGM + option + treeflag = 枚举的三个关键参数
+        fprintf(stderr, "[AJB_BP][Enumerator] constructed: AGM=%lld option=%d treeflag=%d\n",
+                access_tree.AGM, option, (int)treeflag);
+        fprintf(stderr, "[AJB_STATE][Enumerator] BanPickTree range=[1, %lld]\n", access_tree.AGM);
+    }
+
     void random_enumerate() {
         double totalRRAccessTime = 0;
         int cntsuccess = 0, cnt = 0, step = 20;
-        // [AJB] 枚举开始: AGM是总解空间大小,option决定RRAccess变体
-        fprintf(stderr, "[AJB_BP][Enumerator] AGM=%lld option=%d treeflag=%d\n",
-                access_tree.AGM, option, (int)treeflag);
         clock_t start = clock();
         clock_t end;
         double elapsed = 0;
@@ -57,9 +76,13 @@ public:
         long long s;
         bool res;
         struct rusage r_usage;
+        auto ajb_wall_start = std::chrono::steady_clock::now();
+        fprintf(stderr, "[AJB_BP][Enumerator] enumerate start: option=%d AGM=%lld\n",
+                option, access_tree.AGM);
         while(bp.remaining()){
             // cout << "REMAINING: " << bp.remaining() << endl;
             cnt++;
+            ajb_enum_stats.total_attempts++;
             s = bp.pick();
             // auto startRRAccess = std::chrono::high_resolution_clock::now();
             switch(option) {
@@ -84,12 +107,18 @@ public:
                 // cout << ")" << endl;
                 
                 cntsuccess++;
+                ajb_enum_stats.total_success++;
                 // if(cntsuccess == 77610){
                 if(cntsuccess <= 20 || cntsuccess % 10000 == 0){
                 end = clock();
                 elapsed = double(end - start) / CLOCKS_PER_SEC;
                 getrusage(RUSAGE_SELF, &r_usage);
+                double rss_mb = r_usage.ru_maxrss / 1024.0;
+                if(rss_mb > ajb_enum_stats.peak_rss_mb) ajb_enum_stats.peak_rss_mb = rss_mb;
                 cout << cntsuccess << ", " << cnt << ", " << bp.remaining() << ", " << bp.getPercentage() << ", " << elapsed  << ", "<< r_usage.ru_maxrss/1024 << "MB, " << access_tree.idx.totalrrtreenode << endl;
+                // [AJB_TRACE] 阶段性进度: hit_rate在这里能看出算法效率
+                fprintf(stderr, "[AJB_TRACE][Enumerator] progress: success=%d/%d remaining=%lld pct=%.4f rss=%.0fMB rrtreenode=%d\n",
+                        cntsuccess, cnt, bp.remaining(), bp.getPercentage(), rss_mb, access_tree.idx.totalrrtreenode);
                 }
             }
             // if(cnt % 100 == 0){
@@ -100,16 +129,22 @@ public:
             if(res) bp.ban(s,s);
             for(int i = 0; i < access_tree.numti; i++) {
                 bp.ban(access_tree.trivialIntervals[i].first, access_tree.trivialIntervals[i].second);
+                ajb_enum_stats.total_bans++;
             }
             // else bp.ban(access_tree.trivialInterval.first, access_tree.trivialInterval.second);
         }
         end = clock();
         elapsed = double(end - start) / CLOCKS_PER_SEC;
+        auto ajb_wall_end = std::chrono::steady_clock::now();
+        double wall_sec = std::chrono::duration<double>(ajb_wall_end - ajb_wall_start).count();
         cout << cntsuccess << ", " << cnt << ", " << bp.remaining() << ", " << bp.getPercentage() << ", " << elapsed << endl;
         cout << "Total RRAccess Time: " << totalRRAccessTime << endl;
-        // [AJB] hit_rate = 实际找到tuple的比例,低hit_rate说明解空间很稀疏
-        fprintf(stderr, "[AJB_STATE][Enumerator] results=%d attempts=%d hit_rate=%.4f elapsed=%.3fs\n",
-                cntsuccess, cnt, cnt > 0 ? (double)cntsuccess / cnt : 0.0, elapsed);
+        // [AJB_TIMER] final summary: 成功数/尝试数/ban数/wall time
+        ajb_enum_stats.last_hit_rate = cnt > 0 ? (double)cntsuccess / cnt : 0.0;
+        fprintf(stderr, "[AJB_TIMER][Enumerator] done: success=%d attempts=%d hit_rate=%.6f cpu=%.3fs wall=%.3fs\n",
+                cntsuccess, cnt, ajb_enum_stats.last_hit_rate, elapsed, wall_sec);
+        fprintf(stderr, "[AJB_STATE][Enumerator] total_bans=%lld peak_rss=%.1fMB\n",
+                ajb_enum_stats.total_bans, ajb_enum_stats.peak_rss_mb);
     }
 
 };

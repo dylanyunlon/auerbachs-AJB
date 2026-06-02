@@ -985,6 +985,11 @@ def init(platform: Platform):
 
     ####################################################################################################################
     # EXECUTABLE # ajb_benchmark (AJB — Adaptive Bandwidth-tier Join)
+    # [AJB] 自适应带宽分层Join: 根据GPU互连拓扑(PCIe/NVLink/NVSwitch)自动选择最优数据传输策略
+    # K_x: build-partition cadence — 控制hash partition的粒度
+    # K_u: merge-path boundary cadence — 控制merge阶段的并行度
+    # K_v: materialization buffer cadence — 控制结果物化的buffer大小
+    # auto_tune=True: 使用skew detector自动调参
     ####################################################################################################################
 
     executable = "ajb_benchmark"
@@ -1012,6 +1017,8 @@ def init(platform: Platform):
         ################################################################################################################
 
         identifier = "ajb_cadence_sweep"
+        # [AJB] cadence sweep: 固定K_x/K_v, 扫描K_u, 对应论文Figure 3
+        # 验证merge-path boundary cadence对throughput的影响
         arguments = []
 
         r_num_elements = {

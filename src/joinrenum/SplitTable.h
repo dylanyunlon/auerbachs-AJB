@@ -1,66 +1,74 @@
-//
-// Created by shai.zeevi
-// [AJB] SplitTable: per-relation split tracking for BucketPool on 04/06/2019.
-//
-
-#ifndef RANDOMORDERENUMERATION_SPLITTABLE_H
-#define RANDOMORDERENUMERATION_SPLITTABLE_H
-
-#include "iostream"
-#include <functional>
-#include <unordered_map>
-#include "Table.h"
-
-typedef long long ll;
-
+#ifndef SPLITTABLE_H
+#define SPLITTABLE_H
+// [AJB] SplitTable: per-relation split tracking for BucketPool
+// 记录每个relation在每个splitDim上的值域边界(用于快速Split)
+// Created by shai.zeevi on 04/06/2019.
+#include <vector>
+#include <iostream>
+#include <cstdio>
 using namespace std;
 
-//KeyParcel is the key by which it is split - we'll use it to constitutes an incomplete parcel which
-//encompasses the intersection of the atom attr. and the parent attr.
+class SplitTable {
+public:
+    // splitRanges[dim] = 这个relation在维度dim上的split point列表(已排序)
+    vector<vector<int> > splitRanges;
+    int numDims;
 
-template<typename KeyParcel, typename Parcel, typename KeyParcelHash = hash<KeyParcel>, typename KeyParcelEqual = equal_to<KeyParcel>,
-        typename ParcelHash = hash<Parcel>, typename ParcelEqual = equal_to<Parcel>>
-struct SplitTable {
-    unordered_map<KeyParcel, Table<Parcel, ParcelHash, ParcelEqual>, KeyParcelHash, KeyParcelEqual> buckets;
-
-    SplitTable() = default;
-
-    inline void push_back(const KeyParcel& key, const Row<Parcel>& value) {
-//        if (buckets.find(key) == buckets.end()) {
-//            buckets[key] = Table<Parcel, ParcelHash, ParcelEqual>();
-//        }
-        buckets[key].push_back(value);
+    SplitTable() : numDims(0) {}
+    SplitTable(int d) : numDims(d) {
+        splitRanges.resize(d);
     }
 
-//  KeyParcel is the key, Parcel is the value
-    inline void loadFromTable(const Table<Parcel, ParcelHash, ParcelEqual> &table) { /*unified table containing the values*/
-        buckets.clear();
-        for (const Row<Parcel> &row : table.data) { //traverse the unified table
-            push_back(row.parcel.template to<KeyParcel>() /*key extraction*/, row); //put the tuple in its bucket
+    void addSplitPoint(int dim, int val) {
+        if(dim >= 0 && dim < numDims)
+            splitRanges[dim].push_back(val);
+    }
+
+    void sortAll() {
+        for(int d = 0; d < numDims; d++){
+            sort(splitRanges[d].begin(), splitRanges[d].end());
+            splitRanges[d].erase(
+                unique(splitRanges[d].begin(), splitRanges[d].end()),
+                splitRanges[d].end());
         }
     }
 
-    inline long long getCummulativeWeight() {
-        ll cumWeight = 0;
+    const vector<int>& getSplitPoints(int dim) const {
+        return splitRanges[dim];
+    }
 
-        for(auto& b : buckets) {
-            cumWeight += b.second.totalWeight;
-        }
-
-        return cumWeight;
+    int numSplitPoints(int dim) const {
+        return dim < numDims ? splitRanges[dim].size() : 0;
     }
 
     void print() const {
-        for (auto& p : buckets) {
-            cout << "key = [\n";
-            p.first.print();
-            cout << "]:" << endl;
-            p.second.print();
+        cout << "SplitTable (" << numDims << " dims):" << endl;
+        for(int d = 0; d < numDims; d++){
+            cout << "  dim" << d << ": " << splitRanges[d].size() << " splits";
+            if(!splitRanges[d].empty())
+                cout << " range=[" << splitRanges[d].front() << "," << splitRanges[d].back() << "]";
             cout << endl;
         }
     }
 
+    // [AJB] structured dump — 每维的split points数量和值域
+    void ajb_dump(const char* label = "") const {
+        fprintf(stderr, "[AJB_STATE][SplitTable] %s dims=%d\n", label, numDims);
+        for(int d = 0; d < numDims; d++){
+            fprintf(stderr, "[AJB_STATE][SplitTable]   dim%d: %zu splits",
+                    d, splitRanges[d].size());
+            if(!splitRanges[d].empty())
+                fprintf(stderr, " [%d..%d]", splitRanges[d].front(), splitRanges[d].back());
+            fprintf(stderr, "\n");
+        }
+    }
+
+    // [AJB] 总split点数 — 用于评估预处理开销
+    int ajb_total_splits() const {
+        int total = 0;
+        for(int d = 0; d < numDims; d++) total += splitRanges[d].size();
+        return total;
+    }
 };
 
-
-#endif //RANDOMORDERENUMERATION_SPLITTABLE_H
+#endif // SPLITTABLE_H

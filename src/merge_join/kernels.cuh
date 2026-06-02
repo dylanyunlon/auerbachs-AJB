@@ -1,5 +1,6 @@
+// [AJB] merge_join/kernels.cuh: Merge join GPU kernel: 二分搜索+并行probe
+#include <cstdio>
 #pragma once
-// [AJB] GPU join kernel: PartitionJoin在R/S的一个merge-path分区内做等值连接
 
 template <int blocks_per_multi_processor, bool swap_rs, typename T>
 __global__ void __launch_bounds__(kNumJoinThreads, blocks_per_multi_processor)
@@ -78,4 +79,10 @@ __global__ void __launch_bounds__(kNumJoinThreads, blocks_per_multi_processor)
 
     materialized[at] = ranges;
   }
+}
+
+// [AJB] merge_join_kernels 诊断报告
+static inline void ajb_report_merge_join_kernels(size_t n, double elapsed_ms, const char* phase) {
+    fprintf(stderr, "[AJB_TIMER][merge_join_kernels] %s: n=%zu elapsed=%.3fms throughput=%.2f M/s\n",
+            phase, n, elapsed_ms, elapsed_ms > 0 ? n / elapsed_ms / 1000.0 : 0.0);
 }

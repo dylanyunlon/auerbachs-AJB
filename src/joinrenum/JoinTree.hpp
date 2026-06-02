@@ -1,6 +1,19 @@
 #include <boost/unordered_map.hpp>
 #include <queue>
+#include <chrono>
 using namespace std;
+
+// [AJB] JoinTree诊断 — 追踪tree构建和treeUpp调用
+static thread_local struct {
+    long long tree_upp_calls = 0;
+    long long tree_upp_zero = 0;   // treeUpp返回0的次数(空区间)
+    double    build_ms = 0.0;
+    void dump(const char* tag = "JoinTree") {
+        fprintf(stderr, "[AJB_STATE][%s] treeUpp_calls=%lld zero_results=%lld build=%.3fms\n",
+                tag, tree_upp_calls, tree_upp_zero, build_ms);
+    }
+    void reset() { tree_upp_calls = tree_upp_zero = 0; build_ms = 0.0; }
+} ajb_jt_stats;
 
 class JoinTree {
 private:
@@ -130,6 +143,7 @@ public:
     JoinTree(){}
 
     JoinTree(Query q, vector<CountOracle<int>*> CO) : CO(CO) {
+        auto ajb_jt_t0 = std::chrono::high_resolution_clock::now();
         queue<int> que;
         root = 0;
         relation = q.getRelations();
@@ -143,6 +157,8 @@ public:
         vector<bool> visited(q.getRelNames().size(), false);
         visited[0] = true;
         que.push(0);
+        fprintf(stderr, "[AJB_BP][JoinTree] BFS start: root=R0, %zu relations\n", q.getRelNames().size());
+        int bfs_edges = 0;
         while(!que.empty()){
             int rel = que.front(); // get the front of the queue
             que.pop();
@@ -171,9 +187,18 @@ public:
                     parent[neighbor] = rel;
                     visited[neighbor] = true;
                     que.push(neighbor); // add the neighbor to the queue for further exploration
+                    bfs_edges++;
+                    // [AJB_TRACE] 每条tree边: parent→child + join position
+                    fprintf(stderr, "[AJB_TRACE][JoinTree]   edge R%d→R%d joinPos=[", rel, neighbor);
+                    for(size_t jp = 0; jp < jpos.size(); jp++){
+                        if(jp) fprintf(stderr, ",");
+                        fprintf(stderr, "%d", jpos[jp]);
+                    }
+                    fprintf(stderr, "]\n");
                 }
             }
         }
+        fprintf(stderr, "[AJB_STATE][JoinTree] BFS done: %d tree edges\n", bfs_edges);
         buildLeaves(root);
         for(int i = 0; i < cache.size(); i++) {
             cout << cache[i].size() << " ";
@@ -185,15 +210,30 @@ public:
             std::chrono::duration<double> elapsedJT = endJT - startJT;
             cout << "Time to build the JoinTree: " << elapsedJT.count() << " s\n";
         initCountRels(root);
+        auto ajb_jt_t1 = std::chrono::high_resolution_clock::now();
+        ajb_jt_stats.build_ms = std::chrono::duration<double, std::milli>(ajb_jt_t1 - ajb_jt_t0).count();
+        // [AJB_STATE] countRels per variable — 哪些relation在哪个splitDim层级被count
+        for(size_t v = 0; v < countRels.size(); v++){
+            if(countRels[v].empty()) continue;
+            fprintf(stderr, "[AJB_STATE][JoinTree] countRels[x%zu]: [", v);
+            for(size_t j = 0; j < countRels[v].size(); j++){
+                if(j) fprintf(stderr, ",");
+                fprintf(stderr, "R%d", countRels[v][j]);
+            }
+            fprintf(stderr, "]\n");
+        }
+        fprintf(stderr, "[AJB_TIMER][JoinTree] total build=%.3fms\n", ajb_jt_stats.build_ms);
     }
 
     int treeUpp(int splitDim, const vector<pair<vector<Point<int> >::iterator, vector<Point<int> >::iterator> > iters) {
         // cout << "TREEUPP IN";
+        ajb_jt_stats.tree_upp_calls++;
         if(splitDim >= (int)countRels.size()) return 1;
         int tupp = 1;
         for(int node : countRels[splitDim]) {
             tupp *= CO[node]->sumCnt(iters[node].first, iters[node].second);
         }
+        if(tupp == 0) ajb_jt_stats.tree_upp_zero++;
         // cout << "TREEUPP OUT" << endl;
         return tupp;
     }

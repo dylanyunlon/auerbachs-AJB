@@ -1,5 +1,6 @@
-#pragma once
 // [AJB] HostAllocator: pinned host内存arena, 16字节对齐, 用于H2D/D2H传输buffer
+// cudaMallocHost分配的内存可以实现zero-copy DMA传输
+#pragma once
 
 #include <string>
 
@@ -23,3 +24,12 @@ struct HostAllocator : MemoryAllocator {
   static constexpr size_t kByteAlignment = 16;
   const std::string kType = "HostAllocator";
 };
+
+#ifdef AJB_TRACE_ALLOC
+#include <cstdio>
+static inline void ajb_report_host_alloc(size_t bytes, const char* tag) {
+    fprintf(stderr, "[AJB_MEM][HostAlloc] %s: %zu bytes (%.2f MB)\n", tag, bytes, bytes / 1048576.0);
+}
+#else
+static inline void ajb_report_host_alloc(size_t, const char*) {}
+#endif

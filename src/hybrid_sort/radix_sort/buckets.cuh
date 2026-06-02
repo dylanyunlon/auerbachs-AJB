@@ -1,5 +1,6 @@
+// [AJB] hybrid_sort/radix_sort/buckets.cuh: Radix sort bucket分配
+#include <cstdio>
 #pragma once
-// [AJB] BucketId: 多pass基数排序的桶标识, predecessor指向上一pass的父桶
 
 #include <cub/cub.cuh>
 
@@ -63,3 +64,9 @@ struct LPSpanningBucketFraction {
   size_t source_offset;
   size_t dest_offset;
 };
+
+// [AJB] hybrid_sort_radix_sort_buckets 诊断报告
+static inline void ajb_report_hybrid_sort_radix_sort_buckets(size_t n, double elapsed_ms, const char* phase) {
+    fprintf(stderr, "[AJB_TIMER][hybrid_sort_radix_sort_buckets] %s: n=%zu elapsed=%.3fms throughput=%.2f M/s\n",
+            phase, n, elapsed_ms, elapsed_ms > 0 ? n / elapsed_ms / 1000.0 : 0.0);
+}

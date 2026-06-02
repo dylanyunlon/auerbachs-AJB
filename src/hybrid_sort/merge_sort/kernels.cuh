@@ -1,5 +1,6 @@
+// [AJB] hybrid_sort/merge_sort/kernels.cuh: GPU merge sort kernel: 每个warp内的排序
+#include <cstdio>
 #pragma once
-// [AJB] merge sort GPU kernel辅助: GetValueFromVirtualPartition处理跨buffer读取
 
 template <typename T>
 inline __device__ void GetValueFromVirtualPartition(size_t partition_size, T** virtual_partition, size_t index,
@@ -29,4 +30,10 @@ __global__ void SelectPivot(size_t partition_size, size_t num_partitions, T** lo
   }
 
   *pivot = low;
+}
+
+// [AJB] hybrid_sort_merge_sort_kernels 诊断报告
+static inline void ajb_report_hybrid_sort_merge_sort_kernels(size_t n, double elapsed_ms, const char* phase) {
+    fprintf(stderr, "[AJB_TIMER][hybrid_sort_merge_sort_kernels] %s: n=%zu elapsed=%.3fms throughput=%.2f M/s\n",
+            phase, n, elapsed_ms, elapsed_ms > 0 ? n / elapsed_ms / 1000.0 : 0.0);
 }
