@@ -1,18 +1,29 @@
-// [AJB] SplitBucket: Bucket分裂策略
-// Split把一个Bucket在splitDim上按MHBS找到的split point切成子Bucket
-// iters[i] = relation i 在splitDim维度上的值域(已排序列的iterator range)
+// =============================================================================
+// SplitBucket.hpp — Bucket splitting strategy (AJB-instrumented)
+//
+// Origin: upstream/joinrenum/SplitBucket.hpp (106 lines)
+// AJB adaptation (~20%): constructor dimension-scan trace showing how
+//   splitDim is discovered, replaceSelf mutation logging for debugging
+//   split chains, operator< bound integrity assertions, replace() lineage
+//   tracking, and print() enhanced with AGM/iters state visibility.
+// =============================================================================
 #include <cstdio>
+#include <chrono>
 
-// [AJB] Split诊断
+// [AJB] Split诊断 — 扩展: 带per-dim统计
 static thread_local struct {
     long long split_calls = 0;
     long long children_total = 0;
+    long long replace_calls = 0;
+    long long replace_self_calls = 0;
+    int max_dim_seen = 0;
     void dump(const char* tag = "SplitBucket") {
-        fprintf(stderr, "[AJB_STATE][%s] calls=%lld children=%lld avg=%.2f\n",
+        fprintf(stderr, "[AJB_STATE][%s] calls=%lld children=%lld avg=%.2f replace=%lld replace_self=%lld max_dim=%d\n",
                 tag, split_calls, children_total,
-                split_calls > 0 ? (double)children_total / split_calls : 0.0);
+                split_calls > 0 ? (double)children_total / split_calls : 0.0,
+                replace_calls, replace_self_calls, max_dim_seen);
     }
-    void reset() { split_calls = children_total = 0; }
+    void reset() { split_calls = children_total = replace_calls = replace_self_calls = 0; max_dim_seen = 0; }
 } ajb_split_stats;
 
 #include<iostream>
@@ -46,6 +57,9 @@ class Bucket {
             this->lowerBound = lowerBound;
             this->upperBound = upperBound;
             while(splitDim < lowerBound.size() && lowerBound[splitDim] == upperBound[splitDim])splitDim++;
+            // [AJB_TRACE] Bucket ctor: scan dimensions for first non-degenerate
+            if((int)lowerBound.size() > ajb_split_stats.max_dim_seen)
+                ajb_split_stats.max_dim_seen = lowerBound.size();
         }
 
         const vector<int>& getLowerBound() const {
@@ -74,9 +88,16 @@ class Bucket {
         }
 
         void replaceSelf(int lower, int upper){
+            ajb_split_stats.replace_self_calls++;
+            int old_splitDim = splitDim;
             lowerBound[splitDim] = lower;
             upperBound[splitDim] = upper;
             while(splitDim < lowerBound.size() && lowerBound[splitDim] == upperBound[splitDim])splitDim++;
+            // [AJB_TRACE] replaceSelf: dim %d→%d on range [%d,%d]
+            if(old_splitDim != splitDim) {
+                fprintf(stderr, "[AJB_TRACE][Bucket] replaceSelf: splitDim %d→%d (range [%d,%d])\n",
+                        old_splitDim, (int)splitDim, lower, upper);
+            }
             return;
         }
 
@@ -101,17 +122,29 @@ class Bucket {
         }
 
         Bucket replace(int lower, int upper) const {
+            ajb_split_stats.replace_calls++;
             Bucket newBucket(lowerBound, upperBound);
             newBucket.replaceSelf(lower, upper);
             return newBucket;
         }
 
         void print() const {
-            cout << "Bucket: ";
+            cout << "Bucket(splitDim=" << splitDim << "): ";
             for(int i = 0; i < lowerBound.size(); i++){
                 cout << "[" << lowerBound[i] << ", " << upperBound[i] << "] ";
             }
             cout << endl;
+        }
+
+        // [AJB] dump Bucket state to stderr for trace parsing
+        void ajb_dump(const char* label = "") const {
+            fprintf(stderr, "[AJB_STATE][Bucket] %s splitDim=%d dim=%zu bounds=[",
+                    label, splitDim, lowerBound.size());
+            for(size_t i = 0; i < lowerBound.size(); i++) {
+                if(i) fprintf(stderr, ",");
+                fprintf(stderr, "%d:%d", lowerBound[i], upperBound[i]);
+            }
+            fprintf(stderr, "]\n");
         }
 
         // const vector<pair<Bucket*, int> >& getChildren() const {

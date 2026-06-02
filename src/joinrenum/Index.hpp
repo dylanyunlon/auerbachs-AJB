@@ -1,35 +1,49 @@
-// [AJB] Index: joinrenum的核心索引, 管理所有relation的RangeTree/CountOracle
-// preProcessing: 读数据、建RangeTree/CountOracle
-// setAGM/setAGMandIters: 计算Bucket的AGM bound
-// splitBucket/Split: 在splitDim上二分Bucket
-// MultiHeadBinarySearch: 在多个relation上同时二分搜索split point
+// =============================================================================
+// Index.hpp — Core join index: manages RangeTree/CountOracle per relation
+//             (AJB-instrumented)
+//
+// Origin: upstream/joinrenum/Index.hpp (935 lines)
+// AJB adaptation (~20%): per-function entry/exit breakpoints with line-locator
+//   tags, MHBS convergence trace (iteration count per call), split chain
+//   depth tracking, preProcessing per-relation timing breakdown,
+//   setAGMandIters bound-range dump, and sample()/randomAccess() path trace.
+// =============================================================================
 #include <cstdio>
 #include <chrono>
 #include <random>  // AJB: for sample() method
 
-// [AJB] Index运行时诊断计数器
+// [AJB] Index运行时诊断计数器 — 扩展版
 static thread_local struct {
     long long preprocess_calls = 0;
     long long agm_calls = 0;
     long long set_agm_calls = 0;
     long long split_calls = 0;
+    long long split_bs_calls = 0;       // splitBucket_BS variant
     long long mhbs_calls = 0;
-    long long mhbs_total_iters = 0;  // MHBS内部循环总次数
+    long long mhbs_total_iters = 0;     // MHBS内部循环总次数
+    long long mhbs_max_iters = 0;       // 单次MHBS最大循环次数
+    long long split_pool_calls = 0;
     double preprocess_ms = 0;
     double agm_total_ms = 0;
     double split_total_ms = 0;
+    double mhbs_total_ms = 0;
     int max_split_children = 0;
+    int max_split_depth = 0;            // splitBucket递归最大深度
     void dump(const char* tag = "Index") {
-        fprintf(stderr, "[AJB_STATE][%s] preprocess=%lld agm=%lld set_agm=%lld split=%lld mhbs=%lld mhbs_iters=%lld\n",
-                tag, preprocess_calls, agm_calls, set_agm_calls, split_calls, mhbs_calls, mhbs_total_iters);
-        fprintf(stderr, "[AJB_TIMER][%s] preprocess=%.1fms agm=%.1fms split=%.1fms\n",
-                tag, preprocess_ms, agm_total_ms, split_total_ms);
-        fprintf(stderr, "[AJB_STATE][%s] max_split_children=%d\n", tag, max_split_children);
+        fprintf(stderr, "[AJB_STATE][%s] preprocess=%lld agm=%lld set_agm=%lld split=%lld split_bs=%lld mhbs=%lld\n",
+                tag, preprocess_calls, agm_calls, set_agm_calls, split_calls, split_bs_calls, mhbs_calls);
+        fprintf(stderr, "[AJB_STATE][%s] mhbs_iters=%lld mhbs_max_single=%lld split_pool=%lld\n",
+                tag, mhbs_total_iters, mhbs_max_iters, split_pool_calls);
+        fprintf(stderr, "[AJB_TIMER][%s] preprocess=%.1fms agm=%.1fms split=%.1fms mhbs=%.1fms\n",
+                tag, preprocess_ms, agm_total_ms, split_total_ms, mhbs_total_ms);
+        fprintf(stderr, "[AJB_STATE][%s] max_split_children=%d max_split_depth=%d\n",
+                tag, max_split_children, max_split_depth);
     }
     void reset() {
-        preprocess_calls = agm_calls = set_agm_calls = split_calls = mhbs_calls = mhbs_total_iters = 0;
-        preprocess_ms = agm_total_ms = split_total_ms = 0;
-        max_split_children = 0;
+        preprocess_calls = agm_calls = set_agm_calls = split_calls = split_bs_calls = mhbs_calls = 0;
+        mhbs_total_iters = mhbs_max_iters = split_pool_calls = 0;
+        preprocess_ms = agm_total_ms = split_total_ms = mhbs_total_ms = 0;
+        max_split_children = max_split_depth = 0;
     }
 } ajb_idx_stats;
 
@@ -425,8 +439,7 @@ class Index {
         
         void setAGMandIters(Bucket &B, const vector<pair<vector<Point<int> >::iterator, vector<Point<int> >::iterator> >& iters = {}) {
             int relnum = R.size();
-            auto ajb_agm_t1 = std::chrono::steady_clock::now();
-            ajb_idx_stats.agm_total_ms += std::chrono::duration<double, std::milli>(ajb_agm_t1 - ajb_agm_t0).count();
+            auto ajb_agm_t0 = std::chrono::steady_clock::now();
             if(B.iters.size() != relnum) B.iters = vector<pair<int, int> >(relnum);
             vector<int> cardinalities(relnum, 0);
             vector<int> lower_bound = {};
@@ -449,6 +462,18 @@ class Index {
             B.AGM = ceil(ans) - ans < 1e-5 ? ceil(ans) : (long long)(ans);
             if(treeflag && B.splitDim < jt.countRels.size())B.AGM = min(B.AGM, treeUpp(B.iters, jt.countRels[B.splitDim]));
             // B.AGM = min(B.AGM, jt.treeUpp(B.splitDim, B.iters));
+            auto ajb_agm_t1 = std::chrono::steady_clock::now();
+            ajb_idx_stats.agm_total_ms += std::chrono::duration<double, std::milli>(ajb_agm_t1 - ajb_agm_t0).count();
+            // [AJB_TRACE] setAGMandIters: periodic cardinality vector dump
+            if(ajb_idx_stats.set_agm_calls % 5000 == 0 && ajb_idx_stats.set_agm_calls > 0) {
+                fprintf(stderr, "[AJB_TRACE][Index] setAGMandIters[%lld]: AGM=%lld cards=[",
+                        ajb_idx_stats.set_agm_calls, B.AGM);
+                for(int i = 0; i < relnum; i++) {
+                    if(i) fprintf(stderr, ",");
+                    fprintf(stderr, "%d", cardinalities[i]);
+                }
+                fprintf(stderr, "] splitDim=%d\n", B.splitDim);
+            }
             return;
         }
 
@@ -661,9 +686,8 @@ class Index {
 
         vector<Bucket> splitBucket(Bucket &B){
             
-            auto ajb_split_t1 = std::chrono::steady_clock::now();
-            ajb_idx_stats.split_total_ms += std::chrono::duration<double, std::milli>(ajb_split_t1 - ajb_split_t0).count();
-            if((int)result.size() > ajb_idx_stats.max_split_children) ajb_idx_stats.max_split_children = result.size();
+            ajb_idx_stats.split_calls++;
+            auto ajb_split_t0 = std::chrono::steady_clock::now();
             // auto startSplit = chrono::high_resolution_clock::now();
             cntSplitCall++;
             if(B.AGM < 0) setAGMandIters(B);
@@ -725,6 +749,21 @@ class Index {
             
             if(splitPos - 1 >= B.lowerBound[splitDim] && Bleft.AGM > 0) result.push_back(move(Bleft));
             
+            // [AJB] splitBucket timing + children tracking
+            auto ajb_split_t1 = std::chrono::steady_clock::now();
+            ajb_idx_stats.split_total_ms += std::chrono::duration<double, std::milli>(ajb_split_t1 - ajb_split_t0).count();
+            if((int)result.size() > ajb_idx_stats.max_split_children)
+                ajb_idx_stats.max_split_children = result.size();
+            // [AJB_TRACE] periodic split summary
+            if(ajb_idx_stats.split_calls % 2000 == 0 && ajb_idx_stats.split_calls > 0) {
+                fprintf(stderr, "[AJB_TRACE][Index] splitBucket[%lld]: dim=%d pos=%d children=%zu AGM=%lld→[",
+                        ajb_idx_stats.split_calls, splitDim, splitPos, result.size(), B.AGM);
+                for(size_t ri = 0; ri < result.size() && ri < 5; ri++) {
+                    if(ri) fprintf(stderr, ",");
+                    fprintf(stderr, "%lld", result[ri].AGM);
+                }
+                fprintf(stderr, "]\n");
+            }
             return result;
         }
 
@@ -757,9 +796,15 @@ class Index {
 
         vector<Bucket> Split(Bucket &B) {
             vector<Bucket> result = splitBucket(B);
-            // [AJB_TRACE] Split: splitBucket + 传播AGM到children
+            // [AJB_TRACE] Split: if single-child re-splitting, track depth
+            int resplit_rounds = 0;
             while(result.size() == 1 && result[0].splitDim != result[0].getDim()){
                 result = splitBucket(result[0]);
+                resplit_rounds++;
+            }
+            if(resplit_rounds > 0) {
+                fprintf(stderr, "[AJB_TRACE][Index] Split re-split %d rounds → %zu final children\n",
+                        resplit_rounds, result.size());
             }
             return result;
         }

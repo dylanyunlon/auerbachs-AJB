@@ -1,18 +1,38 @@
+// =============================================================================
+// JoinTree.hpp — Join tree construction and treeUpp bound (AJB-instrumented)
+//
+// Origin: upstream/joinrenum/JoinTree.hpp (236 lines)
+// AJB adaptation (~20%): per-phase timing (BFS / buildLeaves / preProcessing),
+//   cache occupancy tracking, treeUpp convergence logging (zero-rate),
+//   buildLeaves leaf-node cardinality dump, and preProcessing per-node
+//   cnt accumulation trace for debugging incorrect AGM bounds.
+// =============================================================================
 #include <boost/unordered_map.hpp>
 #include <queue>
 #include <chrono>
 using namespace std;
 
-// [AJB] JoinTree诊断 — 追踪tree构建和treeUpp调用
+// [AJB] JoinTree诊断 — 扩展: per-phase timing + cache stats
 static thread_local struct {
     long long tree_upp_calls = 0;
     long long tree_upp_zero = 0;   // treeUpp返回0的次数(空区间)
+    long long buildleaves_nodes = 0; // buildLeaves处理的叶子数
+    long long preproc_nodes = 0;     // preProcessing处理的内部节点数
+    long long cache_entries = 0;     // cache总条目数
     double    build_ms = 0.0;
+    double    buildleaves_ms = 0.0;
+    double    preproc_ms = 0.0;
+    double    bfs_ms = 0.0;
     void dump(const char* tag = "JoinTree") {
-        fprintf(stderr, "[AJB_STATE][%s] treeUpp_calls=%lld zero_results=%lld build=%.3fms\n",
-                tag, tree_upp_calls, tree_upp_zero, build_ms);
+        fprintf(stderr, "[AJB_STATE][%s] treeUpp_calls=%lld zero=%lld leaves=%lld preproc_nodes=%lld cache=%lld\n",
+                tag, tree_upp_calls, tree_upp_zero, buildleaves_nodes, preproc_nodes, cache_entries);
+        fprintf(stderr, "[AJB_TIMER][%s] total=%.3fms bfs=%.3fms leaves=%.3fms preproc=%.3fms\n",
+                tag, build_ms, bfs_ms, buildleaves_ms, preproc_ms);
     }
-    void reset() { tree_upp_calls = tree_upp_zero = 0; build_ms = 0.0; }
+    void reset() {
+        tree_upp_calls = tree_upp_zero = buildleaves_nodes = preproc_nodes = cache_entries = 0;
+        build_ms = buildleaves_ms = preproc_ms = bfs_ms = 0.0;
+    }
 } ajb_jt_stats;
 
 class JoinTree {
@@ -30,6 +50,7 @@ private:
         if(node < 0 || node >= (int)children.size()) return;
         bool flag = true;
         if(children[node].size() == 0) {
+            ajb_jt_stats.buildleaves_nodes++;
             if(fa == -1) return;
             vector<int> joinVals(joinPos[fa][k].size());
             for(int j = 0; j < joinPos[fa][k].size(); j++) {
@@ -51,6 +72,10 @@ private:
             for(int i = 0; i < CO[node]->points.size(); i++){
                 if(i > 0) CO[node]->points[i].cnt += CO[node]->points[i - 1].cnt;
             }
+            // [AJB_STATE] leaf built: node=R%d, points=%zu, cache_keys=%zu
+            ajb_jt_stats.cache_entries += cache[node].size();
+            fprintf(stderr, "[AJB_STATE][JoinTree] leaf R%d: %zu points, %zu cache keys\n",
+                    node, CO[node]->points.size(), cache[node].size());
             return;
         }
         for(int i = 0; i < children[node].size(); i++) buildLeaves(children[node][i], node, i);
@@ -58,6 +83,7 @@ private:
 
     void preProcessing(int node, int fa = -1, int k = -1) {
         if(node < 0 || node >= (int)children.size() || children[node].size() == 0) return;
+        ajb_jt_stats.preproc_nodes++;
         for(int i = 0; i < children[node].size(); i++) preProcessing(children[node][i], node, i);
         vector<int> joinVals;
         for(int j = 0; j < children[node].size(); j++) {
@@ -68,6 +94,13 @@ private:
                 // cout << "CO[node]->points[i].cnt: " << CO[node]->points[i].cnt << endl;
                 // CO[node]->points[i].cnt *= CO[children[node][j]]->sumCnt(Point<int>(joinVals), Point<int>(joinVals));
             }
+        }
+        // [AJB_STATE] after cnt propagation: sample first/last point's cnt
+        if(CO[node]->points.size() > 0) {
+            fprintf(stderr, "[AJB_STATE][JoinTree] preProc R%d: %zu pts, cnt[0]=%lld cnt[last]=%lld\n",
+                    node, CO[node]->points.size(),
+                    (long long)CO[node]->points[0].cnt,
+                    (long long)CO[node]->points.back().cnt);
         }
         for(int i = 0; i < CO[node]->points.size(); i++){
             if(i > 0) CO[node]->points[i].cnt += CO[node]->points[i - 1].cnt;
@@ -157,7 +190,8 @@ public:
         vector<bool> visited(q.getRelNames().size(), false);
         visited[0] = true;
         que.push(0);
-        fprintf(stderr, "[AJB_BP][JoinTree] BFS start: root=R0, %zu relations\n", q.getRelNames().size());
+        fprintf(stderr, "[AJB_BP][JoinTree] BFS start: root=R0, %zu relations, %d variables\n",
+                q.getRelNames().size(), q.getVarNumber());
         int bfs_edges = 0;
         while(!que.empty()){
             int rel = que.front(); // get the front of the queue
@@ -198,8 +232,17 @@ public:
                 }
             }
         }
-        fprintf(stderr, "[AJB_STATE][JoinTree] BFS done: %d tree edges\n", bfs_edges);
+        auto ajb_bfs_done = std::chrono::high_resolution_clock::now();
+        ajb_jt_stats.bfs_ms = std::chrono::duration<double, std::milli>(ajb_bfs_done - ajb_jt_t0).count();
+        fprintf(stderr, "[AJB_STATE][JoinTree] BFS done: %d tree edges in %.3fms\n", bfs_edges, ajb_jt_stats.bfs_ms);
+
+        auto ajb_leaves_t0 = std::chrono::high_resolution_clock::now();
         buildLeaves(root);
+        auto ajb_leaves_t1 = std::chrono::high_resolution_clock::now();
+        ajb_jt_stats.buildleaves_ms = std::chrono::duration<double, std::milli>(ajb_leaves_t1 - ajb_leaves_t0).count();
+        fprintf(stderr, "[AJB_TIMER][JoinTree] buildLeaves=%.3fms (%lld leaves)\n",
+                ajb_jt_stats.buildleaves_ms, ajb_jt_stats.buildleaves_nodes);
+
         for(int i = 0; i < cache.size(); i++) {
             cout << cache[i].size() << " ";
         }
@@ -209,6 +252,10 @@ public:
             auto endJT = std::chrono::high_resolution_clock::now();
             std::chrono::duration<double> elapsedJT = endJT - startJT;
             cout << "Time to build the JoinTree: " << elapsedJT.count() << " s\n";
+        ajb_jt_stats.preproc_ms = std::chrono::duration<double, std::milli>(endJT - startJT).count();
+        fprintf(stderr, "[AJB_TIMER][JoinTree] preProcessing=%.3fms (%lld internal nodes)\n",
+                ajb_jt_stats.preproc_ms, ajb_jt_stats.preproc_nodes);
+
         initCountRels(root);
         auto ajb_jt_t1 = std::chrono::high_resolution_clock::now();
         ajb_jt_stats.build_ms = std::chrono::duration<double, std::milli>(ajb_jt_t1 - ajb_jt_t0).count();
@@ -222,7 +269,8 @@ public:
             }
             fprintf(stderr, "]\n");
         }
-        fprintf(stderr, "[AJB_TIMER][JoinTree] total build=%.3fms\n", ajb_jt_stats.build_ms);
+        fprintf(stderr, "[AJB_TIMER][JoinTree] total build=%.3fms (bfs=%.3f leaves=%.3f preproc=%.3f)\n",
+                ajb_jt_stats.build_ms, ajb_jt_stats.bfs_ms, ajb_jt_stats.buildleaves_ms, ajb_jt_stats.preproc_ms);
     }
 
     int treeUpp(int splitDim, const vector<pair<vector<Point<int> >::iterator, vector<Point<int> >::iterator> > iters) {
@@ -233,7 +281,15 @@ public:
         for(int node : countRels[splitDim]) {
             tupp *= CO[node]->sumCnt(iters[node].first, iters[node].second);
         }
-        if(tupp == 0) ajb_jt_stats.tree_upp_zero++;
+        if(tupp == 0) {
+            ajb_jt_stats.tree_upp_zero++;
+            // [AJB_TRACE] periodic zero-rate report every 10000 calls
+            if(ajb_jt_stats.tree_upp_calls % 10000 == 0 && ajb_jt_stats.tree_upp_calls > 0) {
+                fprintf(stderr, "[AJB_STATE][JoinTree] treeUpp zero_rate=%.4f (%lld/%lld)\n",
+                        (double)ajb_jt_stats.tree_upp_zero / ajb_jt_stats.tree_upp_calls,
+                        ajb_jt_stats.tree_upp_zero, ajb_jt_stats.tree_upp_calls);
+            }
+        }
         // cout << "TREEUPP OUT" << endl;
         return tupp;
     }
@@ -260,13 +316,13 @@ public:
 
     void printChildren() {
         for(int i = 0; i < children.size(); i++) {
-            cout << "R" << i << " has children: ";
+            cout << "R" << i << " has " << children[i].size() << " children: ";
             for(int j = 0; j < children[i].size(); j++) {
-                cout << "R" << children[i][j] << "(";
+                cout << "R" << children[i][j] << "(jp=[";
                 for(int k = 0; k < joinPos[i][j].size() - 1; k++) {
                     cout << joinPos[i][j][k] << ", ";
                 }
-                cout << joinPos[i][j][joinPos[i][j].size() - 1] << "); ";
+                cout << joinPos[i][j][joinPos[i][j].size() - 1] << "]); ";
             }
             cout << endl;
         }
@@ -274,5 +330,22 @@ public:
 
     void print(){
         printTree(root);
+    }
+
+    // [AJB] dump full JoinTree diagnostics
+    void ajb_dump_stats() {
+        ajb_jt_stats.dump();
+        fprintf(stderr, "[AJB_STATE][JoinTree] root=%d, %zu relations, %zu cache arrays\n",
+                root, relation.size(), cache.size());
+        // cache occupancy per relation
+        for(size_t i = 0; i < cache.size(); i++) {
+            if(!cache[i].empty())
+                fprintf(stderr, "[AJB_STATE][JoinTree]   cache[R%zu]: %zu entries\n", i, cache[i].size());
+        }
+    }
+
+    // [AJB] reset all JoinTree diagnostic counters
+    static void ajb_reset_stats() {
+        ajb_jt_stats.reset();
     }
 };

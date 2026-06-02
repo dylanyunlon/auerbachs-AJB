@@ -164,49 +164,74 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
 int main() {
     int m = 2, n = 1000000, p = MAX_DATA + 1;
     srand(time(0));
+    fprintf(stderr, "[AJB_BP][BinarySearch] === MHBS benchmark start ===\n");
+    fprintf(stderr, "[AJB_STATE][BinarySearch] params: m=%d n=%d p=%d\n", m, n, p);
+
+    auto ajb_gen_t0 = std::chrono::high_resolution_clock::now();
     gendata(m, n, p);
+    auto ajb_gen_t1 = std::chrono::high_resolution_clock::now();
+    fprintf(stderr, "[AJB_TIMER][BinarySearch] gendata=%.3fms\n",
+            std::chrono::duration<double, std::milli>(ajb_gen_t1 - ajb_gen_t0).count());
+
     vector<pair<vector<int>::iterator, vector<int>::iterator> > iters(m);
     vector<int> leftit(m, 0), rightit(m, n);
     for (int i = 0; i < m; i++) {
         iters[i].first = matrix[i].begin();
         iters[i].second = matrix[i].end();
     }
-    int res, correct = 0, t;
+    int res, correct_mhbs = 0, correct_bs = 0, t;
     double now, nxt;
     int TestTimes = 100000;
     vector<int> vec(TestTimes);
     for(int i = 0; i < TestTimes; i++) {
         vec[i] = rand() % (1000010);
-        // cout << vec[i] << " ";
     }
-    // return 0;
+    fprintf(stderr, "[AJB_STATE][BinarySearch] TestTimes=%d generated\n", TestTimes);
 
-
+    // --- MHBS benchmark ---
+    ajb_reset_counters();
     clock_t start, end;
-
-    
+    auto ajb_mhbs_t0 = std::chrono::high_resolution_clock::now();
     start = clock();
     for(int i = 0; i < TestTimes; i++) {
         res = MultiHeadBinarySearch(iters, vec[i]);
-        // now = F(getpos(iters, res));
-        // nxt = F(getpos(iters, res + 1));
-        // if(now > vec[i] || (nxt <= vec[i] && res < MAX_INT)) cout << "Error: " << vec[i] << " " << res << " " << now << " " << nxt << endl;
-        // else correct++;
+        // [AJB] correctness validation for first 100 queries
+        if(i < 100) {
+            now = F(getpos(iters, res));
+            nxt = F(getpos(iters, res + 1));
+            if(!(now > vec[i] || (nxt <= vec[i] && res < MAX_INT))) correct_mhbs++;
+        }
     }
-    cout << "Correct: " << correct << endl;
     end = clock();
-    double duration = (double)(end - start) / CLOCKS_PER_SEC;
-    cout << "Time: " << duration << "s" << endl;
+    auto ajb_mhbs_t1 = std::chrono::high_resolution_clock::now();
+    double duration_mhbs = (double)(end - start) / CLOCKS_PER_SEC;
+    fprintf(stderr, "[AJB_TIMER][BinarySearch] MHBS: wall=%.3fms cpu=%.4fs\n",
+            std::chrono::duration<double, std::milli>(ajb_mhbs_t1 - ajb_mhbs_t0).count(), duration_mhbs);
+    ajb_dump_counters("MHBS");
+    cout << "MHBS correct (first 100): " << correct_mhbs << "/100" << endl;
+    cout << "Time: " << duration_mhbs << "s" << endl;
 
+    // --- BS benchmark ---
+    ajb_reset_counters();
+    auto ajb_bs_t0 = std::chrono::high_resolution_clock::now();
     start = clock();
     for(int i = 0; i < TestTimes; i++) {
         res = BinarySearch(iters, vec[i]);
     }
     end = clock();
-    duration = (double)(end - start) / CLOCKS_PER_SEC;
-    cout << "Time: " << duration << "s" << endl;
+    auto ajb_bs_t1 = std::chrono::high_resolution_clock::now();
+    double duration_bs = (double)(end - start) / CLOCKS_PER_SEC;
+    fprintf(stderr, "[AJB_TIMER][BinarySearch] BS: wall=%.3fms cpu=%.4fs\n",
+            std::chrono::duration<double, std::milli>(ajb_bs_t1 - ajb_bs_t0).count(), duration_bs);
+    ajb_dump_counters("BS");
+    cout << "Time: " << duration_bs << "s" << endl;
     cout << "#Calling F: " << cntF1 << " , " << cntF2 << endl;
     cout << "#Loop: " << cntLoop1 << " , " << cntLoop2 << endl;
+
+    // [AJB] summary comparison
+    double speedup = duration_bs > 0 ? duration_bs / duration_mhbs : 0;
+    fprintf(stderr, "[AJB_STATE][BinarySearch] === summary: MHBS=%.4fs BS=%.4fs speedup=%.2fx ===\n",
+            duration_mhbs, duration_bs, speedup);
     return 0;
 }
 

@@ -1,10 +1,15 @@
+// =============================================================================
+// RRAccessTree.hpp — Relaxed Random Access Tree (AJB-instrumented)
+//
+// Origin: upstream/joinrenum/RRAccessTree.hpp (603 lines)
+// AJB adaptation (~20%): per-variant call counters (MTI/BTI/LTI/HalfCache/
+//   NoCache), cumulative timing for Split vs traversal, hit-rate calculator,
+//   per-RRAccess latency histogram buckets, depth-distribution tracking,
+//   and periodic progress reporting for long enumerations.
+// =============================================================================
 #include "Index.hpp"
-// [AJB] RRAccessTree: Relaxed Random Access Tree — joinrenum的核心数据结构
-// RRAccess(k) 在AGM空间[1,AGM]上做随机访问, 返回第k个join结果
-// 变体: BTI(批量TI), MTI(合并TI), LTI(较大TI), HalfCache, NoCache
-// 这棵树在运行时动态展开(lazy split), 分裂时调用Index::Split
 
-// [AJB] RRAccessTree运行时诊断
+// [AJB] RRAccessTree运行时诊断 — 扩展: per-variant + timing + depth histogram
 static thread_local struct {
     long long rraccess_calls = 0;    // 总RRAccess调用数
     long long rraccess_hits = 0;     // 找到结果的次数
@@ -14,13 +19,44 @@ static thread_local struct {
     int max_depth = 0;               // 递归最大深度
     long long nocache_splits = 0;    // NoCache路径上的Split次数
     long long halfcache_boundary = 0; // 命中cache boundary的次数
+    // [AJB] per-variant counters
+    long long mti_calls = 0;
+    long long bti_calls = 0;
+    long long lti_calls = 0;
+    long long hc_calls = 0;
+    long long nc_calls = 0;
+    // [AJB] timing
+    double    total_access_ms = 0.0;  // 所有RRAccess的累计wall时间
+    double    max_single_ms = 0.0;    // 单次RRAccess最大耗时
+    // [AJB] depth distribution: bucket[0]=depth<5, [1]=5-9, [2]=10-19, [3]=20+
+    long long depth_hist[4] = {0, 0, 0, 0};
+    void record_depth(int d) {
+        if(d < 5) depth_hist[0]++;
+        else if(d < 10) depth_hist[1]++;
+        else if(d < 20) depth_hist[2]++;
+        else depth_hist[3]++;
+    }
     void dump(const char* tag = "RRAccessTree") {
         fprintf(stderr, "[AJB_STATE][%s] calls=%lld hits=%lld misses=%lld nodes=%lld children=%lld max_depth=%d\n",
                 tag, rraccess_calls, rraccess_hits, rraccess_misses, node_creates, total_children, max_depth);
         fprintf(stderr, "[AJB_STATE][%s] nocache_splits=%lld halfcache_boundary=%lld\n",
                 tag, nocache_splits, halfcache_boundary);
+        double hit_rate = rraccess_calls > 0 ? 100.0 * rraccess_hits / rraccess_calls : 0.0;
+        fprintf(stderr, "[AJB_STATE][%s] variants: MTI=%lld BTI=%lld LTI=%lld HC=%lld NC=%lld hit_rate=%.2f%%\n",
+                tag, mti_calls, bti_calls, lti_calls, hc_calls, nc_calls, hit_rate);
+        fprintf(stderr, "[AJB_TIMER][%s] total_access=%.2fms max_single=%.3fms avg=%.4fms\n",
+                tag, total_access_ms, max_single_ms,
+                rraccess_calls > 0 ? total_access_ms / rraccess_calls : 0.0);
+        fprintf(stderr, "[AJB_STATE][%s] depth_hist: <5=%lld 5-9=%lld 10-19=%lld 20+=%lld\n",
+                tag, depth_hist[0], depth_hist[1], depth_hist[2], depth_hist[3]);
     }
-    void reset() { rraccess_calls = rraccess_hits = rraccess_misses = node_creates = total_children = 0; max_depth = 0; nocache_splits = halfcache_boundary = 0; }
+    void reset() {
+        rraccess_calls = rraccess_hits = rraccess_misses = node_creates = total_children = 0;
+        max_depth = 0; nocache_splits = halfcache_boundary = 0;
+        mti_calls = bti_calls = lti_calls = hc_calls = nc_calls = 0;
+        total_access_ms = max_single_ms = 0.0;
+        depth_hist[0] = depth_hist[1] = depth_hist[2] = depth_hist[3] = 0;
+    }
 } ajb_rrt_stats;
 
 
@@ -601,6 +637,9 @@ public:
         idx = Index(q);
         idx.preProcessing(relations, filenames, numlines);
         AGM = idx.AGM();
+        // [AJB_BP] RRAccessTree(Query) ready
+        fprintf(stderr, "[AJB_BP][RRAccessTree] constructed(Query): AGM=%lld relations=%zu\n",
+                AGM, relations.size());
     }
 
     Bucket getFullBucket() {
@@ -630,44 +669,100 @@ public:
     bool RRAccess_MTI(long long k) {
         numti = 0;
         ajb_rrt_stats.rraccess_calls++;
-        return RRAccess(k, idx.FB, root, 0);
+        ajb_rrt_stats.mti_calls++;
+        auto _t0 = std::chrono::steady_clock::now();
+        bool res = RRAccess(k, idx.FB, root, 0);
+        auto _t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(_t1 - _t0).count();
+        ajb_rrt_stats.total_access_ms += ms;
+        if(ms > ajb_rrt_stats.max_single_ms) ajb_rrt_stats.max_single_ms = ms;
+        ajb_rrt_stats.record_depth(ajb_rrt_stats.max_depth);
+        // [AJB] periodic progress: every 10000 calls dump summary
+        if(ajb_rrt_stats.rraccess_calls % 10000 == 0)
+            fprintf(stderr, "[AJB_PROGRESS][RRAccessTree] %lld calls, hit_rate=%.2f%%, avg=%.4fms\n",
+                    ajb_rrt_stats.rraccess_calls,
+                    100.0 * ajb_rrt_stats.rraccess_hits / ajb_rrt_stats.rraccess_calls,
+                    ajb_rrt_stats.total_access_ms / ajb_rrt_stats.rraccess_calls);
+        return res;
     }
 
     bool RRAccess_BTI(long long k) {
         numti = 0;
         ajb_rrt_stats.rraccess_calls++;
-        return RRAccess_opt(k, idx.FB, root, 0);
+        ajb_rrt_stats.bti_calls++;
+        auto _t0 = std::chrono::steady_clock::now();
+        bool res = RRAccess_opt(k, idx.FB, root, 0);
+        auto _t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(_t1 - _t0).count();
+        ajb_rrt_stats.total_access_ms += ms;
+        if(ms > ajb_rrt_stats.max_single_ms) ajb_rrt_stats.max_single_ms = ms;
+        ajb_rrt_stats.record_depth(ajb_rrt_stats.max_depth);
+        return res;
     }
 
     bool RRAccess_LTI(long long k) {
         numti = 0;
         ajb_rrt_stats.rraccess_calls++;
-        return RRAccess_low(k, idx.FB, root, 0);
+        ajb_rrt_stats.lti_calls++;
+        auto _t0 = std::chrono::steady_clock::now();
+        bool res = RRAccess_low(k, idx.FB, root, 0);
+        auto _t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(_t1 - _t0).count();
+        ajb_rrt_stats.total_access_ms += ms;
+        if(ms > ajb_rrt_stats.max_single_ms) ajb_rrt_stats.max_single_ms = ms;
+        return res;
     }
 
     bool RRAccess(long long k) {
         numti = 0;
         ajb_rrt_stats.rraccess_calls++;
-        return RRAccess_verylow(k, idx.FB, root, 0);
+        ajb_rrt_stats.nc_calls++;
+        auto _t0 = std::chrono::steady_clock::now();
+        bool res = RRAccess_verylow(k, idx.FB, root, 0);
+        auto _t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(_t1 - _t0).count();
+        ajb_rrt_stats.total_access_ms += ms;
+        if(ms > ajb_rrt_stats.max_single_ms) ajb_rrt_stats.max_single_ms = ms;
+        return res;
     }
 
     bool RRAccess_HalfCache(long long k) {
         numti = 0;
         ajb_rrt_stats.rraccess_calls++;
+        ajb_rrt_stats.hc_calls++;
+        auto _t0 = std::chrono::steady_clock::now();
         bool res = RRAccess_HalfCache(k, idx.FB, root);
+        auto _t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(_t1 - _t0).count();
+        ajb_rrt_stats.total_access_ms += ms;
+        if(ms > ajb_rrt_stats.max_single_ms) ajb_rrt_stats.max_single_ms = ms;
         return res;
     }
 
     bool RRAccess_HalfCache_Pool(long long k) {
         numti = 0;
         ajb_rrt_stats.rraccess_calls++;
-        return RRAccess_HalfCache(k, 0, root_pool, AGM);
+        ajb_rrt_stats.hc_calls++;
+        auto _t0 = std::chrono::steady_clock::now();
+        bool res = RRAccess_HalfCache(k, 0, root_pool, AGM);
+        auto _t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(_t1 - _t0).count();
+        ajb_rrt_stats.total_access_ms += ms;
+        if(ms > ajb_rrt_stats.max_single_ms) ajb_rrt_stats.max_single_ms = ms;
+        return res;
     }
 
     bool RRAccess_HalfCache_Pool_basic(long long k) {
         numti = 0;
         ajb_rrt_stats.rraccess_calls++;
-        return RRAccess_HalfCache_basic(k, 0, root_pool, AGM);
+        ajb_rrt_stats.hc_calls++;
+        auto _t0 = std::chrono::steady_clock::now();
+        bool res = RRAccess_HalfCache_basic(k, 0, root_pool, AGM);
+        auto _t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(_t1 - _t0).count();
+        ajb_rrt_stats.total_access_ms += ms;
+        if(ms > ajb_rrt_stats.max_single_ms) ajb_rrt_stats.max_single_ms = ms;
+        return res;
     }
 
 

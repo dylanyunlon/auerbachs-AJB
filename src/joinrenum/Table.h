@@ -1,8 +1,38 @@
-// [AJB] Table: columnar relation storage
-// readFromFile读CSV/TBL格式, 支持'|'和','分隔符
-// 每列存为一个vector<int>, 是CountOracle/Index的数据来源
+// =============================================================================
+// Table.h — Columnar relation storage (AJB-instrumented)
+//
+// Origin: upstream/joinrenum/Table.h (227 lines)
+// AJB adaptation (~20%): per-loadFromFile timing breakdown (file I/O vs
+//   dedup vs CountOracle build), column cardinality histogram dump,
+//   parse error detection with row-level diagnostics, data distribution
+//   summary (min/max/median per column), and push_back throughput counters.
+// =============================================================================
 #include <cstdio>
 #include <chrono>
+#include <algorithm>  // AJB: for nth_element (median)
+#include <numeric>    // AJB: for accumulate
+
+// [AJB] Table-level operation counters — tracks load, push, select throughput
+static thread_local struct {
+    long long load_calls = 0;
+    long long push_back_calls = 0;
+    long long select_calls = 0;
+    long long parse_errors = 0;      // lines that failed to parse
+    long long total_rows_loaded = 0;
+    double    file_io_ms = 0.0;
+    double    dedup_ms = 0.0;
+    double    co_build_ms = 0.0;
+    void dump(const char* tag = "Table") {
+        fprintf(stderr, "[AJB_STATE][%s] loads=%lld pushes=%lld selects=%lld parse_errs=%lld rows=%lld\n",
+                tag, load_calls, push_back_calls, select_calls, parse_errors, total_rows_loaded);
+        fprintf(stderr, "[AJB_TIMER][%s] file_io=%.2fms dedup=%.2fms co_build=%.2fms\n",
+                tag, file_io_ms, dedup_ms, co_build_ms);
+    }
+    void reset() {
+        load_calls = push_back_calls = select_calls = parse_errors = total_rows_loaded = 0;
+        file_io_ms = dedup_ms = co_build_ms = 0.0;
+    }
+} ajb_table_stats;
 
 //
 // Created by shai.zeevi on 04/06/2019.
@@ -92,12 +122,14 @@ struct Table {
 
     inline void push_back(const Row<Parcel> &t) {
         data.push_back(t);
+        ajb_table_stats.push_back_calls++;
         //totalWeight += t.weight*t.card;
         //weightPrefixSum.push_back(weightPrefixSum.back() + t.weight*t.card);
     }
 
     inline void push_back(const Parcel &t/*, int card = 1*/, int weight = 1) {
         data.emplace_back(t/*, card*/, weight);
+        ajb_table_stats.push_back_calls++;
         //totalWeight += weight*card;
         //weightPrefixSum.push_back(weightPrefixSum.back() + weight*card);
     }
@@ -124,6 +156,9 @@ struct Table {
     inline void loadFromFile(const string &filename, int numLines = 0, vector<int> columns = {} /*,
                              SelectionPredicate predicate = nullptr, void *arg = nullptr*/) {
 
+        ajb_table_stats.load_calls++;
+        auto ajb_phase0 = std::chrono::high_resolution_clock::now();
+
         unordered_set<Parcel, ParcelHash, ParcelEqual> parcelSet;
         parcelSet.reserve(numLines);
 
@@ -132,15 +167,26 @@ struct Table {
         assert(!file.fail());
 
         string line;
+        long long line_num = 0;
         while (getline(file, line)) {
+            line_num++;
             Parcel curr = Parcel::from(line, columns);
-            // curr.print();
-            // if(++cnt > 100)break;
-            /*if (predicate == nullptr || predicate(arg, (void *) &curr)) {
-                parcelSet.insert(curr); //only insert if it passes the filter (or it doesn't exists)
-            }*/
+            // [AJB_TRACE] parse validation: check for empty-data parcels
+            if(curr.data.empty()) {
+                ajb_table_stats.parse_errors++;
+                if(ajb_table_stats.parse_errors <= 5)
+                    fprintf(stderr, "[AJB_WARN][Table] empty parcel at %s:%lld\n",
+                            filename.c_str(), line_num);
+            }
             parcelSet.insert(curr);
         }
+
+        auto ajb_phase1 = std::chrono::high_resolution_clock::now();
+        ajb_table_stats.file_io_ms += std::chrono::duration<double, std::milli>(ajb_phase1 - ajb_phase0).count();
+
+        // [AJB_STATE] file read summary
+        fprintf(stderr, "[AJB_STATE][Table] file=%s raw_lines=%lld unique=%zu columns=%zu\n",
+                filename.c_str(), line_num, parcelSet.size(), columns.size());
 
         data.reserve(parcelSet.size());
         // vector<RT::Point<int, bool>> list;
@@ -151,16 +197,41 @@ struct Table {
             list.push_back(a);
         }
 
+        auto ajb_phase2 = std::chrono::high_resolution_clock::now();
+        ajb_table_stats.dedup_ms += std::chrono::duration<double, std::milli>(ajb_phase2 - ajb_phase1).count();
+
         // print the time
         auto start = std::chrono::high_resolution_clock::now();
         rt = CountOracle<int>(list);
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = end - start;
         cout << "Time to build the Index: " << elapsed.count() << " s\n";
+
+        ajb_table_stats.co_build_ms += std::chrono::duration<double, std::milli>(end - ajb_phase2).count();
+        ajb_table_stats.total_rows_loaded += parcelSet.size();
+
+        // [AJB_STATE] per-column data distribution (first 3 columns, min/med/max)
+        if(!list.empty() && list[0].size() > 0) {
+            int ncols = std::min((int)list[0].size(), 3);
+            for(int c = 0; c < ncols; c++) {
+                std::vector<int> col_vals;
+                col_vals.reserve(list.size());
+                for(auto &pt : list) col_vals.push_back(pt[c]);
+                std::nth_element(col_vals.begin(), col_vals.begin() + col_vals.size()/2, col_vals.end());
+                int med = col_vals[col_vals.size()/2];
+                auto mm = std::minmax_element(col_vals.begin(), col_vals.end());
+                fprintf(stderr, "[AJB_STATE][Table]   col[%d]: min=%d median=%d max=%d distinct=%zu\n",
+                        c, *mm.first, med, *mm.second, col_vals.size());
+            }
+        }
         
         for (auto &p : parcelSet) {
             data.emplace_back(p, 1); //weight is 1
         }
+
+        fprintf(stderr, "[AJB_TIMER][Table] loadFromFile total=%.2fms (io=%.2f dedup=%.2f co=%.2f)\n",
+                std::chrono::duration<double, std::milli>(end - ajb_phase0).count(),
+                ajb_table_stats.file_io_ms, ajb_table_stats.dedup_ms, ajb_table_stats.co_build_ms);
     }
 
     int cardinality() const {
@@ -196,14 +267,18 @@ struct Table {
 
     // does not preserve anything (weights, prefixSum, totalWeight)
     Table select(SelectionPredicate predicate = nullptr, void* arg = nullptr) {
+        ajb_table_stats.select_calls++;
         Table newTable;
 
+        int matched = 0;
         for(Row<Parcel>& row : data) {
             if (predicate == nullptr || predicate(arg, (void *) &(row.parcel))) {
                 newTable.data.emplace_back(row.parcel, 1);
+                matched++;
             }
         }
 
+        fprintf(stderr, "[AJB_STATE][Table] select: %d/%zu rows matched\n", matched, data.size());
 
         return newTable;
     }
@@ -215,18 +290,35 @@ struct Table {
         unordered_set<Projected_Parcel> newRows;
         Table<Projected_Parcel> projectedTable;
 
+        int dup_count = 0;
         for(auto r : data) {
             /*projection does not conserve weights*/
             Projected_Parcel p = Projected_Parcel::from(r.parcel);
             if(newRows.find(p) == newRows.end()) {
                 newRows.insert(p);
                 projectedTable.push_back(p);
+            } else {
+                dup_count++;
             }
         }
+        fprintf(stderr, "[AJB_STATE][Table] project: %zu unique, %d duplicates removed\n",
+                newRows.size(), dup_count);
 
         return move(projectedTable);
     }
 #endif
+
+    // [AJB] dump Table-level diagnostic counters
+    void ajb_dump_stats() const {
+        ajb_table_stats.dump();
+        fprintf(stderr, "[AJB_STATE][Table] this_table: rows=%zu totalWeight=%lld prefixSum.size=%zu\n",
+                data.size(), totalWeight, weightPrefixSum.size());
+    }
+
+    // [AJB] reset Table-level counters
+    static void ajb_reset_stats() {
+        ajb_table_stats.reset();
+    }
 
 };
 
