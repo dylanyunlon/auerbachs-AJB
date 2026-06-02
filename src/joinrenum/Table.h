@@ -9,6 +9,7 @@
 #include <vector>
 #include <fstream>
 #include <unordered_map>
+// [AJB] Table: columnar relation storage, readFromFile reads CSV/TBL
 #include <unordered_set>
 #include <assert.h>
 #include "iostream"

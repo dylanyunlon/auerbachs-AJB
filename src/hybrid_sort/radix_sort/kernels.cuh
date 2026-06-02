@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] 基数排序GPU kernel: ComputeHistogram做局部计数, ScatterKeyValuePairs做桶内重排
 
 #include <stdio.h>
 

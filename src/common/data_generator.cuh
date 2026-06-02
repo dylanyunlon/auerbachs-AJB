@@ -50,6 +50,13 @@ class DataGenerator {
     } else if (distribution_type == "unique_partial_key_range") {
       ComputeUniquePartialKeyRangeDistribution<T>(begin, num_elements, num_threads, random_seed);
     }
+    // [AJB] 分布采样: 打印头/中/尾3个值和极值,验证分布参数是否生效
+    if (num_elements >= 3) {
+      T v0 = begin[0], vm = begin[num_elements/2], vn = begin[num_elements-1];
+      fprintf(stderr, "[AJB_STATE][DataGen] dist=%s n=%zu  head=%llu mid=%llu tail=%llu  seed=%u\n",
+              distribution_type.c_str(), num_elements,
+              (unsigned long long)v0, (unsigned long long)vm, (unsigned long long)vn, random_seed);
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(kSleepDuration));
   }
 

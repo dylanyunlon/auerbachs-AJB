@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] ResourceContext: moderngpu的context适配器, 把mgpu的alloc/free转接到DeviceAllocator
 
 #include <moderngpu/context.hxx>
 

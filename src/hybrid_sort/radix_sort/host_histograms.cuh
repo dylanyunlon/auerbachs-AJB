@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] HostHistograms: histogram的host副本 + bucket-to-GPU映射表
 
 #include <cstring>
 

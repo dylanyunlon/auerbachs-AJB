@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] join也用3个stream, 和sort共享stream编号约定
 
 #include "common/math_utilities.cuh"
 

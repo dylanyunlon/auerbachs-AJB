@@ -47,6 +47,9 @@ public:
     void random_enumerate() {
         double totalRRAccessTime = 0;
         int cntsuccess = 0, cnt = 0, step = 20;
+        // [AJB] 枚举开始: AGM是总解空间大小,option决定RRAccess变体
+        fprintf(stderr, "[AJB_BP][Enumerator] AGM=%lld option=%d treeflag=%d\n",
+                access_tree.AGM, option, (int)treeflag);
         clock_t start = clock();
         clock_t end;
         double elapsed = 0;
@@ -104,6 +107,9 @@ public:
         elapsed = double(end - start) / CLOCKS_PER_SEC;
         cout << cntsuccess << ", " << cnt << ", " << bp.remaining() << ", " << bp.getPercentage() << ", " << elapsed << endl;
         cout << "Total RRAccess Time: " << totalRRAccessTime << endl;
+        // [AJB] hit_rate = 实际找到tuple的比例,低hit_rate说明解空间很稀疏
+        fprintf(stderr, "[AJB_STATE][Enumerator] results=%d attempts=%d hit_rate=%.4f elapsed=%.3fs\n",
+                cntsuccess, cnt, cnt > 0 ? (double)cntsuccess / cnt : 0.0, elapsed);
     }
 
 };

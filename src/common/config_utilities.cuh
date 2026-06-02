@@ -17,6 +17,9 @@ void ConfigurePeerAccess(const std::vector<int>& gpus) {
     CheckCudaError(cudaSetDevice(gpus[i]));
     for (size_t j = 0; j < gpus.size(); ++j) {
       if (i != j) {
+        int can = 0;
+        cudaDeviceCanAccessPeer(&can, gpus[i], gpus[j]);
+        if (!can) fprintf(stderr, "[AJB_WARN][P2P] gpu %d -> %d: no peer access\n", gpus[i], gpus[j]);
         CheckCudaError(cudaDeviceEnablePeerAccess(gpus[j], 0));
       }
     }

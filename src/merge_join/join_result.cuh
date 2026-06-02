@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] JoinResult: count_是匹配数, items_是可选的(r_range × s_range)物化结果
 
 #include <vector>
 

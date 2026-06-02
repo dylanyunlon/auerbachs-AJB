@@ -555,6 +555,9 @@ public:
 
     bool RRAccess_BTI(long long k) {
         numti = 0;
+        // [AJB] BTI: k should be in [1, AGM]. k>AGM means BanPickTree picked an invalid position
+        if (k < 1 || k > AGM)
+            fprintf(stderr, "[AJB_WARN][RRAccess_BTI] k=%lld out of [1, AGM=%lld]\n", k, AGM);
         return RRAccess_opt(k, idx.FB, root, 0);
     }
 

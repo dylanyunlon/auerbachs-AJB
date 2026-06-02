@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] BucketId: 多pass基数排序的桶标识, predecessor指向上一pass的父桶
 
 #include <cub/cub.cuh>
 

@@ -83,6 +83,9 @@ class RelationGenerator {
       ParallelSortPairs(s_relation.GetKeys(), s_relation.GetValues());
     }
 
+    // [AJB] expected_matches控制join output大小: theta>0用zipf偏斜,sigma<100引入non-matching keys
+    fprintf(stderr, "[AJB_STATE][RelationGen] |R|=%zu |S|=%zu expected_matches=%zu theta=%u sigma=%u\n",
+            r_relation.GetSize(), s_relation.GetSize(), num_matches, theta, sigma);
     return num_matches;
   }
 };

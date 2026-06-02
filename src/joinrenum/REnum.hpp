@@ -1,4 +1,5 @@
 #include "Table.h"
+// [AJB] REnum: top-level — Index→JoinTree→Enumerator→enumerate()
 #include "Parcel.h"
 #include "Index.hpp"
 #include "ReadConfig.hpp"

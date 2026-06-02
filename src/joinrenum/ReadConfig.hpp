@@ -1,4 +1,5 @@
 using namespace std;
+// [AJB] ReadConfig: db/{relations,filenames,numlines}.txt → schema+data paths
 unordered_map<string, string> readFilenames(const string& filename){
     ifstream f;
     f.open(filename);

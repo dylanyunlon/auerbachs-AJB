@@ -1,5 +1,6 @@
 //
-// Created by shai.zeevi on 04/06/2019.
+// Created by shai.zeevi
+// [AJB] SplitTable: per-relation split tracking for BucketPool on 04/06/2019.
 //
 
 #ifndef RANDOMORDERENUMERATION_SPLITTABLE_H

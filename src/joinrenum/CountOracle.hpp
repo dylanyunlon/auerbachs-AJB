@@ -166,6 +166,8 @@ public:
         // upperbound = Point<T>(uppervec);
         sort(points.begin(), points.end());
         this->points = points;
+        // [AJB] CountOracle: 点数=关系大小, dim=属性数, 后续range query的搜索空间
+        fprintf(stderr, "[AJB_STATE][CountOracle] %zu points, dim=%lu\n", points.size(), points[0].dim());
     }
 
     int sumCnt(const Point<T> &pl, const Point<T> &pr) {

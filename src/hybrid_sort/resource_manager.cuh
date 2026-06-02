@@ -51,6 +51,10 @@ class ResourceManager {
           reinterpret_cast<V*>(device_allocators_[g].allocate(adjusted_chunk_size * sizeof(V)));
       values_double_buffers_[g].d_buffers[1] =
           reinterpret_cast<V*>(device_allocators_[g].allocate(adjusted_chunk_size * sizeof(V)));
+      // [AJB] 每GPU 4个buffer (2×key + 2×value), 占用 = 4 × adjusted_chunk × elem_size
+      fprintf(stderr, "[AJB_STATE][ResourceMgr] gpu=%d buffers=%.1f MB free_after=%zu\n",
+              gpus_[g], 4.0 * adjusted_chunk_size * std::max(sizeof(T), sizeof(V)) / (1024*1024),
+              device_allocators_[g].GetFreeBytes());
     }
 
 #pragma omp parallel for num_threads(gpus_.size())

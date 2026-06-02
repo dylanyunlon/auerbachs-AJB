@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] DeviceContainers: 管理每GPU每个spanning bucket的设备端histogram buffer
 
 #include <map>
 #include <vector>

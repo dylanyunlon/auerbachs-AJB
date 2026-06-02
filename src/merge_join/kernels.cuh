@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] GPU join kernel: PartitionJoin在R/S的一个merge-path分区内做等值连接
 
 template <int blocks_per_multi_processor, bool swap_rs, typename T>
 __global__ void __launch_bounds__(kNumJoinThreads, blocks_per_multi_processor)

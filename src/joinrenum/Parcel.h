@@ -1,4 +1,5 @@
 #ifndef RANDOMORDERENUMERATION_PARCEL_H
+// [AJB] Parcel: 单列数据容器, Table的组成单位
 #define RANDOMORDERENUMERATION_PARCEL_H
 
 #include <iostream>

@@ -1,4 +1,5 @@
 #include <vector>
+// [AJB] MHBS: Multi-Hash Bucket Splitting — setAGMandIters中hash分桶来估AGM bound
 #include <cmath>
 #include "AGM.hpp"
 using namespace std;

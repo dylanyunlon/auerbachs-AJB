@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] PinnedVector: cudaMallocHost分配的std::vector, H2D传输零拷贝
 
 #include <vector>
 

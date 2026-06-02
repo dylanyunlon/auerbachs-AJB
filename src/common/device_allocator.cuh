@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] DeviceAllocator: GPU显存arena, 128字节对齐, 用于sort/join所有临时buffer
 
 #include <string>
 

@@ -1,4 +1,6 @@
 #include<iostream>
+// [AJB] Bucket: 多维区间 [lower, upper]^d, splitDim=第一个lower≠upper的维度
+// AGM由Index通过RangeTree查询赋值, 是这个区间内join结果数的上界
 #include<vector>
 using namespace std;
 

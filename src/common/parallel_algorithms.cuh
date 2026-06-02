@@ -47,6 +47,8 @@ void ParallelMergePairs(PinnedVector<T>& in_keys, PinnedVector<V>& in_values, Pi
 
   KeyValueZipIter<T, V> out_begin_zip_iter(out_keys.begin(), out_values.begin());
 
+  // [AJB] CPU端k-way归并: 如果chunk_groups很多,这里是瓶颈
+  fprintf(stderr, "[AJB_TRACE][Parallel] %zu-way merge, total %zu elements\n", num_chunk_groups, num_elements);
   __gnu_parallel::multiway_merge(zip_iter_pairs.begin(), zip_iter_pairs.end(), out_begin_zip_iter, num_elements,
                                  std::less<>());
 }

@@ -91,9 +91,13 @@ class Bucket {
         }
 
         void replaceSelf(int lower, int upper){
+            int oldDim = splitDim;
             lowerBound[splitDim] = lower;
             upperBound[splitDim] = upper;
             while(splitDim < lowerBound.size() && lowerBound[splitDim] == upperBound[splitDim])splitDim++;
+            // [AJB] bucket narrowed: 如果splitDim推进到dim说明这个bucket已经是单点(叶子)
+            if (splitDim >= (int)lowerBound.size() && oldDim < splitDim)
+                fprintf(stderr, "[AJB_TRACE][Bucket] collapsed to leaf: dim=%zu\n", lowerBound.size());
             return;
         }
 

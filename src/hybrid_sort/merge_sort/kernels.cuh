@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] merge sort GPU kernel辅助: GetValueFromVirtualPartition处理跨buffer读取
 
 template <typename T>
 inline __device__ void GetValueFromVirtualPartition(size_t partition_size, T** virtual_partition, size_t index,

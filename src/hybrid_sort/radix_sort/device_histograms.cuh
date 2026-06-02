@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] DeviceHistograms: GPU上的256桶histogram + prefix sum + mgpu条纹histogram
 
 #include <thrust/device_vector.h>
 

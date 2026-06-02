@@ -69,6 +69,10 @@ struct MemoryAllocator {
 #ifdef DEBUG_BUILD
       printf("[ERROR][%s] num_bytes = %lu is too large.\n", GetType(), aligned_num_bytes);
 #endif
+      // [AJB] OOM诊断: 打印当前水位和请求大小,帮助定位哪个阶段耗尽了内存
+      fprintf(stderr, "[AJB_FAIL][%s] alloc %zu failed: used %zu / %zu (%.1f%%), %zu live allocs\n",
+              GetType(), aligned_num_bytes, offset_, capacity_,
+              100.0 * offset_ / (capacity_ ? capacity_ : 1), allocations_.size());
       return nullptr;
     }
     offset_ += aligned_num_bytes;
@@ -82,6 +86,9 @@ struct MemoryAllocator {
 #ifdef DEBUG_BUILD
       printf("[ERROR][%s] begin_pointer = %p is invalid.\n", GetType(), reinterpret_cast<void*>(begin_pointer));
 #endif
+      // [AJB] double-free或wild pointer诊断
+      fprintf(stderr, "[AJB_FAIL][%s] dealloc %p not found in %zu live allocs\n",
+              GetType(), reinterpret_cast<void*>(begin_pointer), allocations_.size());
       return;
     }
 #ifdef DEBUG_BUILD

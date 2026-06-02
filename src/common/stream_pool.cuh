@@ -20,6 +20,7 @@ class StreamPool {
       for (cudaStream_t& stream : streams_) {
         CheckCudaError(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
       }
+      fprintf(stderr, "[AJB_TRACE][StreamPool] created %zu non-blocking streams\n", num_streams);
     }
   }
 

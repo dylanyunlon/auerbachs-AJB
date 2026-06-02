@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] 256桶=8bit基数, kNumRadixThreads=1024是kernel线程数, kMaxNumGpus=64是硬上限
 
 constexpr size_t kNumBuckets = 256;
 constexpr size_t kNumRadixBits = 8;

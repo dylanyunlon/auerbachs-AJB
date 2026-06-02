@@ -214,6 +214,9 @@ std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_va
   }
 
   const size_t num_gpus = gpus.size();
+  // [AJB] merge sort: 先每GPU独立thrust排序,再树形跨GPU归并
+  fprintf(stderr, "[AJB_BP][MergeSort] n=%zu gpus=%zu chunk=%zu fillers=%zu\n",
+          num_elements, num_gpus, chunk_size, num_fillers);
 
 #pragma omp parallel for num_threads(num_gpus)
   for (size_t i = 0; i < num_gpus; ++i) {

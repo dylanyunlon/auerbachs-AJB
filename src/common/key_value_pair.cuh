@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] KVP zip/unzip: sort/join用key排序时需要value跟着走, zip把两个数组合成pair数组
 
 #include <vector>
 

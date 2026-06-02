@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] HostContainers: DeviceContainers的host端镜像, 用于CPU端的桶分配决策
 
 #include <map>
 #include <vector>

@@ -96,8 +96,13 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
   const size_t num_gpus = gpus.size();
 
+  // [AJB] radix sort config: max_passes = sizeof(T) = how many bytes to partition through
+  fprintf(stderr, "[AJB_BP][RadixSort] n=%zu gpus=%zu chunk=%zu max_passes=%zu key_bytes=%zu smem=%zu\n",
+          num_elements, num_gpus, chunk_size, max_num_partition_passes, sizeof(T), shared_memory_size);
+
   if (num_gpus == 1) {
     const int gpu = gpus[0];
+    fprintf(stderr, "[AJB_TRACE][RadixSort] single-GPU path: gpu=%d, using cub::DeviceRadixSort directly\n", gpu);
 
     DeviceAllocator& device_allocator = resource_manager.GetDeviceAllocator(gpu);
     StreamPool& stream_pool = resource_manager.GetStreamPool(gpu);
@@ -173,8 +178,12 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                                                         spanning_bucket_to_gpus_map, gpus, iteration);
       }
 
+      // [AJB] partition pass状态: spanning_buckets>0 说明还有桶横跨多个GPU,需要继续分
+      fprintf(stderr, "[AJB_TRACE][RadixSort] pass %zu: spanning_buckets=%zu\n", iteration, num_spanning_buckets);
+
       if (num_spanning_buckets == 0) {
         num_partition_passes_needed = iteration;
+        fprintf(stderr, "[AJB_TRACE][RadixSort] partition converged at pass %zu (all buckets single-GPU)\n", iteration);
         break;
       }
 
@@ -738,6 +747,11 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
         std::sort(reduced_sorting_buckets[g].begin(), reduced_sorting_buckets[g].end(),
                   CompareReducedSortingBuckets<T, V>());
+
+        // [AJB] reduced sort: 每个桶太小不值得multi-GPU partition,改用cub局部排序
+        // num_buckets_to_sort > kMaxNumBucketsForReducedSorting 时退化为全量cub排序
+        fprintf(stderr, "[AJB_STATE][RadixSort] gpu=%d reduced_buckets=%zu local_chunk=%zu (threshold=%zu)\n",
+                gpu, num_buckets_to_sort, gpu_local_chunk_size, (size_t)kMaxNumBucketsForReducedSorting);
 
         std::vector<uint8_t*> temporary_storage_pointers;
         temporary_storage_pointers.reserve(num_buckets_to_sort);

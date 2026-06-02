@@ -389,6 +389,10 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
                         PinnedVector<V>& values_s, const std::vector<int>& gpus,
                         std::vector<DeviceAllocator>& device_allocators, std::vector<StreamPool>& stream_pools,
                         const bool materialize) {
+  // [AJB] merge-join入口: R和S必须已排序,merge-path按对角线切分给各GPU
+  fprintf(stderr, "[AJB_BP][MergeJoin] |R|=%zu |S|=%zu gpus=%zu materialize=%d\n",
+          keys_r.size(), keys_s.size(), gpus.size(), (int)materialize);
+
   for (size_t g = 0; g < gpus.size(); ++g) {
     CheckCudaError(cudaSetDevice(gpus[g]));
 
@@ -426,6 +430,12 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
           diagonal, mgpu::less_t<T>());
       ends[i_device].y = diagonal - ends[i_device].x;
     }
+    // [AJB] merge-path分区: 每GPU拿到R和S各一段,大小由对角线切分决定
+    fprintf(stderr, "[AJB_STATE][MergeJoin] gpu[%zu]: R[%lld..%lld]=%lld  S[%lld..%lld]=%lld\n",
+            i_device, starts[i_device].x, ends[i_device].x,
+            ends[i_device].x - starts[i_device].x,
+            starts[i_device].y, ends[i_device].y,
+            ends[i_device].y - starts[i_device].y);
   }
 
   JoinResult<T> answer;
@@ -449,6 +459,7 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
   for (size_t i_device = 0; i_device < device_count; ++i_device) {
     answer.count_ += device_results[i_device].count_;
   }
+  fprintf(stderr, "[AJB_TRACE][MergeJoin] total_matches=%zu\n", answer.count_);
 
   if (materialize) {
     answer.items_.reserve(answer.count_);

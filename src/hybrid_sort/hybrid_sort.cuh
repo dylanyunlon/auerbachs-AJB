@@ -37,9 +37,14 @@ void HybridSort(PinnedVector<T>& keys, PinnedVector<V>& values, PinnedVector<T>&
                 std::vector<StreamPool>& stream_pools, size_t num_elements, size_t& chunk_size) {
   if (chunk_size == 0) {
     chunk_size = CalculateChunkSize(gpus, num_elements, sizeof(T) + sizeof(V));
+    fprintf(stderr, "[AJB_TRACE][HybridSort] auto chunk_size=%zu (from GPU free mem)\n", chunk_size);
   }
   const size_t num_elements_per_chunk_group = chunk_size * gpus.size();
   const size_t num_chunk_groups = DivideUp(num_elements, num_elements_per_chunk_group);
+  // [AJB] chunk_groups>1 意味着要做CPU端multiway merge,这是额外开销
+  fprintf(stderr, "[AJB_BP][HybridSort] n=%zu chunk=%zu groups=%zu kernel=%s\n",
+          num_elements, chunk_size, num_chunk_groups,
+          kernel == HybridSortKernel::kMerge ? "merge" : "radix");
 
   size_t num_streams = 0;
   if (kernel == HybridSortKernel::kMerge) {

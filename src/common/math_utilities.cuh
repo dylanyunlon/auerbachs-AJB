@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] DivideUp/RoundUp: 所有chunk大小计算和对齐的基础, _KB/_MB/_GB是allocator用的字面量
 
 constexpr unsigned long long operator"" _KB(unsigned long long n) { return n * 1024; }
 constexpr unsigned long long operator"" _MB(unsigned long long n) { return n * 1024 * 1024; }

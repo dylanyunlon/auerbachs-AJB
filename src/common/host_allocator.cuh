@@ -1,4 +1,5 @@
 #pragma once
+// [AJB] HostAllocator: pinned host内存arena, 16字节对齐, 用于H2D/D2H传输buffer
 
 #include <string>
 

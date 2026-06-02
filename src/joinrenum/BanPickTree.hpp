@@ -124,6 +124,9 @@ public:
 
     void ban(long long low, long long high) {
         if (low > high) return;
+        // [AJB] ban区间溢出检查: low和high应该在[1, H]内
+        if (low < 1 || high > H)
+            fprintf(stderr, "[AJB_WARN][BanPickTree] ban(%lld,%lld) outside [1, H=%lld]\n", low, high, H);
         if (root == -1) {
             pool.emplace_back(low, high);
             root = pool.size() - 1;

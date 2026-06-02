@@ -212,6 +212,7 @@ const std::pair<size_t, size_t> OptionsLimits::kValidNumThreads = {1, omp_get_nu
 const std::vector<int> OptionsLimits::kValidGpus = []() {
   int cuda_device_count = 0;
   cudaGetDeviceCount(&cuda_device_count);
+  fprintf(stderr, "[AJB_STATE][Options] detected %d CUDA devices\n", cuda_device_count);
 
   std::vector<int> valid_gpus(cuda_device_count);
   std::iota(valid_gpus.begin(), valid_gpus.end(), 0);

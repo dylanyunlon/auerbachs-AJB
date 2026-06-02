@@ -9,6 +9,7 @@
     if (error_code != cudaSuccess) {                                                                                 \
       const char* error_name = cudaGetErrorName(error_code);                                                         \
       std::cout << "[ERROR] " << __FILE__ << " " << __LINE__ << error_code << " " << error_name << " " << std::endl; \
+      fprintf(stderr, "[AJB_FAIL] CUDA launch @ %s:%d code=%d %s\n", __FILE__, __LINE__, error_code, error_name);   \
     }                                                                                                                \
   }
 #else
