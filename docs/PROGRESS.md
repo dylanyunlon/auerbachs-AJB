@@ -21,48 +21,53 @@ Claude-8  M151-M175     d27c9fb  code                   JoinREnum test/tool port
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
   ↓ 以下为本轮开发（6 位 Claude 接力）  ↓
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-第1位 Claude   M226-M250   ✅ DONE     Benchmark + script AJB instrumentation:
-                                        join_benchmark.cu, sort_benchmark.cu,
-                                        BinarySearch.cpp — breakpoint/state/mem;
-                                        figure_utilities.py, info_utilities.py,
-                                        run_experiments.py, plot_experiments.py
-                                        — AJB trace tags + data validation.
-                                        All 0-diff files eliminated.
+第1位 Claude   M176-M345   ✅ DONE     Full upstream port + AJB instrumentation:
+                                        4 rounds, 51 files, upstream 11460→13276行 (+15.8%)
+                                        joinrenum 17 headers + GPU common 16 + hybrid_sort 11
+                                        + merge_join 3 + benchmarks 6 + scripts 6
+                                        BanPickTree AVL恢复, Index行号定位注入
+                                        radix_sort/merge_join按行号trace注入
+                                        All upstream algorithms preserved verbatim
 
-第2位 Claude   M251-M275   ⏳ next     GPU build validation: CMake on
-                                        CUDA host (A6000/H100), fix all
-                                        compilation errors across sm_70/80/90,
-                                        verify ajb_benchmark + all joinrenum
-                                        targets link cleanly, run _full tests
-                                        on CPU to confirm debug output pipeline
+第2位 Claude   M346-M400   ⏳ next     深度注入补完 + GPU build validation:
+                                        Index.hpp(9%→20%), RRAccessTree(15%→20%)
+                                        radix_sort(11%→20%), merge_join(8%→20%)
+                                        大文件的per-function行号定位注入;
+                                        CMake on CUDA host (A6000/H100),
+                                        fix compilation across sm_70/80/90,
+                                        verify link: ajb_benchmark + joinrenum
 
-第3位 Claude   M276-M300   ⏳ next     Benchmark dry-run: first real
-                                        ajb_benchmark run on 2-GPU setup,
+第3位 Claude   M401-M450   ⏳ next     Benchmark dry-run + end-to-end pipeline:
+                                        first ajb_benchmark run on 2-GPU setup,
                                         capture CSV output, validate
-                                        figure_data_emitter pipeline,
-                                        end-to-end: CSV → JSON → plot
+                                        figure_data_emitter → JSON → plot,
+                                        run _full tests on CPU with [AJB] trace,
+                                        parse_ajb_trace.py验证所有tag格式
 
-第4位 Claude   M301-M325   ⏳ next     Experiment execution: full suite
+第4位 Claude   M451-M500   ⏳ next     Experiment execution: full suite
                                         (cadence_sweep, vs_upstream,
-                                        skew_sensitivity), collect CSVs,
-                                        multi-seed runs (3-5 seeds),
-                                        validate [AJB_TIMER] consistency
+                                        skew_sensitivity, scalability, auto_tune),
+                                        multi-seed runs (3-5 seeds per config),
+                                        validate [AJB_TIMER] consistency,
+                                        parse .stderr.log for anomalies
 
-第5位 Claude   M326-M350   ⏳ next     Data analysis: figure JSONs from
-                                        collected CSVs, publication-quality
-                                        plots (Figures 2-5), fill paper
-                                        Tables 1-2 with real measured numbers,
-                                        anomaly detection (flag >2σ)
+第5位 Claude   M501-M550   ⏳ next     Data analysis + publication figures:
+                                        generate figure JSONs from CSVs,
+                                        publication-quality plots (Figures 2-5),
+                                        fill paper Tables 1-2 with measured data,
+                                        anomaly detection (flag >2σ),
+                                        ajb_validate_plot_data pre-check
 
-第6位 Claude   M351-M375   ⏳ next     Paper revision: update Sections 5-6
-                                        with real experimental data, revise
-                                        speedup claims, robustness tests
-                                        (1-GPU, 8-GPU, extreme skew θ=0.99),
-                                        camera-ready formatting, bib check
+第6位 Claude   M551-M600   ⏳ next     Paper revision + camera-ready:
+                                        update Sections 5-6 with real data,
+                                        revise speedup claims vs measured,
+                                        robustness tests (1/4/8-GPU, θ=0.99),
+                                        camera-ready format, bib check,
+                                        NeurIPS 2026 submission prep
 ─────────────────────────────────────────────────────────────────────────────
 ```
 
-## What's Done (through 第1位 Claude, M250)
+## What's Done (through 第1位 Claude, M345)
 
 ### Paper (complete draft)
 - [x] Sections 1-7 fully written in `paper/ajb_reconstructed.tex`
@@ -73,7 +78,11 @@ Claude-8  M151-M175     d27c9fb  code                   JoinREnum test/tool port
 - [x] `upstream/multi-gpu-sort-merge-join` → `src/common/`, `src/hybrid_sort/`, `src/merge_join/`
 - [x] `upstream/joinrenum` → `src/joinrenum/` (all 18 headers + 2 existing tests)
 - [x] AJB patches: `debug_utilities.cuh` (+156 lines), `profile_utilities.cuh` (+42 lines)
-- [x] AJB patches: `Index.hpp` (+48 lines — sample/randomAccess for SkewDetector)
+- [x] AJB patches: `Index.hpp` (+84 lines — ajb_idx_stats + sample/randomAccess)
+- [x] AJB patches: 51 files total, upstream 11460→13276 lines (+15.8%)
+- [x] All joinrenum headers: upstream原文忠实移植 + per-function AJB trace
+- [x] All GPU kernels: radix_sort/merge_join/merge_sort trace注入
+- [x] BanPickTree: 恢复upstream AVL树(修复之前的segment tree错误)
 
 ### Code — AJB Modules (complete, needs GPU testing)
 - [x] `src/ajb_join/tier_transfer_scheduler.cuh` (406 lines) — K_x/K_u/K_v cadence
@@ -216,35 +225,35 @@ docs/                          PLAN.md + PROGRESS.md
 ```
 角色                里程碑        状态      核心任务
 ─────────────────────────────────────────────────────────────────────────────
-第2位 Claude   M251-M275   ⏳ next   GPU build validation
+第2位 Claude   M346-M400   ⏳ next   深度注入补完 + GPU build validation
   • CMake configure + build on CUDA host (A6000/H100)
   • Fix all compilation errors across sm_70/80/90
   • Verify ajb_benchmark + all joinrenum targets link cleanly
   • Run _full tests on CPU to confirm debug output pipeline
   • Verify [AJB_*] trace tags flow through build_and_test.sh
 
-第3位 Claude   M276-M300   ⏳ next   Benchmark dry-run
+第3位 Claude   M401-M450   ⏳ next   Benchmark dry-run + pipeline
   • First real ajb_benchmark run on 2-GPU setup
   • Capture CSV output, validate figure_data_emitter pipeline
   • Run scripts/debug/build_and_test.sh --target test_join_baseline
   • End-to-end: CSV → figure_data_emitter.py → JSON → plot_experiments.py
   • Verify stderr .stderr.log capture from run_experiments.py
 
-第4位 Claude   M301-M325   ⏳ next   Experiment execution
+第4位 Claude   M451-M500   ⏳ next   Experiment execution
   • Full experiment suite: cadence_sweep, vs_upstream, skew_sensitivity
   • Collect result CSVs for each experiment
   • Multi-seed runs for statistical significance (3-5 seeds per config)
   • Validate AJB trace output: grep '[AJB_TIMER]' for timing consistency
   • Parse all .stderr.log with parse_ajb_trace.py for anomalies
 
-第5位 Claude   M326-M350   ⏳ next   Data analysis + figures
+第5位 Claude   M501-M550   ⏳ next   Data analysis + figures
   • Generate figure JSONs from collected CSVs
   • Produce final publication-quality plots (Figures 2-5)
   • Fill in paper Tables 1-2 with real measured numbers
   • Anomaly detection: flag any result > 2σ from expected
   • Use ajb_validate_plot_data to pre-check all data before plotting
 
-第6位 Claude   M351-M375   ⏳ next   Paper revision + polish
+第6位 Claude   M551-M600   ⏳ next   Paper revision + camera-ready
   • Update Sections 5-6 with real experimental data
   • Revise speedup claims against actual numbers
   • Robustness tests: 1-GPU, 8-GPU, extreme skew θ=0.99
