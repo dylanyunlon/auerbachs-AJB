@@ -1,6 +1,13 @@
 #pragma once
 
 #include <iostream>
+#include <stdexcept>
+
+// Upstream: CheckCudaError in release mode expands to just the bare
+// instruction with no error check at all — silent failures.
+// Changed: release mode still evaluates the return code and throws
+// on error.  The cost is one branch per CUDA call, which is negligible
+// compared to the kernel launch / memcpy latency.
 
 #ifdef DEBUG_BUILD
 #define CheckCudaLaunchError()                                                                                       \
@@ -25,24 +32,15 @@
     }                                                                                                                \
   }
 #else
-#define CheckCudaError(instruction) instruction
+// Release mode: still check the error code, throw on failure.
+// Upstream just discarded the return value entirely.
+#define CheckCudaError(instruction)                    \
+  {                                                    \
+    cudaError_t _err = (instruction);                  \
+    if (_err != cudaSuccess) {                         \
+      throw std::runtime_error(                        \
+          std::string("CUDA error: ") +                \
+          cudaGetErrorString(_err));                    \
+    }                                                  \
+  }
 #endif
-
-// [AJB] 增强版CUDA错误检查: 带文件名+行号+上下文tag
-#include <cstdio>
-#define AJB_CUDA_CHECK(call, tag) do {                                      \
-    cudaError_t err = (call);                                               \
-    if(err != cudaSuccess){                                                 \
-        fprintf(stderr, "[AJB_FAIL][CUDA] %s @ %s:%d: %s (%d)\n",          \
-                tag, __FILE__, __LINE__, cudaGetErrorString(err), (int)err); \
-    }                                                                       \
-} while(0)
-
-// [AJB] 批量检查: 在pipeline的每个阶段末尾调用
-static inline void ajb_cuda_sync_check(const char* phase) {
-    cudaError_t err = cudaDeviceSynchronize();
-    if(err != cudaSuccess)
-        fprintf(stderr, "[AJB_FAIL][CUDA] sync after %s: %s\n", phase, cudaGetErrorString(err));
-    else
-        fprintf(stderr, "[AJB_TRACE][CUDA] sync OK after %s\n", phase);
-}

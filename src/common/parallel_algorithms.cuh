@@ -1,6 +1,3 @@
-// [AJB] ParallelAlgorithms: thrust/cub的wrapper
-// 包含scan, sort, merge等GPU并行原语
-// 这些是hybrid_sort和merge_join的底层building blocks
 #pragma once
 
 #include <vector>
@@ -23,46 +20,43 @@ void ParallelShufflePairs(PinnedVector<T>& keys, PinnedVector<V>& values, const 
   __gnu_parallel::random_shuffle(begin_zip_iter, end_zip_iter, __gnu_parallel::_RandomNumber(random_seed));
 }
 
+// Upstream: no size guard — calling sort on empty ranges is fine but
+// creating ZipIter on empty vectors may be UB for some implementations.
+// Changed: early return when keys is empty.
 template <typename T, typename V>
 void ParallelSortPairs(PinnedVector<T>& keys, PinnedVector<V>& values) {
+  if (keys.empty()) return;
+
   KeyValueZipIter<T, V> begin_zip_iter(keys.begin(), values.begin());
   KeyValueZipIter<T, V> end_zip_iter(keys.end(), values.end());
 
   __gnu_parallel::sort(begin_zip_iter, end_zip_iter);
 }
 
+// Upstream: computes begin/end offsets inside the loop using repeated
+// multiplication.
+// Changed: use saturating min for end_offset, and hoist the zip iter
+// type alias for readability.
 template <typename T, typename V>
 void ParallelMergePairs(PinnedVector<T>& in_keys, PinnedVector<V>& in_values, PinnedVector<T>& out_keys,
                         PinnedVector<V>& out_values, const size_t num_elements, const size_t num_chunk_groups,
                         const size_t num_elements_per_chunk_group) {
-  std::vector<std::pair<KeyValueZipIter<T, V>, KeyValueZipIter<T, V>>> zip_iter_pairs;
+  using ZipIt = KeyValueZipIter<T, V>;
+
+  std::vector<std::pair<ZipIt, ZipIt>> zip_iter_pairs;
   zip_iter_pairs.reserve(num_chunk_groups);
 
   for (size_t i = 0; i < num_chunk_groups; ++i) {
     const size_t begin_offset = i * num_elements_per_chunk_group;
-    const size_t end_offset = std::min((i + 1) * num_elements_per_chunk_group, num_elements);
+    const size_t end_offset = std::min(begin_offset + num_elements_per_chunk_group, num_elements);
 
-    KeyValueZipIter<T, V> begin_zip_iter(in_keys.begin() + begin_offset, in_values.begin() + begin_offset);
-    KeyValueZipIter<T, V> end_zip_iter(in_keys.begin() + end_offset, in_values.begin() + end_offset);
-
-    zip_iter_pairs.emplace_back(begin_zip_iter, end_zip_iter);
+    zip_iter_pairs.emplace_back(
+        ZipIt(in_keys.begin() + begin_offset, in_values.begin() + begin_offset),
+        ZipIt(in_keys.begin() + end_offset, in_values.begin() + end_offset));
   }
 
-  KeyValueZipIter<T, V> out_begin_zip_iter(out_keys.begin(), out_values.begin());
+  ZipIt out_begin_zip_iter(out_keys.begin(), out_values.begin());
 
   __gnu_parallel::multiway_merge(zip_iter_pairs.begin(), zip_iter_pairs.end(), out_begin_zip_iter, num_elements,
                                  std::less<>());
 }
-
-#include <cstdio>
-// [AJB] parallel op计时宏
-#define AJB_PARALLEL_TIMED(op_name, code) do {                                  \
-    cudaEvent_t _s, _e;                                                         \
-    cudaEventCreate(&_s); cudaEventCreate(&_e);                                 \
-    cudaEventRecord(_s);                                                        \
-    { code; }                                                                   \
-    cudaEventRecord(_e); cudaEventSynchronize(_e);                              \
-    float _ms; cudaEventElapsedTime(&_ms, _s, _e);                              \
-    fprintf(stderr, "[AJB_TIMER][Parallel] %s: %.3fms\n", op_name, _ms);        \
-    cudaEventDestroy(_s); cudaEventDestroy(_e);                                 \
-} while(0)
