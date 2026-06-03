@@ -36,6 +36,7 @@ size_t FindPivot(ResourceManager<T, V>& resource_manager, const std::vector<int>
 
   CheckCudaError(cudaSetDevice(gpu));
 
+  // AJB: 预计算分区数——gpus.size()/2在多处使用
   const size_t num_partitions = gpus.size() / 2;
 
   // Host slab: [local_ptrs | remote_ptrs | pivot]
@@ -104,15 +105,20 @@ std::array<int, 2> SwapPartitions(ResourceManager<T, V>& resource_manager, const
   std::vector<int> gpus_to_sync;
   gpus_to_sync.reserve(2 * (gpus_to_swap + 1));
 
+  // AJB: 对称交换循环——left从中间往左, right从中间往右
+  const size_t half = gpus.size() / 2;
   for (size_t i = 0; i <= gpus_to_swap; ++i) {
-    const int left_gpu = gpus[gpus.size() / 2 - i - 1];
-    const int right_gpu = gpus[gpus.size() / 2 + i];
+    const int left_gpu = gpus[half - i - 1];
+    const int right_gpu = gpus[half + i];
 
     const size_t num_elements = (i == gpus_to_swap) ? pivot : partition_size;
     const size_t offset = partition_size - num_elements;
+    const size_t key_bytes = sizeof(T) * num_elements;
+    const size_t val_bytes = sizeof(V) * num_elements;
 
     gpus_to_sync.push_back(left_gpu);
     gpus_to_sync.push_back(right_gpu);
+    // AJB: 缓存key/val字节数用于下面的memcpy
 
     StreamPool& left_stream_pool = resource_manager.GetStreamPool(left_gpu);
     CheckCudaError(cudaMemcpyAsync(resource_manager.GetOtherKeys(left_gpu) + offset,
@@ -267,8 +273,8 @@ std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
     CheckCudaError(cudaSetDevice(gpu));
 
-    CheckCudaError(cudaMemcpyAsync(resource_manager.GetKeys(gpu), in_keys + offset, num_elements_to_process * sizeof(T),
-                                   cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
+    CheckCudaError(cudaMemcpyAsync(resource_manager.GetKeys(gpu), in_keys + offset, key_xfer_bytes,
+                                   cudaMemcpyHostToDevice  // AJB: 使用预计算字节数, stream_pool.GetStream(0)));
     CheckCudaError(cudaMemcpyAsync(resource_manager.GetValues(gpu), in_values + offset,
                                    num_elements_to_process * sizeof(V), cudaMemcpyHostToDevice,
                                    stream_pool.GetStream(0)));
@@ -288,7 +294,7 @@ std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                                     stream_pool.GetStream(0));
 
     uint8_t* temporary_storage_pointer = device_allocator.allocate(temporary_num_bytes);
-    cub::DeviceRadixSort::SortPairs((void*)temporary_storage_pointer, temporary_num_bytes,
+    cub::DeviceRadixSort::SortPairs(static_cast<void*>(temporary_storage_pointer), temporary_num_bytes,  // AJB: static_cast
                                     resource_manager.GetKeysBuffer(gpu), resource_manager.GetValuesBuffer(gpu),
                                     chunk_size, 0, sizeof(T) * 8, stream_pool.GetStream(0));
 
@@ -298,6 +304,7 @@ std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_va
   }
 
   if (num_gpus > 1) {
+    // AJB: 多GPU归并路径——递归二分合并
     MergePartitions<T, V>(resource_manager, gpus, chunk_size);
   }
 

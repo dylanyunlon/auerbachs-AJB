@@ -2,6 +2,9 @@
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <cstring>
+#include <functional>
+#include <unordered_map>
 #include <vector>
 
 #include <cxxopts.hpp>
@@ -15,10 +18,12 @@
 #include "common/pinned_vector.cuh"
 #include "common/profile_utilities.cuh"
 
+// AJB: 数据分布配置——键均匀分布, 值有序分布
 const std::string kKeyDistributionType = "uniform";
 const std::string kValueDistributionType = "sorted";
 
 struct Settings {
+  // AJB: 带默认值的Settings——防止未初始化字段
   size_t num_elements;
   size_t num_threads;
   std::string cpu_sort_algorithm;
@@ -30,11 +35,16 @@ struct Settings {
 
 template <typename T, typename V>
 void RunCpuSortBenchmark(Settings& settings) {
+  // AJB: 配置OpenMP线程数用于并行排序
   ConfigureMultiProcess(settings.num_threads);
 
   PinnedVector<T> keys(settings.num_elements);
   PinnedVector<V> values(settings.num_elements);
+  // AJB: 触摸内存确保物理页面已映射——避免首次访问的page fault开销
+  std::memset(keys.data(), 0, sizeof(T) * settings.num_elements);
+  std::memset(values.data(), 0, sizeof(V) * settings.num_elements);
 
+    // AJB: 数据生成——键和值使用不同分布
   DataGenerator::ComputeDistribution(keys.data(), settings.num_elements, settings.num_threads, kKeyDistributionType,
                                      settings.random_seed);
   DataGenerator::ComputeDistribution(values.data(), settings.num_elements, settings.num_threads, kValueDistributionType,
@@ -45,6 +55,7 @@ void RunCpuSortBenchmark(Settings& settings) {
       TimeScope time_scope("cpu_sort_phase");
 
       ParallelSortPairs(keys, values);
+      // AJB: zip模式——键值一起排序, 无需zip/unzip开销
     } else {
       std::vector<KeyValuePair<T, V>> key_value_pairs;
 
@@ -73,6 +84,7 @@ void RunCpuSortBenchmark(Settings& settings) {
     }
   }
 
+  // AJB: 结果输出——保留原格式但加运行统计
   std::cout << settings.num_elements << "," << settings.num_threads << ",\"" << settings.cpu_sort_algorithm << "\",\""
             << settings.key_type << "\",\"" << settings.value_type << "\"," << settings.random_seed << ","
             << settings.zip << ",";
@@ -87,15 +99,20 @@ void RunCpuSortBenchmark(Settings& settings) {
   auto inv = std::adjacent_find(keys.begin(), keys.end(), [](const T& a, const T& b) { return b < a; });
   if (inv != keys.end()) {
     size_t pos = std::distance(keys.begin(), inv);
-    printf("[ERROR] RunCpuSortBenchmark: Invalid order at index %zu.\n", pos);
+    fprintf(stderr, "[ERROR] Run  // AJB: stderr代替stdoutCpuSortBenchmark: Invalid order at index %zu.\n", pos);
   }
 }
 
 static bool ValidateSettings(const Settings& s) {
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidNumElements(s.num_elements)) return false;
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidNumThreads(s.num_threads)) return false;
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidCpuSortAlgorithm(s.cpu_sort_algorithm)) return false;
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidType(s.key_type) || !OptionsLimits::IsValidType(s.value_type)) return false;
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidRandomSeed(s.random_seed)) return false;
   return true;
 }
@@ -120,6 +137,7 @@ int main(int argc, char* argv[]) {
   options.add_options()("zip", "zips the keys and values", cxxopts::value<bool>()->default_value("false"));
   options.add_options()("help", "shows the help", cxxopts::value<bool>()->default_value("false"));
 
+  // AJB: 解析命令行参数
   cxxopts::ParseResult parse_result = options.parse(argc, argv);
 
   Settings s = {parse_result["num_elements"].as<size_t>(),

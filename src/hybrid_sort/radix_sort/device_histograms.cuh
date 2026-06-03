@@ -62,15 +62,16 @@ class DeviceHistograms {
 
   ~DeviceHistograms() {
     CheckCudaError(cudaSetDevice(gpu_));
-
-    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(non_empty_count_));
-    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(global_histogram_));
-    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(global_prefix_sums_));
-    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(global_scatter_offsets_));
-    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(block_local_histograms_));
-    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(mgpu_histograms_));
-    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(mgpu_striped_histogram_));
+    // AJB: LIFO顺序释放——与allocate顺序相反
+    // 大多数内存分配器对LIFO释放模式有优化(合并相邻空闲块)
     device_allocator_.deallocate(reinterpret_cast<uint8_t*>(bucket_to_gpu_map_));
+    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(mgpu_striped_histogram_));
+    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(mgpu_histograms_));
+    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(block_local_histograms_));
+    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(global_scatter_offsets_));
+    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(global_prefix_sums_));
+    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(global_histogram_));
+    device_allocator_.deallocate(reinterpret_cast<uint8_t*>(non_empty_count_));
   }
 
   size_t* GetNonEmptyCount() const { return non_empty_count_; }

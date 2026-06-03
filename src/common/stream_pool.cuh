@@ -1,4 +1,5 @@
 #pragma once
+#include "common/ajb_debug_infra.cuh"
 
 #include <vector>
 
@@ -31,9 +32,12 @@ class StreamPool {
     streams_.shrink_to_fit();
   }
 
-  cudaStream_t GetStream(size_t index) { return streams_[index]; }
+  cudaStream_t GetStream(size_t index) { if (ajb_stream_use_count_.size() > index)
+        ajb_stream_use_count_[index]++;
+    return streams_[index]; }
 
  private:
+  mutable std::vector<size_t> ajb_stream_use_count_;
   std::vector<cudaStream_t> streams_;
 };
 

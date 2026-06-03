@@ -28,11 +28,19 @@ struct node {
     node() : low(0), high(0), take(0), height(1) {}
     node(long long low, long long high) : low(low), high(high), take(high - low + 1), height(1) {}
 
+    // AJB: 子节点属性访问提取为内联函数——避免散落的三元运算
+    static inline int childHeight(const vector<node>& pool, int idx) {
+        return idx != -1 ? pool[idx].height : 0;
+    }
+    static inline long long childTake(const vector<node>& pool, int idx) {
+        return idx != -1 ? pool[idx].take : 0;
+    }
     void update(vector<node>& pool) {
-        take = high - low + 1;
-        if (left != -1) take += pool[left].take;
-        if (right != -1) take += pool[right].take;
-        height = max(left != -1 ? pool[left].height : 0, right != -1 ? pool[right].height : 0) + 1;
+        take = (high - low + 1) + childTake(pool, left) + childTake(pool, right);
+        height = max(childHeight(pool, left), childHeight(pool, right)) + 1;
+    }
+    int balanceFactor(const vector<node>& pool) const {
+        return childHeight(pool, left) - childHeight(pool, right);
     }
 
     bool operator<(const node& n) const {
@@ -90,7 +98,8 @@ private:
         }
         if (pool[nv] < pool[v]) {
             insertSubTree(pool[v].left, nv);
-            if (pool[v].left != -1 && pool[pool[v].left].height - (pool[v].right != -1 ? pool[pool[v].right].height : 0) == 2) {
+            // AJB: balanceFactor代替手写height差
+            if (pool[v].balanceFactor(pool) == 2) {
                 if (pool[nv] < pool[pool[v].left]) {
                     rotateRight(v);
                 } else {
@@ -100,7 +109,8 @@ private:
             }
         } else {
             insertSubTree(pool[v].right, nv);
-            if (pool[v].right != -1 && pool[pool[v].right].height - (pool[v].left != -1 ? pool[pool[v].left].height : 0) == 2) {
+            // AJB: balanceFactor代替手写height差
+            if (pool[v].balanceFactor(pool) == -2) {
                 if (pool[pool[v].right] < pool[nv]) {
                     rotateLeft(v);
                 } else {
@@ -114,14 +124,17 @@ private:
 
     long long G() {
         int u = root;
-        long long y = uniform_int_distribution<long long>(1, root != -1 ? H - pool[root].take : H)(gen);
-        long long b = 0, temp = 0;
+        long long rem = remaining();
+        if (rem <= 0) return 0;
+        long long y = uniform_int_distribution<long long>(1, rem)(gen);
+        long long b = 0;
         while (u != -1) {
-            temp = pool[u].left != -1 ? pool[pool[u].left].take : 0;
-            if (y + b + temp < pool[u].low) {
+            // AJB: 用childTake代替重复的三元运算
+            long long ltake = node::childTake(pool, pool[u].left);
+            if (y + b + ltake < pool[u].low) {
                 u = pool[u].left;
             } else {
-                b = b + temp + (pool[u].high - pool[u].low + 1);
+                b += ltake + (pool[u].high - pool[u].low + 1);
                 u = pool[u].right;
             }
         }
@@ -182,13 +195,16 @@ public:
     }
 
     bool available(long long low, long long high) {
+        // AJB: 区间重叠检测——等价条件但先做不重叠判断(分支预测友好)
         int u = root;
         while (u != -1) {
-            if (low <= pool[u].high && high >= pool[u].low) return false;
-            if (high < pool[u].low)
-                u = pool[u].left;
-            else
-                u = pool[u].right;
+            if (high < pool[u].low) {
+                u = pool[u].left;   // 完全在左边
+            } else if (low > pool[u].high) {
+                u = pool[u].right;  // 完全在右边
+            } else {
+                return false;       // 有重叠
+            }
         }
         return true;
     }

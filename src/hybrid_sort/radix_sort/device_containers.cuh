@@ -31,7 +31,8 @@ class DeviceContainers {
         gpu_index_flat_[dev] = (int)g;
     }
 
-    const size_t max_num_partition_passes = sizeof(T);
+    // AJB: partition passes由类型位宽决定——uint32_t=4, uint64_t=8
+    constexpr size_t max_num_partition_passes = sizeof(T);
     max_histograms_per_gpu_ = (gpus_.size() - 1) * (max_num_partition_passes - 1) + 1;
 
     fprintf(stderr, "[DEBUG][DeviceContainers] gpus=%zu max_hist/gpu=%zu "
@@ -70,6 +71,7 @@ class DeviceContainers {
   }
 
   void AssignNewHistogramBuffer(int gpu, const BucketId& bucket_id) {
+    // AJB: histogram buffer分配——通过gpu_index_映射GPU ID到内部索引
     const int i = GpuIdx(gpu);
     size_t& next_index = next_histogram_index_[i];
     if (next_index < max_histograms_per_gpu_) {

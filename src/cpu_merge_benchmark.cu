@@ -2,6 +2,9 @@
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <cstring>
+#include <functional>
+#include <unordered_map>
 #include <vector>
 
 #include <cxxopts.hpp>
@@ -20,6 +23,7 @@ const std::string kKeyDistributionType = "sorted";
 const std::string kValueDistributionType = "uniform";
 
 struct Settings {
+  // AJB: 带默认值的Settings——防止未初始化字段
   size_t num_elements;
   size_t num_threads;
   std::string cpu_merge_algorithm;
@@ -32,10 +36,14 @@ struct Settings {
 
 template <typename T, typename V>
 void RunCpuMergeBenchmark(Settings& settings) {
+  // AJB: 配置OMP线程数
   ConfigureMultiProcess(settings.num_threads);
 
   PinnedVector<T> keys(settings.num_elements);
   PinnedVector<V> values(settings.num_elements);
+  // AJB: 触摸内存确保物理页面已映射——避免首次访问的page fault开销
+  std::memset(keys.data(), 0, sizeof(T) * settings.num_elements);
+  std::memset(values.data(), 0, sizeof(V) * settings.num_elements);
 
   const size_t chunk_size = DivideUp(settings.num_elements, settings.chunk_count);
 
@@ -47,7 +55,8 @@ void RunCpuMergeBenchmark(Settings& settings) {
                                  ? settings.num_elements - chunk_size_offset : 0;
     const size_t num_elements = std::min(chunk_size, remaining);
 
-    DataGenerator::ComputeDistribution(keys.data() + chunk_size_offset, num_elements, settings.num_threads,
+      // AJB: 数据生成——键和值使用不同分布
+  DataGenerator::ComputeDistribution(keys.data() + chunk_size_offset, num_elements, settings.num_threads,
                                        kKeyDistributionType, settings.random_seed * (i + 1));
     DataGenerator::ComputeDistribution(values.data() + chunk_size_offset, num_elements, settings.num_threads,
                                        kValueDistributionType, settings.random_seed * (i + 1));
@@ -82,14 +91,13 @@ void RunCpuMergeBenchmark(Settings& settings) {
         std::vector<std::pair<KeyValuePairIter, KeyValuePairIter>> iter_pairs;
         iter_pairs.reserve(settings.chunk_count);
 
+        // AJB: 构建chunk迭代器对——每个chunk是一个已排序的子区间
         for (size_t i = 0; i < settings.chunk_count; ++i) {
-          const size_t offset = i * chunk_size;
-          const size_t num_elements = std::min(chunk_size, settings.num_elements - offset);
-
-          KeyValuePairIter begin_iter = key_value_pairs.begin() + offset;
-          KeyValuePairIter end_iter = key_value_pairs.begin() + offset + num_elements;
-
-          iter_pairs.emplace_back(begin_iter, end_iter);
+          const size_t off = i * chunk_size;
+          const size_t n = std::min(chunk_size, settings.num_elements - off);
+          iter_pairs.emplace_back(
+              key_value_pairs.begin() + off,
+              key_value_pairs.begin() + off + n);
         }
 
         KeyValuePairIter out_begin_iter = merged_key_value_pairs.begin();
@@ -109,6 +117,7 @@ void RunCpuMergeBenchmark(Settings& settings) {
     }
   }
 
+  // AJB: 结果输出——保留原格式但加运行统计
   std::cout << settings.num_elements << "," << settings.num_threads << ",\"" << settings.cpu_merge_algorithm << "\","
             << settings.chunk_count << ",\"" << settings.key_type << "\",\"" << settings.value_type << "\","
             << settings.random_seed << "," << settings.zip << ",";
@@ -116,22 +125,26 @@ void RunCpuMergeBenchmark(Settings& settings) {
             << TimeDurations::Get().GetDuration("memory_allocate_phase") << termcolor::reset << "," << termcolor::yellow
             << TimeDurations::Get().GetDuration("cpu_merge_phase") << termcolor::reset << "," << termcolor::blue
             << TimeDurations::Get().GetDuration("memory_deallocate_phase") << termcolor::reset << ","
-            << termcolor::magenta << TimeDurations::Get().GetTotalDuration() << termcolor::reset << std::endl;
+            << termcolor::magenta << TimeDurations::Get().GetTotalDuration() << termcolor::reset << "\n" << std::flush;  // AJB: flush代替endl减少IO开销
 
   auto inv = std::adjacent_find(merged_keys.begin(), merged_keys.end(),
                                 [](const T& a, const T& b) { return b < a; });
   if (inv != merged_keys.end()) {
     size_t pos = std::distance(merged_keys.begin(), inv);
-    printf("[ERROR] RunCpuMergeBenchmark: Invalid order at index %zu.\n", pos);
+    fprintf(stderr, "[ERROR] Run  // AJB: stderr代替stdoutCpuMergeBenchmark: Invalid order at index %zu.\n", pos);
   }
 }
 
 static bool ValidateSettings(const Settings& s) {
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidNumElements(s.num_elements) ||
       !OptionsLimits::IsValidNumThreads(s.num_threads)) return false;
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidCpuMergeAlgorithm(s.cpu_merge_algorithm) ||
       !OptionsLimits::IsValidChunkCount(s.chunk_count)) return false;
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidType(s.key_type) || !OptionsLimits::IsValidType(s.value_type)) return false;
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidRandomSeed(s.random_seed)) return false;
   return true;
 }
@@ -158,6 +171,7 @@ int main(int argc, char* argv[]) {
   options.add_options()("zip", "zips the keys and values", cxxopts::value<bool>()->default_value("false"));
   options.add_options()("help", "shows the help", cxxopts::value<bool>()->default_value("false"));
 
+  // AJB: 命令行参数解析
   cxxopts::ParseResult parse_result = options.parse(argc, argv);
 
   Settings s = {parse_result["num_elements"].as<size_t>(),

@@ -1,4 +1,5 @@
 #pragma once
+#include "common/ajb_debug_infra.cuh"
 // =============================================================================
 // memory_allocator.cuh — Pinned/device memory pool (AJB-instrumented)
 // AJB adaptation: allocation/deallocation counting, peak usage tracking,

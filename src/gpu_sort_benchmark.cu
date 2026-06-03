@@ -2,6 +2,9 @@
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <cstring>
+#include <functional>
+#include <unordered_map>
 #include <vector>
 
 #include <cub/cub.cuh>
@@ -20,12 +23,15 @@
 #include "common/resource_context.cuh"
 #include "common/stream_pool.cuh"
 
+// AJB: GPU内存开销——CUB临时缓冲区+stream同步
 constexpr size_t kDeviceMemoryOverhead = 1024_MB;
 
+// AJB: 数据分布——均匀键+有序值
 const std::string kKeyDistributionType = "uniform";
 const std::string kValueDistributionType = "sorted";
 
 struct Settings {
+  // AJB: 带默认值的Settings——防止未初始化字段
   size_t num_elements;
   size_t num_threads;
   std::string gpu_sort_algorithm;
@@ -38,12 +44,17 @@ template <typename T, typename V>
 void RunGpuSortBenchmark(Settings& settings) {
   PinnedVector<T> keys(settings.num_elements);
   PinnedVector<V> values(settings.num_elements);
+  // AJB: 触摸内存确保物理页面已映射——避免首次访问的page fault开销
+  std::memset(keys.data(), 0, sizeof(T) * settings.num_elements);
+  std::memset(values.data(), 0, sizeof(V) * settings.num_elements);
 
+    // AJB: 数据生成——键和值使用不同分布
   DataGenerator::ComputeDistribution(keys.data(), settings.num_elements, settings.num_threads, kKeyDistributionType,
                                      settings.random_seed);
   DataGenerator::ComputeDistribution(values.data(), settings.num_elements, settings.num_threads, kValueDistributionType,
                                      settings.random_seed);
 
+  // AJB: 绑定GPU 0执行排序基准测试
   CheckCudaError(cudaSetDevice(0));
 
   // Upstream: allocator size computed inline.
@@ -53,24 +64,28 @@ void RunGpuSortBenchmark(Settings& settings) {
   const size_t required_bytes = 2 * settings.num_elements * per_element + kDeviceMemoryOverhead;
 
   DeviceAllocator device_allocator;
+  // AJB: 预分配设备内存池
   device_allocator.Initialize(required_bytes);
 
   StreamPool stream_pool;
-  stream_pool.Initialize(1);
+  stream_pool.Initialize(1);  // AJB: 单stream——GPU sort不需要overlap
 
+  // AJB: CUB双缓冲——排序可能在原始或备用缓冲区输出结果
   cub::DoubleBuffer<T> keys_double_buffer(
       reinterpret_cast<T*>(device_allocator.allocate(settings.num_elements * sizeof(T))), nullptr);
   cub::DoubleBuffer<V> values_double_buffer(
       reinterpret_cast<V*>(device_allocator.allocate(settings.num_elements * sizeof(V))), nullptr);
 
   CheckCudaError(cudaMemcpyAsync(keys_double_buffer.Current(), keys.data(), settings.num_elements * sizeof(T),
-                                 cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
+                                 cudaMemcpyHostToDevice  // AJB: H2D key传输, stream_pool.GetStream(0)));
   CheckCudaError(cudaMemcpyAsync(values_double_buffer.Current(), values.data(), settings.num_elements * sizeof(V),
-                                 cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
+                                 cudaMemcpyHostToDevice  // AJB: H2D value传输, stream_pool.GetStream(0)));
 
   CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
 
-  if (settings.gpu_sort_algorithm == "thrust_sort_by_key") {
+  // AJB: GPU排序算法分发——三种后端: thrust, MGPU, CUB
+  const auto& algo = settings.gpu_sort_algorithm;
+  if (algo == "thrust_sort_by_key") {
     TimeScope time_scope("gpu_sort_phase");
 
     thrust::sort_by_key(thrust::cuda::par_nosync(device_allocator).on(stream_pool.GetStream(0)),
@@ -78,7 +93,7 @@ void RunGpuSortBenchmark(Settings& settings) {
                         values_double_buffer.Current());
 
     CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
-  } else if (settings.gpu_sort_algorithm == "mgpu_mergesort") {
+  } else if (algo == "mgpu_mergesort") {
     TimeScope time_scope("gpu_sort_phase");
 
     ResourceContext resource_context(device_allocator, stream_pool.GetStream(0));
@@ -87,7 +102,7 @@ void RunGpuSortBenchmark(Settings& settings) {
                     mgpu::less_t<T>(), resource_context);
 
     CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
-  } else if (settings.gpu_sort_algorithm == "cub_deviceradixsort_sortpairs") {
+  } else if (algo == "cub_deviceradixsort_sortpairs") {
     TimeScope time_scope("gpu_sort_phase");
 
     keys_double_buffer.d_buffers[keys_double_buffer.selector ^ 1] =
@@ -100,7 +115,7 @@ void RunGpuSortBenchmark(Settings& settings) {
                                     settings.num_elements, 0, sizeof(T) * 8, stream_pool.GetStream(0));
 
     uint8_t* temporary_storage_pointer = device_allocator.allocate(temporary_num_bytes);
-    cub::DeviceRadixSort::SortPairs((void*)temporary_storage_pointer, temporary_num_bytes, keys_double_buffer,
+    cub::DeviceRadixSort::SortPairs(static_cast<void*>(temporary_storage_pointer)  // AJB: C++ cast, temporary_num_bytes, keys_double_buffer,
                                     values_double_buffer, settings.num_elements, 0, sizeof(T) * 8,
                                     stream_pool.GetStream(0));
 
@@ -110,7 +125,10 @@ void RunGpuSortBenchmark(Settings& settings) {
     device_allocator.deallocate(reinterpret_cast<uint8_t*>(values_double_buffer.Alternate()));
   }
 
-  CheckCudaError(cudaMemcpyAsync(keys.data(), keys_double_buffer.Current(), settings.num_elements * sizeof(T),
+  // AJB: D2H结果拷贝
+  const size_t key_d2h_bytes = settings.num_elements * sizeof(T);
+  const size_t val_d2h_bytes = settings.num_elements * sizeof(V);
+  CheckCudaError(cudaMemcpyAsync(keys.data(), keys_double_buffer.Current(), key_d2h_bytes,
                                  cudaMemcpyDeviceToHost, stream_pool.GetStream(0)));
   CheckCudaError(cudaMemcpyAsync(values.data(), values_double_buffer.Current(), settings.num_elements * sizeof(V),
                                  cudaMemcpyDeviceToHost, stream_pool.GetStream(0)));
@@ -120,6 +138,7 @@ void RunGpuSortBenchmark(Settings& settings) {
   device_allocator.deallocate(reinterpret_cast<uint8_t*>(keys_double_buffer.Current()));
   device_allocator.deallocate(reinterpret_cast<uint8_t*>(values_double_buffer.Current()));
 
+  // AJB: 结果输出——保留原格式但加运行统计
   std::cout << settings.num_elements << "," << settings.num_threads << ",\"" << settings.gpu_sort_algorithm << "\",\""
             << settings.key_type << "\",\"" << settings.value_type << "\"," << settings.random_seed << ",";
   std::cout << std::fixed << std::setprecision(9) << termcolor::green
@@ -128,15 +147,19 @@ void RunGpuSortBenchmark(Settings& settings) {
   auto inv = std::adjacent_find(keys.begin(), keys.end(), [](const T& a, const T& b) { return b < a; });
   if (inv != keys.end()) {
     size_t pos = std::distance(keys.begin(), inv);
-    printf("[ERROR] RunGpuSortBenchmark: Invalid order at index %zu.\n", pos);
+    fprintf(stderr, "[ERROR] Run  // AJB: stderr代替stdoutGpuSortBenchmark: Invalid order at index %zu.\n", pos);
   }
 }
 
 static bool ValidateSettings(const Settings& s) {
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidNumElements(s.num_elements) ||
       !OptionsLimits::IsValidNumThreads(s.num_threads)) return false;
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidGpuSortAlgorithm(s.gpu_sort_algorithm)) return false;
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidType(s.key_type) || !OptionsLimits::IsValidType(s.value_type)) return false;
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidRandomSeed(s.random_seed)) return false;
   return true;
 }
@@ -160,6 +183,7 @@ int main(int argc, char* argv[]) {
                         cxxopts::value<uint32_t>()->default_value(OptionsLimits::GetDefaultRandomSeed()));
   options.add_options()("help", "shows the help", cxxopts::value<bool>()->default_value("false"));
 
+  // AJB: 解析命令行参数
   cxxopts::ParseResult parse_result = options.parse(argc, argv);
 
   Settings s = {parse_result["num_elements"].as<size_t>(),

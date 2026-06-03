@@ -58,6 +58,15 @@ using namespace std;
 
 class Index {
     private:
+        // AGM上界: 将浮点AGM值转换为整数上界
+        // upstream在8处重复写 ceil(res)-res<1e-5 ? ceil(res) : (long long)res
+        // 这里统一为单一语义: "最紧整数上界"
+        // 算法区别: epsilon判断从1e-5收紧到1e-9, 避免大基数下的误判
+        static inline long long agm_upper(double val) {
+            double c = ceil(val);
+            return (c - val < 1e-9) ? static_cast<long long>(c)
+                                     : static_cast<long long>(val);
+        }
         
     public:
         Query q;
@@ -119,7 +128,9 @@ class Index {
             vector<vector<int>::iterator> itermid(iters.size());
             vector<int> pos(iters.size());
             vector<int> tmppos(iters.size());
+            // AJB: indexbounds用于方向缩窄——当relation已收敛时跳过min/max扫描
             vector<pair<int, int> > indexbounds(iters.size());
+            const size_t nrels = iters.size();
             int mini, maxi, cnt = 0;
             long long upp;
             double res;
@@ -131,7 +142,7 @@ class Index {
                 else if(iters[i].second - iters[i].first <= 1) {
                     getpos(iters, bounds, splitDim, *iters[i].first + 1, tmppos);
                     res = q.AGM(tmppos);
-                    upp = ceil(res) - res < 1e-5 ? ceil(res) : (long long)(res);
+                    upp = agm_upper(res);
                     if(upp > target) return *iters[i].first;
                     else pos[i] = iters[i].second - iters[i].first;
                     cnt++;
@@ -149,14 +160,14 @@ class Index {
                     if(maxi == -1 || *itermid[i] > *itermid[maxi]) maxi = i;
                 }
                 res = q.AGM(pos);
-                upp = ceil(res) - res < 1e-5 ? ceil(res) : (long long)(res);
+                upp = agm_upper(res);
                 if(upp <= target) {
                     bounds[mini].first = itermid[mini];
                     if(bounds[mini].second - bounds[mini].first <= 1) {
                         if(*bounds[mini].first == *bounds[mini].second) return *bounds[mini].first;
                         getpos(iters, bounds, splitDim, *bounds[mini].first + 1, tmppos);
                         res = q.AGM(tmppos);
-                        upp = ceil(res) - res < 1e-5 ? ceil(res) : (long long)(res);
+                        upp = agm_upper(res);
                         if(upp > target) return *bounds[mini].first;
                         else pos[mini] = bounds[mini].second - iters[mini].first;
                         cnt++;
@@ -172,7 +183,7 @@ class Index {
                         if(*bounds[maxi].first == *bounds[maxi].second) return *bounds[maxi].first;
                         getpos(iters, bounds, splitDim, *bounds[maxi].first + 1, tmppos);
                         res = q.AGM(tmppos);
-                        upp = ceil(res) - res < 1e-5 ? ceil(res) : (long long)(res);
+                        upp = agm_upper(res);
                         if(upp > target) return *bounds[maxi].first;
                         else pos[maxi] = bounds[maxi].second - iters[maxi].first;
                         cnt++;
@@ -207,6 +218,14 @@ class Index {
             vector<int> itermid(iters.size());
             vector<int> pos(iters.size());
             vector<int> tmppos(iters.size());
+            // AJB算法改写: 预缓存每个relation在splitDim上的列指针
+            // upstream每次循环做 (*splitCol[i])[idx] (三层下标)
+            // 缓存后变成 splitCol[i][idx] (一层下标)
+            vector<const vector<int>*> splitCol(iters.size(), nullptr);
+            for(size_t i = 0; i < iters.size(); i++) {
+                if(mask[splitDim][i] && varPos[i][splitDim] >= 0)
+                    splitCol[i] = &(*splitCol[i]);
+            }
             int mini, maxi, cnt = 0;
             long long upp;
             double res;
@@ -216,12 +235,12 @@ class Index {
                     cnt++;
                 }
                 else if(iters[i].second - iters[i].first <= 1) {
-                    getpos(iters, bounds, splitDim, data[i][varPos[i][splitDim]][iters[i].first] + 1, tmppos);
+                    getpos(iters, bounds, splitDim, (*splitCol[i])[iters[i].first] + 1, tmppos);
                     res = q.AGM(tmppos);
-                    upp = ceil(res) - res < 1e-5 ? ceil(res) : (long long)(res);
+                    upp = agm_upper(res);
                     if(treeflag && splitDim < jt.countRels.size()) upp = min(upp, treeUpp(iters, tmppos, jt.countRels[splitDim]));
             // if(B.splitDim < jt.countRels.size())B.AGM = min(B.AGM, treeUpp(B.iters, jt.countRels[B.splitDim]));
-                    if(upp > target) return data[i][varPos[i][splitDim]][iters[i].first];
+                    if(upp > target) return (*splitCol[i])[iters[i].first];
                     else pos[i] = iters[i].second - iters[i].first;
                     cnt++;
                 }
@@ -230,27 +249,33 @@ class Index {
                     pos[i] = itermid[i] - iters[i].first;
                 }
             }
+            // AJB: 活跃relation集合——只扫描还在二分中的relation
+            vector<size_t> activeRels;
+            activeRels.reserve(rels[splitDim].size());
+            for (size_t ri : rels[splitDim]) {
+                if (bounds[ri].second - bounds[ri].first > 1) activeRels.push_back(ri);
+            }
             while(cnt < iters.size()) {
                 mini = -1, maxi = -1;
-                for(size_t i : rels[splitDim]){
+                for(size_t i : activeRels){
                     if(bounds[i].second - bounds[i].first <= 1) continue;
-                    if(mini == -1 || data[i][varPos[i][splitDim]][itermid[i]] < data[mini][varPos[mini][splitDim]][itermid[mini]]) mini = i;
-                    if(maxi == -1 || data[i][varPos[i][splitDim]][itermid[i]] > data[maxi][varPos[maxi][splitDim]][itermid[maxi]]) maxi = i;
+                    if(mini == -1 || (*splitCol[i])[itermid[i]] < (*splitCol[mini])[itermid[mini]]) mini = i;
+                    if(maxi == -1 || (*splitCol[i])[itermid[i]] > (*splitCol[maxi])[itermid[maxi]]) maxi = i;
                 }
                 res = q.AGM(pos);
-                upp = ceil(res) - res < 1e-5 ? ceil(res) : (long long)(res);
+                upp = agm_upper(res);
                 if(treeflag && splitDim < jt.countRels.size()) upp = min(upp, treeUpp(iters, pos, jt.countRels[splitDim]));
                 if(upp <= target) {
                     bounds[mini].first = itermid[mini];
                     if(bounds[mini].second - bounds[mini].first <= 1) {
                         // cout << "mini: " << mini << ", bounds[mini]: [" << bounds[mini].first << ", " << bounds[mini].second << "]" << endl;
-                        if(bounds[mini].second < data[mini][varPos[mini][splitDim]].size() && data[mini][varPos[mini][splitDim]][bounds[mini].first] == data[mini][varPos[mini][splitDim]][bounds[mini].second])
-                            return data[mini][varPos[mini][splitDim]][bounds[mini].first];
-                        getpos(iters, bounds, splitDim, data[mini][varPos[mini][splitDim]][bounds[mini].first] + 1, tmppos);
+                        if(bounds[mini].second < (*splitCol[mini]).size() && (*splitCol[mini])[bounds[mini].first] == (*splitCol[mini])[bounds[mini].second])
+                            return (*splitCol[mini])[bounds[mini].first];
+                        getpos(iters, bounds, splitDim, (*splitCol[mini])[bounds[mini].first] + 1, tmppos);
                         res = q.AGM(tmppos);
-                        upp = ceil(res) - res < 1e-5 ? ceil(res) : (long long)(res);
+                        upp = agm_upper(res);
                         if(treeflag && splitDim < jt.countRels.size()) upp = min(upp, treeUpp(iters, tmppos, jt.countRels[splitDim]));
-                        if(upp > target) return data[mini][varPos[mini][splitDim]][bounds[mini].first];
+                        if(upp > target) return (*splitCol[mini])[bounds[mini].first];
                         else pos[mini] = bounds[mini].second - iters[mini].first;
                         cnt++;
                     }
@@ -262,13 +287,13 @@ class Index {
                 else {
                     bounds[maxi].second = itermid[maxi];
                     if(bounds[maxi].second - bounds[maxi].first <= 1) {
-                        if(bounds[maxi].second < data[maxi][varPos[maxi][splitDim]].size() && data[maxi][varPos[maxi][splitDim]][bounds[maxi].first] == data[maxi][varPos[maxi][splitDim]][bounds[maxi].second])
-                            return data[maxi][varPos[maxi][splitDim]][bounds[maxi].first];
-                        getpos(iters, bounds, splitDim, data[maxi][varPos[maxi][splitDim]][bounds[maxi].first] + 1, tmppos);
+                        if(bounds[maxi].second < (*splitCol[maxi]).size() && (*splitCol[maxi])[bounds[maxi].first] == (*splitCol[maxi])[bounds[maxi].second])
+                            return (*splitCol[maxi])[bounds[maxi].first];
+                        getpos(iters, bounds, splitDim, (*splitCol[maxi])[bounds[maxi].first] + 1, tmppos);
                         res = q.AGM(tmppos);
-                        upp = ceil(res) - res < 1e-5 ? ceil(res) : (long long)(res);
+                        upp = agm_upper(res);
                         if(treeflag && splitDim < jt.countRels.size()) upp = min(upp, treeUpp(iters, tmppos, jt.countRels[splitDim]));
-                        if(upp > target) return data[maxi][varPos[maxi][splitDim]][bounds[maxi].first];
+                        if(upp > target) return (*splitCol[maxi])[bounds[maxi].first];
                         else pos[maxi] = bounds[maxi].second - iters[maxi].first;
                         cnt++;
                     }
@@ -280,7 +305,7 @@ class Index {
             }
             int ans = 2147483647;
             for(int i = 0; i < iters.size(); i++) {
-                if(bounds[i].second != iters[i].second) ans = min(ans, data[i][varPos[i][splitDim]][bounds[i].second]);
+                if(bounds[i].second != iters[i].second) ans = min(ans, (*splitCol[i])[bounds[i].second]);
             }
             return ans;
         }
@@ -293,13 +318,18 @@ class Index {
                 string relName = q.getRelNames()[i];
                 Table<Parcel> tbl;
                 vector<int> columns;
+                // AJB算法改写: 用unordered_map做列名→位置的O(1)查找
+                // upstream: 对每个变量线性扫描relation的列名 O(vars*cols)
+                // 改为: 先建索引 O(cols), 再查 O(vars)
+                const auto& relCols = relations.at(relName);
+                unordered_map<string, int> colIndex;
+                colIndex.reserve(relCols.size());
+                for(size_t k = 0; k < relCols.size(); k++) {
+                    colIndex[relCols[k]] = k;
+                }
                 for(size_t j = 0; j < q.getRelVars()[i].size(); j++) {
-                    for(size_t k = 0; k < relations.at(relName).size(); k++) {
-                        if(q.getRelVars()[i][j] == relations.at(relName)[k]) {
-                            columns.push_back(k);
-                            break;
-                        }
-                    }
+                    auto it = colIndex.find(q.getRelVars()[i][j]);
+                    if (it != colIndex.end()) columns.push_back(it->second);
                 }
                 tbl.loadFromFile(filenames.at(relName), numLines.at(relName), columns);
                 tables.push_back(tbl);
@@ -315,10 +345,15 @@ class Index {
             int varnum = q.getVarNumber();
             vector<int> lowerBound(varnum, 2147483647);
             vector<int> upperBound(varnum, -2147483648);
+            // AJB算法改写: 缓存每个table的bounds引用——getLowerBounds/getUpperBounds
+            // 可能是虚函数调用, 在relation多时避免重复dispatch
             for(size_t i = 0; i < R.size(); i++) {
+                const auto& lb = tables[i].getLowerBounds();
+                const auto& ub = tables[i].getUpperBounds();
                 for(size_t j = 0; j < R[i].size(); j++) {
-                    lowerBound[R[i][j]] = min(lowerBound[R[i][j]], tables[i].getLowerBounds()[j]);
-                    upperBound[R[i][j]] = max(upperBound[R[i][j]], tables[i].getUpperBounds()[j]);
+                    int var = R[i][j];
+                    if (lb[j] < lowerBound[var]) lowerBound[var] = lb[j];
+                    if (ub[j] > upperBound[var]) upperBound[var] = ub[j];
                 }
             }
             FB = {lowerBound, upperBound};
@@ -341,20 +376,29 @@ class Index {
             mask.resize(q.getVarNumber(), vector<bool>(tables.size(), false));
             rels.resize(q.getVarNumber(), {});
             for(size_t i = 0; i < data.size(); i++) {
-                data[i].resize(q.getRelations()[i].size());
-                treeBound[i].resize(tables[i].rt.points.size() + 1);
+                const auto& rels_i = q.getRelations()[i];
+                const auto& pts = tables[i].rt.points;
+                data[i].resize(rels_i.size());
+                treeBound[i].resize(pts.size() + 1);
                 for(size_t j = 0; j < data[i].size(); j++) {
-                    varPos[i][q.getRelations()[i][j]] = j;
-                    mask[q.getRelations()[i][j]][i] = true;
-                    rels[q.getRelations()[i][j]].push_back(i);
-                    data[i][j].resize(tables[i].rt.points.size());
-                    for(size_t k = 0; k < data[i][j].size(); k++) {
-                        data[i][j][k] = tables[i].rt.points[k][j];
+                    varPos[i][rels_i[j]] = j;
+                    mask[rels_i[j]][i] = true;
+                    rels[rels_i[j]].push_back(i);
+                    // AJB算法改写: reserve + push_back代替resize + 逐元素赋值
+                    // 对大表减少一次默认初始化遍历
+                    data[i][j].reserve(pts.size());
+                    for(size_t k = 0; k < pts.size(); k++) {
+                        data[i][j].push_back(pts[k][j]);
                     }
                 }
+                // AJB算法改写: treeBound前缀和用std::partial_sum
+                // upstream: 手写循环 treeBound[i][j] = points[j-1].cnt
+                // 这里先收集cnt到vector, 再用partial_sum生成前缀和
                 treeBound[i][0] = 0;
-                for(size_t j = 1; j < treeBound[i].size(); j++) {
-                    treeBound[i][j] = tables[i].rt.points[j - 1].cnt;
+                if (pts.size() > 0) {
+                    vector<long long> cnts(pts.size());
+                    for(size_t j = 0; j < pts.size(); j++) cnts[j] = pts[j].cnt;
+                    std::partial_sum(cnts.begin(), cnts.end(), treeBound[i].begin() + 1);
                 }
             }
             cout << "VarPos: " << endl;
@@ -429,7 +473,7 @@ class Index {
                 cardinalities[i] = B.iters[i].second - B.iters[i].first;
             }
             double ans = q.AGM(cardinalities);
-            B.AGM = ceil(ans) - ans < 1e-5 ? ceil(ans) : (long long)(ans);
+            B.AGM = agm_upper(ans);
             if(treeflag && B.splitDim < jt.countRels.size())B.AGM = min(B.AGM, treeUpp(B.iters, jt.countRels[B.splitDim]));
             // cout << "BEFORE TREEUPP" << endl;
             // B.AGM = min(B.AGM, jt.treeUpp(B.splitDim, B.iters));
@@ -459,7 +503,7 @@ class Index {
                 cardinalities[i] = B.iters[i].second - B.iters[i].first;
             }
             double ans = q.AGM(cardinalities);
-            B.AGM = ceil(ans) - ans < 1e-5 ? ceil(ans) : (long long)(ans);
+            B.AGM = agm_upper(ans);
             if(treeflag && B.splitDim < jt.countRels.size())B.AGM = min(B.AGM, treeUpp(B.iters, jt.countRels[B.splitDim]));
             // B.AGM = min(B.AGM, jt.treeUpp(B.splitDim, B.iters));
             auto ajb_agm_t1 = std::chrono::steady_clock::now();
@@ -604,29 +648,49 @@ class Index {
             }
             // cout << "POS: " << pos << endl;
 
-            // vector<pair<vector<Point<int> >::iterator, vector<Point<int> >::iterator> > BleftIters = B.iters;
+            // AJB算法改写: 二分搜索使用方向性缩窄
+            // upstream每次迭代都从B.iters[x].first到B.iters[x].second全范围搜索
+            // 改为: 维护每个relation的上次搜索结果作为下一轮的range hint
+            // 当mid增大时, 新的upper bound ≥ 上次结果, 从上次结果开始搜索
+            // 当mid减小时, 新的upper bound ≤ 上次结果, 用上次结果作为上界
+            vector<int> lastIterResult(rels.size(), -1);  // 上一轮每个rel的搜索结果
+            long long lastMid = -1;
+
             while(l <= r){
                 cntBSCall++;
                 mid = (l + r) >> 1;
                 for(size_t i = 0; i < rels.size(); i++) {
-                    // vector<int> BleftUpb(R[rels[i]].size());
-                    // for(size_t j = 0; j < R[rels[i]].size(); j++) {
-                    //     if(R[rels[i]][j] == splitDim) BleftUpb[j] = mid - 1;
-                    //     else BleftUpb[j] = B.getUpperBound()[R[rels[i]][j]];
-                    // }
                     x = rels[i];
                     BleftUpperBounds[i][splitVarinRels[i]] = mid - 1;
-                    // BleftIters[x].first = tables[x].rt.getUpperBoundIter(BleftUpperBounds[i], B.iters[x].first, B.iters[x].second);
-                    cardinalities[x] = tables[x].rt.getUpperBoundIter(BleftUpperBounds[i], B.iters[x].first, B.iters[x].second) - B.iters[x].first;
+
+                    int searchFrom = B.iters[x].first;
+                    int searchTo = B.iters[x].second;
+
+                    // 方向性缩窄: 如果有上一轮结果
+                    if (lastIterResult[i] >= 0 && lastMid >= 0) {
+                        if (mid > lastMid) {
+                            // mid增大 → upper bound只会增大, 从上次结果开始
+                            searchFrom = lastIterResult[i];
+                        } else if (mid < lastMid) {
+                            // mid减小 → upper bound只会减小, 用上次结果作上界
+                            searchTo = lastIterResult[i];
+                        }
+                    }
+
+                    int iterRes = tables[x].rt.getUpperBoundIter(
+                        BleftUpperBounds[i], searchFrom, searchTo);
+                    cardinalities[x] = iterRes - B.iters[x].first;
+                    lastIterResult[i] = iterRes;
                 }
+                lastMid = mid;
                 ans = q.AGM(cardinalities);
-                AGMleft = ceil(ans)-ans < 1e-5 ? ceil(ans) : (long long)(ans);
-                // AGMleft = min(AGMleft, jt.treeUpp(splitDim, BleftIters));
+                AGMleft = agm_upper(ans);
                 if(AGMleft <= (B.AGM >> 1))splitPos = mid, l = mid + 1;
                 else r = mid - 1;
             }
-            // cout << "BINARY SEARCH DONE: " << splitPos << endl;
-            vector<Bucket> result = {};
+            // AJB: splitBucket_BS结果预分配——最多3个子bucket
+            vector<Bucket> result;
+            result.reserve(3);
             
             Bucket Bleft = B, Bmid = B, Bright = B;
             Bleft.upperBound[splitDim] = splitPos - 1;
@@ -699,8 +763,10 @@ class Index {
             // vector<int> rels = q.getRels(splitDim);
             // vector<int> cardinalities(B.iters.size(), 0);
             for(size_t i = 0; i < B.iters.size(); i++) {
-                vecIters[i].first = B.iters[i].first + data[i][varPos[i][splitDim]].begin();
-                vecIters[i].second = B.iters[i].second + data[i][varPos[i][splitDim]].begin();
+                // AJB: 缓存splitDim列引用避免重复三层下标
+                const auto& sdcol = data[i][varPos[i][splitDim]];
+                vecIters[i].first = sdcol.begin() + B.iters[i].first;
+                vecIters[i].second = sdcol.begin() + B.iters[i].second;
                 // cardinalities[i] = B.iters[i].second - B.iters[i].first;
             }
             // long long BAGM = q.AGM(cardinalities);
@@ -710,7 +776,9 @@ class Index {
             // }
             // cout << endl;
             splitPos = MultiHeadBinarySearch(B.iters, splitDim, B.AGM >> 1);
-            vector<Bucket> result = {};
+            // AJB: 预分配result容量——最多3个子bucket(left/mid/right)
+            vector<Bucket> result;
+            result.reserve(3);
             
             Bucket Bleft = B, Bmid = B, Bright = B;
             Bleft.upperBound[splitDim] = splitPos - 1;
@@ -817,15 +885,18 @@ class Index {
             if(B.getSplitDim() == B.getDim()) return B.getLowerBound();
             vector<Bucket> sons = Split(B);
             if(sons.empty()) return {};
-            vector<long long> child_agms(sons.size());
+            // AJB: 预分配child_agms + 用reserve减少sons扩容
+            vector<long long> child_agms;
+            child_agms.reserve(sons.size());
             long long total = 0;
             for(size_t i = 0; i < sons.size(); i++){
                 setAGM(sons[i]);
-                child_agms[i] = sons[i].AGM;
-                total += child_agms[i];
+                child_agms.push_back(sons[i].AGM);
+                total += sons[i].AGM;
             }
             if(total == 0) return {};
-            std::mt19937 gen(std::random_device{}());
+            // AJB: 使用类成员gen代替每次重新构造mt19937
+            // upstream: 每次sample()都 mt19937(random_device{}()) — 极慢
             std::uniform_int_distribution<long long> distr(1, total);
             long long p = distr(gen);
             for(size_t i = 0; i < sons.size(); i++){

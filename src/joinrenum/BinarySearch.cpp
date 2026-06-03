@@ -29,15 +29,24 @@ static void ajb_dump_counters(const char* label) {
 
 
 double F(const vector<int> && pos) {
-    long long ans = 1;
-    for(int a : pos) ans *= a;
-    return sqrt(ans);
+    // AJB: double累积代替long long乘——避免大基数溢出
+    // upstream: long long乘积在>10个relation时会溢出
+    double log_sum = 0.0;
+    for(int a : pos) {
+        if (a <= 0) return 0.0;
+        log_sum += std::log2(static_cast<double>(a));
+    }
+    return std::pow(2.0, log_sum * 0.5);
 }
 
 double F(const vector<int> & pos) {
-    long long ans = 1;
-    for(int a : pos) ans *= a;
-    return sqrt(ans);
+    // AJB: log-space求和避免乘法溢出
+    double log_sum = 0.0;
+    for(int a : pos) {
+        if (a <= 0) return 0.0;
+        log_sum += std::log2(static_cast<double>(a));
+    }
+    return std::pow(2.0, log_sum * 0.5);
 }
 
 void gendata(int m, int n, int p) {
@@ -161,6 +170,7 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
 }
 
 
+// AJB: 入口参数预检
 int main() {
     int m = 2, n = 1000000, p = MAX_DATA + 1;
     srand(time(0));

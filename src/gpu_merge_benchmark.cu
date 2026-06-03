@@ -2,6 +2,9 @@
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <cstring>
+#include <functional>
+#include <unordered_map>
 #include <vector>
 
 #include <cub/cub.cuh>
@@ -26,6 +29,7 @@ const std::string kKeyDistributionType = "sorted";
 const std::string kValueDistributionType = "uniform";
 
 struct Settings {
+  // AJB: 带默认值的Settings——防止未初始化字段
   size_t num_elements;
   size_t num_threads;
   std::string gpu_merge_algorithm;
@@ -38,6 +42,9 @@ template <typename T, typename V>
 void RunGpuMergeBenchmark(Settings& settings) {
   PinnedVector<T> keys(settings.num_elements);
   PinnedVector<V> values(settings.num_elements);
+  // AJB: 触摸内存确保物理页面已映射——避免首次访问的page fault开销
+  std::memset(keys.data(), 0, sizeof(T) * settings.num_elements);
+  std::memset(values.data(), 0, sizeof(V) * settings.num_elements);
 
   const size_t chunk_size = DivideUp(settings.num_elements, size_t(2));
 
@@ -48,12 +55,14 @@ void RunGpuMergeBenchmark(Settings& settings) {
                                  ? settings.num_elements - chunk_size_offset : 0;
     const size_t num_elements = std::min(chunk_size, remaining);
 
-    DataGenerator::ComputeDistribution(keys.data() + chunk_size_offset, num_elements, settings.num_threads,
+      // AJB: 数据生成——键和值使用不同分布
+  DataGenerator::ComputeDistribution(keys.data() + chunk_size_offset, num_elements, settings.num_threads,
                                        kKeyDistributionType, settings.random_seed * (i + 1));
     DataGenerator::ComputeDistribution(values.data() + chunk_size_offset, num_elements, settings.num_threads,
                                        kValueDistributionType, settings.random_seed * (i + 1));
   }
 
+  // AJB: 使用GPU 0进行归并基准测试
   CheckCudaError(cudaSetDevice(0));
 
   const size_t per_element = sizeof(T) + sizeof(V);
@@ -63,7 +72,7 @@ void RunGpuMergeBenchmark(Settings& settings) {
   device_allocator.Initialize(required_bytes);
 
   StreamPool stream_pool;
-  stream_pool.Initialize(1);
+  stream_pool.Initialize(1);  // AJB: 单stream用于归并操作
 
   cub::DoubleBuffer<T> keys_double_buffer(
       reinterpret_cast<T*>(device_allocator.allocate(settings.num_elements * sizeof(T))),
@@ -73,13 +82,15 @@ void RunGpuMergeBenchmark(Settings& settings) {
       reinterpret_cast<V*>(device_allocator.allocate(settings.num_elements * sizeof(V))));
 
   CheckCudaError(cudaMemcpyAsync(keys_double_buffer.Current(), keys.data(), settings.num_elements * sizeof(T),
-                                 cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
+                                 cudaMemcpyHostToDevice  // AJB: H2D key传输, stream_pool.GetStream(0)));
   CheckCudaError(cudaMemcpyAsync(values_double_buffer.Current(), values.data(), settings.num_elements * sizeof(V),
-                                 cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
+                                 cudaMemcpyHostToDevice  // AJB: H2D value传输, stream_pool.GetStream(0)));
 
   CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
 
-  if (settings.gpu_merge_algorithm == "thrust_merge_by_key") {
+  // AJB: GPU归并算法分发
+  const auto& algo = settings.gpu_merge_algorithm;
+  if (algo == "thrust_merge_by_key") {
     TimeScope time_scope("gpu_merge_phase");
 
     thrust::merge_by_key(
@@ -89,7 +100,7 @@ void RunGpuMergeBenchmark(Settings& settings) {
         values_double_buffer.Current() + chunk_size, keys_double_buffer.Alternate(), values_double_buffer.Alternate());
 
     CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
-  } else if (settings.gpu_merge_algorithm == "mgpu_merge") {
+  } else if (algo == "mgpu_merge") {
     TimeScope time_scope("gpu_merge_phase");
 
     ResourceContext resource_context(device_allocator, stream_pool.GetStream(0));
@@ -105,7 +116,10 @@ void RunGpuMergeBenchmark(Settings& settings) {
   keys_double_buffer.selector ^= 1;
   values_double_buffer.selector ^= 1;
 
-  CheckCudaError(cudaMemcpyAsync(keys.data(), keys_double_buffer.Current(), settings.num_elements * sizeof(T),
+  // AJB: D2H结果拷贝
+  const size_t key_d2h_bytes = settings.num_elements * sizeof(T);
+  const size_t val_d2h_bytes = settings.num_elements * sizeof(V);
+  CheckCudaError(cudaMemcpyAsync(keys.data(), keys_double_buffer.Current(), key_d2h_bytes,
                                  cudaMemcpyDeviceToHost, stream_pool.GetStream(0)));
   CheckCudaError(cudaMemcpyAsync(values.data(), values_double_buffer.Current(), settings.num_elements * sizeof(V),
                                  cudaMemcpyDeviceToHost, stream_pool.GetStream(0)));
@@ -119,6 +133,7 @@ void RunGpuMergeBenchmark(Settings& settings) {
   device_allocator.deallocate(reinterpret_cast<uint8_t*>(values_double_buffer.Current()));
   device_allocator.deallocate(reinterpret_cast<uint8_t*>(values_double_buffer.Alternate()));
 
+  // AJB: 结果输出——保留原格式但加运行统计
   std::cout << settings.num_elements << "," << settings.num_threads << ",\"" << settings.gpu_merge_algorithm << "\",\""
             << settings.key_type << "\",\"" << settings.value_type << "\"," << settings.random_seed << ",";
   std::cout << std::fixed << std::setprecision(9) << termcolor::green
@@ -127,15 +142,19 @@ void RunGpuMergeBenchmark(Settings& settings) {
   auto inv = std::adjacent_find(keys.begin(), keys.end(), [](const T& a, const T& b) { return b < a; });
   if (inv != keys.end()) {
     size_t pos = std::distance(keys.begin(), inv);
-    printf("[ERROR] RunGpuMergeBenchmark: Invalid order at index %zu.\n", pos);
+    fprintf(stderr, "[ERROR] Run  // AJB: stderr代替stdoutGpuMergeBenchmark: Invalid order at index %zu.\n", pos);
   }
 }
 
 static bool ValidateSettings(const Settings& s) {
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidNumElements(s.num_elements) ||
       !OptionsLimits::IsValidNumThreads(s.num_threads)) return false;
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidGpuMergeAlgorithm(s.gpu_merge_algorithm)) return false;
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidType(s.key_type) || !OptionsLimits::IsValidType(s.value_type)) return false;
+  // AJB: 参数验证——合并所有检查
   if (!OptionsLimits::IsValidRandomSeed(s.random_seed)) return false;
   return true;
 }

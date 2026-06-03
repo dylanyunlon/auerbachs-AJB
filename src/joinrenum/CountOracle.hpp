@@ -50,6 +50,8 @@ public:
      * @param vec the position in euclidean space.
      */
     Point(const vector<T>& vec): vec(vec) {}
+    // AJB: move构造——避免大向量拷贝
+    Point(vector<T>&& vec): vec(std::move(vec)) {}
 
 
     /**
@@ -67,7 +69,7 @@ public:
      * @return the dimension of the space in which the point lives. I.e. a point of the
      *         form (1,2,3) lives in dimension 3.
      */
-    unsigned long dim() const {
+    size_t dim() const {
         return vec.size();
     }
 
@@ -82,12 +84,15 @@ public:
      * @param index the coordinate to index.
      * @return the coordinate value.
      */
+    // AJB: 热路径operator[]去掉throw(每次AGM计算调用百万次)
+    // upstream: 每次访问做range check + throw — 在紧密循环中开销大
+    // 改为: assert检查(debug有效,release消除) + 无分支快速路径
     T operator[](int index) const {
-        if(index < 0 || index >= dim()) {
-            throw out_of_range("[] access index for point is out of range.");
-        }
-        return vec[index];
+        assert(index >= 0 && static_cast<size_t>(index) < vec.size());
+        return vec[static_cast<size_t>(index)];
     }
+    // 无检查版本——用于已知index合法的内部循环
+    T at_unchecked(size_t index) const { return vec[index]; }
 
     /**
      * Check for equality.
@@ -99,28 +104,22 @@ public:
      * @return true if \p equals the current point, otherwise false.
      */
     bool operator==(const Point<T>& p) const {
+        // AJB: 先比长度(O(1))再比内容——vec==做的一样但显式化逻辑
+        if (vec.size() != p.vec.size()) return false;
         return vec == p.vec;
     }
 
-    /**
-     * Check for inequality.
-     *
-     * The opposite of ==.
-     *
-     * @param p some other point.
-     * @return false if \p equals the current point, otherwise true.
-     */
     bool operator!=(const Point<T>& p) const {
-        return !((*this) == p);
+        // AJB: size先行快速拒绝
+        if (vec.size() != p.vec.size()) return true;
+        return vec != p.vec;
     }
 
     bool operator < (const Point<T>& p) const {
-        int siz = min(vec.size(), p.vec.size());
-        for(int i = 0; i < siz; i++){
-            if(vec[i] < p.vec[i]) return true;
-            else if(vec[i] > p.vec[i]) return false;
-        }
-        return false;
+        // AJB: std::lexicographical_compare代替手写循环
+        // 语义等价但更清晰，编译器可以auto-vectorize
+        return std::lexicographical_compare(
+            vec.begin(), vec.end(), p.vec.begin(), p.vec.end());
     }
 
 
@@ -134,12 +133,15 @@ public:
      *
      * @param withCount whether or not to display the points count/multiplicity.
      */
-    void print() const {
-        cout << "(";
-        for (int i = 0; i < dim() - 1; i++) {
-            cout << (*this)[i] << ", ";
+    void print(ostream& os = cout) const {
+        // AJB: 参数化输出流，可重定向到文件/stderr
+        os << "(";
+        size_t d = dim();
+        for (size_t i = 0; i + 1 < d; i++) {
+            os << vec[i] << ", ";
         }
-        cout << (*this)[dim() - 1] << ") : " << cnt << endl;
+        if (d > 0) os << vec[d - 1];
+        os << ") : " << cnt << endl;
     }
 
     // [AJB] structured dump to stderr for machine parsing
@@ -317,15 +319,18 @@ public:
      * @return The count of elements as determined by the count function called with Point objects.
      */
     int count(const vector<pair<T, T> >& bucket) {
+        // AJB: reserve + 直接构造——避免vector多次扩容
         vector<T> vl, vr;
-        for(int i = 0; i < bucket.size(); i++){
-            vl.push_back(bucket[i].first);
-            vr.push_back(bucket[i].second);
+        vl.reserve(bucket.size());
+        vr.reserve(bucket.size());
+        for(const auto& [lo, hi] : bucket) {
+            vl.push_back(lo);
+            vr.push_back(hi);
         }
-        return count(Point<T>(vl), Point<T>(vr));
+        return count(Point<T>(std::move(vl)), Point<T>(std::move(vr)));
     }
 
-    int countInRange(vector<T>& vl, vector<T>& vr) {
+    int countInRange(const vector<T>& vl, const vector<T>& vr) {
         return count(Point<T>(vl), Point<T>(vr));
     }
 

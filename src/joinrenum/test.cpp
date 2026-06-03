@@ -52,13 +52,14 @@ int main() {
     unordered_map<string, int> numlines = readNumLines("db/numlines.txt");
     unordered_map<string, vector<string> > relations = readRelations("db/relations.txt");
     
-    unordered_map<string, vector<string> >::iterator it = relations.begin();
+    // AJB: range-based for代替显式iterator遍历
     vector<string> query_rels;
     vector<vector<string> > query_vars;
-    while(it != relations.end()) {
-        query_rels.push_back(it->first);
-        query_vars.push_back(it->second);
-        it++;
+    query_rels.reserve(relations.size());
+    query_vars.reserve(relations.size());
+    for (const auto& [name, vars] : relations) {
+        query_rels.push_back(name);
+        query_vars.push_back(vars);
     }
     for (size_t i = 0; i < query_rels.size(); i++) {
         cout << query_rels[i] << ": ";
@@ -137,7 +138,7 @@ int main() {
     fprintf(stderr, "[AJB_TRACE] REnum-BMITU loop starting, AGM=%d\n", idx.AGM());
     auto start = std::chrono::high_resolution_clock::now();
     auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
+    std::chrono::duration<double, std::milli> elapsed_ms = end - start;
     double last_percentage = 0;
     while(bp.remaining()){
         cnt++;
@@ -148,7 +149,9 @@ int main() {
             if(cntsuccess < step || cntsuccess % step == 0){
             end = std::chrono::high_resolution_clock::now();
             elapsed = end - start;
-            cout << cntsuccess << ", " << cnt << ", " << bp.remaining() << ", " << bp.getPercentage() << ", " << elapsed.count() << endl;
+            // AJB: fprintf代替cout链——避免iostream格式化开销
+            fprintf(stdout, "%d, %d, %lld, %f, %f\n",
+                    cntsuccess, cnt, (long long)bp.remaining(), bp.getPercentage(), elapsed.count());
         }
             if(cntsuccess % 500 == 0) {
                 printInfo(idx);
@@ -180,7 +183,7 @@ int main() {
     // mt19937 gen(rd());
     // auto start = std::chrono::high_resolution_clock::now();
     // auto end = std::chrono::high_resolution_clock::now();
-    // std::chrono::duration<double> elapsed = end - start;
+    // std::chrono::duration<double, std::milli> elapsed_ms = end - start;
     // int pos, j;
     // for(int i = 1; i <= N; i++){
     //     cnt++;

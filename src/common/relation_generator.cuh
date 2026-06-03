@@ -1,4 +1,30 @@
 #pragma once
+#include "common/ajb_debug_infra.cuh"
+
+// AJB: estimate distinct values via sampling (avoids O(n) unique)
+template<typename T>
+static inline size_t ajb_estimate_cardinality(const T* data, size_t n,
+                                               size_t sample_size = 1000) {
+    if (n <= sample_size) {
+        std::vector<T> tmp(data, data + n);
+        std::sort(tmp.begin(), tmp.end());
+        return std::unique(tmp.begin(), tmp.end()) - tmp.begin();
+    }
+    // Reservoir sample then count unique
+    std::vector<T> sample(sample_size);
+    for (size_t i = 0; i < sample_size; ++i) sample[i] = data[i];
+    // LCG sampling for indices beyond sample_size
+    uint64_t lcg = 6364136223846793005ULL;
+    for (size_t i = sample_size; i < n; ++i) {
+        lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+        size_t j = lcg % (i + 1);
+        if (j < sample_size) sample[j] = data[i];
+    }
+    std::sort(sample.begin(), sample.end());
+    size_t uniq = std::unique(sample.begin(), sample.end()) - sample.begin();
+    // Extrapolate: unique_est = n * (sample_unique / sample_size)
+    return static_cast<size_t>((double)uniq / sample_size * n);
+}
 
 #include <string>
 

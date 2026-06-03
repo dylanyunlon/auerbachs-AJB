@@ -1,4 +1,5 @@
 #include<map>
+#include<unordered_map>
 #include<iostream>
 #include<string>
 #include<vector>
@@ -28,7 +29,7 @@ class Query{
         // std::chrono::duration<double> elapsed;
         vector<string> relationNames;
         vector<vector<string> > relationVars;
-        map<string, int> variables;
+        unordered_map<string, int> variables;  // AJB: O(1) lookup replaces O(logN) tree
         vector<string> variableNames;
         vector<vector<int> > relations;
         vector<int> cardinalities;
@@ -37,9 +38,13 @@ class Query{
         glp_prob *lp;
         
         void initRels(){
-            relsofVar = vector<vector<int> >(variables.size(), vector<int>());
-            for(int i = 0; i < relations.size(); i++){
-                for(int j = 0; j < relations[i].size(); j++){
+            // AJB: resize+clear代替重新构造，保留已分配内存
+            relsofVar.resize(variables.size());
+            for(auto& v : relsofVar) v.clear();
+            // 预估每个变量平均出现在2个relation中
+            for(auto& v : relsofVar) v.reserve(2);
+            for(size_t i = 0; i < relations.size(); i++){
+                for(size_t j = 0; j < relations[i].size(); j++){
                     relsofVar[relations[i][j]].push_back(i);
                 }
             }
@@ -50,24 +55,30 @@ class Query{
             // glp_set_prob_name(lp, "relaxed_hypergraph_edge_cover");
             glp_set_obj_dir(lp, GLP_MIN);
 
-            glp_add_cols(lp, relations.size());
-            for (int i = 1; i <= relations.size(); i++) {
-                glp_set_col_name(lp, i, ("r" + std::to_string(i)).c_str());
+            int nrels = static_cast<int>(relations.size());
+            glp_add_cols(lp, nrels);
+            // AJB: 预构建列名避免循环中反复string拼接+c_str()
+            for (int i = 1; i <= nrels; i++) {
+                char colname[16];
+                snprintf(colname, sizeof(colname), "r%d", i);
+                glp_set_col_name(lp, i, colname);
                 glp_set_col_bnds(lp, i, GLP_LO, 0.0, 0.0);
             }
 
             glp_add_rows(lp, variables.size());
-            for(int i = 1; i <= variables.size(); i++){
+            // AJB: VLA → vector (标准C++不允许VLA, upstream用gcc扩展)
+            // 同时缓存relsofVar引用避免拷贝
+            for(size_t i = 1; i <= variables.size(); i++){
                 glp_set_row_name(lp, i, ("v" + std::to_string(i)).c_str());
                 glp_set_row_bnds(lp, i, GLP_LO, 1.0, 0.0);
-                vector<int> rs = relsofVar[i - 1];
-                int ind[rs.size() + 1] = {0};
-                double val[rs.size() + 1] = {0};
-                for(int j = 0; j < rs.size(); j++){
+                const auto& rs = relsofVar[i - 1];  // 引用代替拷贝
+                vector<int> ind(rs.size() + 1, 0);
+                vector<double> val(rs.size() + 1, 0.0);
+                for(size_t j = 0; j < rs.size(); j++){
                     ind[j + 1] = rs[j] + 1;
                     val[j + 1] = 1.0;
                 }
-                glp_set_mat_row(lp, i, rs.size(), ind, val);
+                glp_set_mat_row(lp, i, rs.size(), ind.data(), val.data());
             }
         }
 
@@ -87,17 +98,25 @@ class Query{
             this->relationNames = relationNames;
             this->relationVars = relations;
             this->cardinalities = cardinalities;
+            // AJB: 预估变量数, reserve避免rehash
             int cnt = 0;
-            for(int i = 0; i < relations.size(); i++){
+            size_t est_vars = 0;
+            for(size_t i = 0; i < relations.size(); i++) est_vars += relations[i].size();
+            this->variables.reserve(est_vars);
+            this->variableNames.reserve(est_vars);
+            this->relations.reserve(relations.size());
+            for(size_t i = 0; i < relations.size(); i++){
                 vector<int> relation;
-                for(int j = 0; j < relations[i].size(); j++){
-                    if(this->variables.find(relations[i][j]) == this->variables.end()){
-                        this->variables[relations[i][j]] = cnt++;
+                relation.reserve(relations[i].size());
+                for(size_t j = 0; j < relations[i].size(); j++){
+                    auto [it, inserted] = this->variables.emplace(relations[i][j], cnt);
+                    if(inserted){
+                        cnt++;
                         this->variableNames.push_back(relations[i][j]);
                     }
-                    relation.push_back(this->variables[relations[i][j]]);
+                    relation.push_back(it->second);
                 }
-                this->relations.push_back(relation);
+                this->relations.push_back(std::move(relation));
             }
             initRels();
             initLP();

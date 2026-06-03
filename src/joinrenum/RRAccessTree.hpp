@@ -147,16 +147,17 @@ public:
     vector<long long> children_agms;
     vector<RRAccessTreeNode_Pool*> children_pointers;
     RRAccessTreeNode_Pool(const int bid, const vector<int> && children_bids, const BucketPool &pool) : bid(bid), children_bids(move(children_bids)) {
-        children_agms = vector<long long>(this->children_bids.size());
+        // AJB: reserve代替默认构造
+        children_agms.resize(this->children_bids.size());
         emptySize = pool[bid].AGM;
         // cout << "children_AGMs: ";
-        for(int i = 0; i < children_bids.size(); i++) {
+        for(size_t i = 0; i < children_bids.size(); i++) {  // AJB: size_t循环变量
             children_agms[i] = pool[children_bids[i]].AGM;
             emptySize -= children_agms[i];
             // cout << children_agms[i] << ", ";
         }
         // cout << endl;
-        children_pointers = vector<RRAccessTreeNode_Pool*>(this->children_bids.size(), NULL);
+        children_pointers.assign(this->children_bids.size(), nullptr);  // AJB: assign代替构造
         ajb_rrt_stats.node_creates++;
         ajb_rrt_stats.total_children += this->children_bids.size();
     }
@@ -192,18 +193,20 @@ private:
             // chrono::duration<double> elapsedSplit = endSplit - startSplit;
             // idx.totalSplitTime += elapsedSplit.count();
         }
-        long long emptyright = node->children_buckets.size() > 0 ? getEmptyRight(node->children_buckets[node->children_buckets.size() - 1], node->children_pointers[node->children_pointers.size() - 1]) : 0;
+        long long emptyright = !node->children_buckets.empty() ? getEmptyRight(node->children_buckets.back(), node->children_pointers.back()) : 0;
 
         return node->emptySize + emptyright;
     }
 
     // [AJB] decreaseTrivialLowBound: 递归计算最右路径的空洞, 用于设置trivialInterval下界
     void decreaseTrivialLowBound(Bucket &B, RRAccessTreeNode* &node, long long &lowbound) {
-        if (B.AGM < 0) idx.setAGMandIters(B);
+        // AJB: 叶子检测前置——splitDim比较是O(1), setAGMandIters可能触发Split
         if (B.getSplitDim() == B.getDim()){
+            if (B.AGM < 0) idx.setAGMandIters(B);
             lowbound -= 1 - B.AGM;
             return;
         }
+        if (B.AGM < 0) idx.setAGMandIters(B);
         if (!node) {
             // vector<Bucket> children = idx.Split(B);
             // auto startSplit = chrono::high_resolution_clock::now();
@@ -215,7 +218,8 @@ private:
             // idx.totalSplitTime += elapsedSplit.count();
         }
         lowbound -= node->emptySize;
-        if (node->children_buckets.size() > 0) decreaseTrivialLowBound(node->children_buckets[node->children_buckets.size() - 1], node->children_pointers[node->children_pointers.size() - 1], lowbound);
+        // AJB: .back()代替[size()-1]——避免重复计算size
+        if (!node->children_buckets.empty()) decreaseTrivialLowBound(node->children_buckets.back(), node->children_pointers.back(), lowbound);
 
         return;
     }
@@ -455,13 +459,15 @@ private:
         if(offset + BAGM - node->emptySize < k){
             return false;
         }
-        long long childAGM, temp = 0;
-        for(int i = 0; i < node->children_agms.size() ; i++) {
-            childAGM = node->children_agms[i];
-            if(offset + temp + childAGM >= k) {
-                return RRAccess_HalfCache_basic(k, node->children_bids[i], node->children_pointers[i], childAGM, offset + temp, depth + 1);
+        long long cumulative = 0;
+        // AJB: size_t循环 + 缓存children数量
+        const size_t nc = node->children_agms.size();
+        for(size_t i = 0; i < nc; i++) {
+            long long cagm = node->children_agms[i];
+            if(offset + cumulative + cagm >= k) {
+                return RRAccess_HalfCache_basic(k, node->children_bids[i], node->children_pointers[i], cagm, offset + cumulative, depth + 1);
             }
-            else temp += childAGM;
+            cumulative += cagm;
         }
         return false;
     }
@@ -572,7 +578,7 @@ public:
     pair<long long, long long> trivialInterval;
     vector<pair<long long, long long> > trivialIntervals = vector<pair<long long, long long> >(50);
     BucketPool pool;
-    int numti = 0;
+    int numti = 0;  // AJB: trivial interval计数器
 
     RRAccessTree() {}
 

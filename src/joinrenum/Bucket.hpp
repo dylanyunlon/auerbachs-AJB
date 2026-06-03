@@ -32,11 +32,20 @@ class Bucket {
          *       will be set to the size of the lowerBound vector.
          */
         Bucket(const vector<int> &lowerBound, const vector<int> &upperBound, int splitDim = 0) : lowerBound(lowerBound), upperBound(upperBound), splitDim(splitDim) {
-            while(splitDim < lowerBound.size() && lowerBound[splitDim] == upperBound[splitDim])splitDim++;
+            // AJB: 用std::mismatch找第一个lb!=ub的维度
+            // upstream: while循环逐个比较
+            auto [itL, itU] = std::mismatch(
+                this->lowerBound.begin() + splitDim, this->lowerBound.end(),
+                this->upperBound.begin() + splitDim);
+            this->splitDim = static_cast<int>(itL - this->lowerBound.begin());
         }
 
         void updateSplitDim() {
-            while(splitDim < lowerBound.size() && lowerBound[splitDim] == upperBound[splitDim])splitDim++;
+            // AJB: mismatch代替while循环
+            auto [itL, itU] = std::mismatch(
+                lowerBound.begin() + splitDim, lowerBound.end(),
+                upperBound.begin() + splitDim);
+            splitDim = static_cast<int>(itL - lowerBound.begin());
         }
 
         const vector<int>& getLowerBound() const {
@@ -48,33 +57,22 @@ class Bucket {
         }
 
         void reset(const vector<int> &newLowerBound, const vector<int> &newUpperBound, int newSplitDim = 0) {
-            if(lowerBound.size() != newLowerBound.size() || upperBound.size() != newUpperBound.size()){
-                cout << "Bucket size mismatch @ reset" << endl;
-                lowerBound = newLowerBound;
-                upperBound = newUpperBound;
-            }
-            copy(newLowerBound.begin(), newLowerBound.end(), lowerBound.begin());
-            copy(newUpperBound.begin(), newUpperBound.end(), upperBound.begin());
+            // AJB: assign代替size-check+copy——assign自动处理大小差异
+            lowerBound.assign(newLowerBound.begin(), newLowerBound.end());
+            upperBound.assign(newUpperBound.begin(), newUpperBound.end());
             splitDim = newSplitDim;
             AGM = -1;
-            // this->iters.clear();
-            while(splitDim < lowerBound.size() && lowerBound[splitDim] == upperBound[splitDim])splitDim++;
-            return;
+            updateSplitDim();
         }
 
         void reset(const Bucket &B) {
-            if(lowerBound.size() != B.lowerBound.size() || upperBound.size() != B.upperBound.size()){
-                cout << "Bucket size mismatch @ reset" << endl;
-                lowerBound = B.lowerBound;
-                upperBound = B.upperBound;
-            }
-            copy(B.lowerBound.begin(), B.lowerBound.end(), lowerBound.begin());
-            copy(B.lowerBound.begin(), B.upperBound.end(), upperBound.begin());
+            // AJB: assign自动处理大小差异 + 修正upstream bug
+            // (upstream: copy(B.lowerBound.begin, B.upperBound.end, ...) 混用了源迭代器)
+            lowerBound.assign(B.lowerBound.begin(), B.lowerBound.end());
+            upperBound.assign(B.upperBound.begin(), B.upperBound.end());
             splitDim = B.splitDim;
             AGM = -1;
-            // this->iters.clear();
-            while(splitDim < lowerBound.size() && lowerBound[splitDim] == upperBound[splitDim])splitDim++;
-            return;
+            updateSplitDim();
         }
 
         /**
@@ -97,8 +95,7 @@ class Bucket {
         void replaceSelf(int lower, int upper){
             lowerBound[splitDim] = lower;
             upperBound[splitDim] = upper;
-            while(splitDim < lowerBound.size() && lowerBound[splitDim] == upperBound[splitDim])splitDim++;
-            return;
+            updateSplitDim();
         }
 
         // bool operator==(const Bucket& B) const {
@@ -111,20 +108,25 @@ class Bucket {
         // }
 
         bool operator<(const Bucket& B) const {
-            if (lowerBound.size() != B.getLowerBound().size() || upperBound.size() != B.getUpperBound().size()) {
-                cout << "Bucket size mismatch @ lessEQ" << endl;
-                cout << lowerBound.size() << " != " << B.getLowerBound().size() << "||" << upperBound.size() << " != " << B.getUpperBound().size() << endl;
-                return false;
-            }
-            if (lowerBound < B.getLowerBound()) return true;
-            if (lowerBound > B.getLowerBound()) return false;
-            return upperBound < B.getUpperBound();
+            // AJB: 直接字典序比较——不等维度先按维度数排
+            // upstream: size不等时打印错误+return false(不安全)
+            if (lowerBound.size() != B.lowerBound.size())
+                return lowerBound.size() < B.lowerBound.size();
+            if (lowerBound != B.lowerBound) return lowerBound < B.lowerBound;
+            return upperBound < B.upperBound;
         }
 
         Bucket replace(int lower, int upper) const {
-            Bucket newBucket(lowerBound, upperBound, splitDim);
-            newBucket.replaceSelf(lower, upper);
-            return newBucket;
+            // AJB: 直接构造子bucket，避免先拷贝再修改
+            Bucket nb;
+            nb.lowerBound = lowerBound;
+            nb.upperBound = upperBound;
+            nb.lowerBound[splitDim] = lower;
+            nb.upperBound[splitDim] = upper;
+            nb.splitDim = splitDim;
+            nb.AGM = -1;
+            nb.updateSplitDim();
+            return nb;
         }
 
         void print() const {

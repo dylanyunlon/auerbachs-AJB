@@ -1,4 +1,46 @@
 #pragma once
+#include <algorithm>
+#include <numeric>
+#include "common/ajb_debug_infra.cuh"
+
+// AJB per-pass diagnostics — structured capture, not printf
+struct RadixSortDiag {
+    size_t total_elements = 0;
+    size_t gpu_resize_steps = 0;
+    size_t passes_executed = 0;
+    size_t reduced_buckets_total = 0;
+    size_t fallback_full_sorts = 0;
+    void dump(FILE* out = stderr) const {
+        fprintf(out, "[AJB_RADIX_SUMMARY] elements=%zu resizes=%zu "
+            "passes=%zu reduced_buckets=%zu fallbacks=%zu\n",
+            total_elements, gpu_resize_steps, passes_executed,
+            reduced_buckets_total, fallback_full_sorts);
+    }
+};
+
+// Ceiling division: bit-shift fast path for power-of-2 divisors
+static inline size_t AjbCeilDiv(size_t a, size_t b) {
+    if (b != 0 && (b & (b - 1)) == 0) {
+        return (a + (b - 1)) >> __builtin_ctzll(b);
+    }
+    return (a + b - 1) / b;
+}
+
+// XOR bit-width via __builtin_clz (single instruction on x86/ARM)
+// Upstream uses a while-shift loop for the same computation
+static inline uint32_t AjbXorBitWidth(uint8_t a, uint8_t b) {
+    uint8_t x = a ^ b;
+    return x == 0 ? 0 : (32u - (uint32_t)__builtin_clz((unsigned)x));
+}
+
+// Batch deallocation in LIFO order — matches arena/stack allocators
+static inline void AjbBatchDealloc(DeviceAllocator& alloc,
+                                    std::vector<uint8_t*>& ptrs) {
+    for (auto it = ptrs.rbegin(); it != ptrs.rend(); ++it)
+        alloc.deallocate(*it);
+    ptrs.clear();
+}
+
 // =============================================================================
 // radix_sort.cuh — Multi-GPU radix sort (AJB-instrumented, enhanced)
 //
@@ -92,13 +134,14 @@ size_t DetectSpanningBuckets(DeviceContainers<T, V>& device_containers, HostCont
 static constexpr size_t kMaxBlocksPerKernel = 65535;  // CUDA grid.x上限
 
 size_t GetNumThreadBlocks(size_t num_keys, size_t keys_per_thread, size_t num_threads) {
-  size_t num_key_groups = DivideUp(num_keys, keys_per_thread);
-  size_t num_thread_blocks = DivideUp(num_key_groups, num_threads);
+  size_t num_key_groups = AjbCeilDiv(num_keys, keys_per_thread);
+  size_t num_thread_blocks = AjbCeilDiv(num_key_groups, num_threads);
 
-  // Clamp: 防止超过CUDA grid维度上限
-  if (num_thread_blocks > kMaxBlocksPerKernel) {
-    num_thread_blocks = kMaxBlocksPerKernel;
-  }
+  // Clamp to CUDA grid.x hardware limit
+  num_thread_blocks = std::min(num_thread_blocks, kMaxBlocksPerKernel);
+
+  AJB_SNAP("GetNumThreadBlocks", "keys=%zu kpt=%zu threads=%zu -> groups=%zu blocks=%zu",
+            num_keys, keys_per_thread, num_threads, num_key_groups, num_thread_blocks);
 
   return num_thread_blocks;
 }
@@ -117,10 +160,15 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
   size_t num_fillers = (num_elements % gpus.size() != 0) ? (gpus.size() - num_elements % gpus.size()) : 0;
   size_t chunk_size = (num_elements + num_fillers) / gpus.size();
 
+  size_t ajb_gpu_resizes = 0;
   while (chunk_size < num_fillers && gpus.size() > 1) {
+    size_t old_sz = gpus.size();
     gpus.resize(gpus.size() / 2);
     num_fillers = (num_elements % gpus.size() != 0) ? (gpus.size() - num_elements % gpus.size()) : 0;
     chunk_size = (num_elements + num_fillers) / gpus.size();
+    ajb_gpu_resizes++;
+    AJB_SNAP("RadixSort", "GPU resize %zu->%zu: chunk=%zu fillers=%zu",
+             old_sz, gpus.size(), chunk_size, num_fillers);
   }
 
   size_t num_partition_passes_needed = max_num_partition_passes;
@@ -200,7 +248,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
       host_containers.AssignNewHistogramBuffer(gpu, BucketId());
       device_containers.AssignNewHistogramBuffer(gpu, BucketId());
 
-      reduced_sorting_buckets[g].reserve(num_gpus * kMaxNumBucketsForReducedSorting);
+      // AJB: 预估更紧的容量——实际spanning bucket通常远少于最大值
+      reduced_sorting_buckets[g].reserve(std::min(num_gpus * kMaxNumBucketsForReducedSorting, size_t(kNumBuckets)));
     }
 
     for (size_t iteration = 0; iteration < sizeof(T); ++iteration) {
@@ -227,26 +276,24 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         DeviceAllocator& device_allocator = resource_manager.GetDeviceAllocator(gpu);
         StreamPool& stream_pool = resource_manager.GetStreamPool(gpu);
 
-        size_t g_chunk_size = chunk_size - (g == num_gpus - 1 ? num_fillers : 0);
+        // AJB: 用std::clamp防止underflow (chunk_size < num_fillers时)
+        size_t g_chunk_size = (g == num_gpus - 1) ? std::max(chunk_size, num_fillers) - num_fillers : chunk_size;
 
         if (iteration == 0) {
+          // AJB: 合并两个连续的iteration==0块——H2D传输+直方图计算
           CheckCudaError(cudaMemcpyAsync(resource_manager.GetKeys(gpu), in_keys + (chunk_size * g),
                                          sizeof(T) * g_chunk_size, cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
-
           CheckCudaError(cudaMemcpyAsync(resource_manager.GetValues(gpu), in_values + (chunk_size * g),
                                          sizeof(V) * g_chunk_size, cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
-
           CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(2)));
           CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
-        }
 
-        if (iteration == 0) {
           DeviceHistograms* hist = device_containers.GetHistograms(gpu, BucketId());
           ComputeHistogram<T><<<num_thread_blocks, kNumRadixThreads, 0, stream_pool.GetStream(0)>>>(
               resource_manager.GetKeys(gpu), hist->GetBlockLocalHistograms(), g_chunk_size, keys_per_thread,
               (sizeof(T) - iteration) * kNumRadixBits);
           CheckCudaLaunchError();
-          AggregateHistogram<<<(num_thread_blocks / kNumBlockHistogramsToAggregate) + 1, kNumRadixThreads, 0,
+          AggregateHistogram<<<AjbCeilDiv(num_thread_blocks, kNumBlockHistogramsToAggregate), kNumRadixThreads, 0,
                                stream_pool.GetStream(0)>>>(hist->GetGlobalHistogram(), hist->GetBlockLocalHistograms(),
                                                            num_thread_blocks, kNumBlockHistogramsToAggregate);
           CheckCudaLaunchError();
@@ -266,7 +313,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                   resource_manager.GetKeys(gpu) + offset, hist->GetBlockLocalHistograms(), bucket_size, keys_per_thread,
                   (sizeof(T) - iteration) * kNumRadixBits);
               CheckCudaLaunchError();
-              AggregateHistogram<<<(local_num_thread_blocks / kNumBlockHistogramsToAggregate) + 1, kNumRadixThreads, 0,
+              AggregateHistogram<<<AjbCeilDiv(local_num_thread_blocks, kNumBlockHistogramsToAggregate), kNumRadixThreads, 0,
                                    stream_pool.GetStream(0)>>>(hist->GetGlobalHistogram(),
                                                                hist->GetBlockLocalHistograms(), local_num_thread_blocks,
                                                                kNumBlockHistogramsToAggregate);
@@ -278,10 +325,13 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
 
         if (iteration == 0) {
+          // AJB: histogram广播——包含自身GPU (upstream也做D2D到自身, CUDA允许)
+          const auto* src_hist = device_containers.GetHistograms(gpu, BucketId())->GetGlobalHistogram();
+          const size_t hist_bytes = sizeof(uint64_t) * kNumBuckets;
           for (size_t dest_gpu = 0; dest_gpu < num_gpus; ++dest_gpu) {
             CheckCudaError(cudaMemcpyAsync(
                 device_containers.GetHistograms(gpus[dest_gpu], BucketId())->GetMgpuHistograms() + (g * kNumBuckets),
-                device_containers.GetHistograms(gpu, BucketId())->GetGlobalHistogram(), sizeof(uint64_t) * kNumBuckets,
+                src_hist, hist_bytes,
                 cudaMemcpyDeviceToDevice, stream_pool.GetStream(1)));
           }
         } else {
@@ -290,11 +340,13 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
               BucketId& spanning_bucket = spanning_buckets[iteration][s].second;
 
             spanning_bucket_to_gpus_map.size());
+              // AJB: 缓存源histogram指针——避免每次dest循环重复查找
+              const auto* src_hist_ptr = device_containers.GetHistograms(gpu, spanning_bucket)->GetGlobalHistogram();
+              const size_t hist_sz = sizeof(uint64_t) * kNumBuckets;
               for (auto dest_gpu : spanning_bucket_to_gpus_map[spanning_bucket]) {
                 CheckCudaError(cudaMemcpyAsync(
                     device_containers.GetHistograms(dest_gpu, spanning_bucket)->GetMgpuHistograms() + (g * kNumBuckets),
-                    device_containers.GetHistograms(gpu, spanning_bucket)->GetGlobalHistogram(),
-                    sizeof(uint64_t) * kNumBuckets, cudaMemcpyDeviceToDevice, stream_pool.GetStream(1)));
+                    src_hist_ptr, hist_sz, cudaMemcpyDeviceToDevice, stream_pool.GetStream(1)));
               }
             }
           }
@@ -341,9 +393,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
         CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
 
-        for (uint8_t* temporary_storage_pointer : temporary_storage_pointers) {
-          device_allocator.deallocate(reinterpret_cast<uint8_t*>(temporary_storage_pointer));
-        }
+        AjbBatchDealloc(device_allocator, temporary_storage_pointers);
 
         if (iteration == 0) {
           if (*host_containers.GetHistograms(gpu, BucketId())->GetNonEmptyCount() > 1) {
@@ -361,7 +411,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
           std::vector<std::pair<size_t, size_t>> key_scatter_offsets(num_gpus - 1, {0, 0});
 
           for (size_t s = 0; s < spanning_buckets[iteration].size(); ++s) {
-            if (spanning_buckets[iteration][s].first == gpu) {
+            if (spanning_buckets[iteration][s].first != gpu) continue;  // AJB: guard-continue减少嵌套
+          {
               BucketId& current_bucket = spanning_buckets[iteration][s].second;
               BucketId* predecessor = current_bucket.predecessor;
 
@@ -398,16 +449,20 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                                              stream_pool.GetStream(1)));
             }
 
+            // AJB: gap copy循环——跳过零长度gap (相邻bucket无间隔时不做无效memcpy)
             for (size_t i = 1; i < spanning_bucket_index; ++i) {
+              size_t gap_start = key_scatter_offsets[i - 1].second;
+              size_t gap_size = key_scatter_offsets[i].first - gap_start;
+              if (gap_size == 0) continue;  // AJB: 跳过空gap
               CheckCudaError(
-                  cudaMemcpyAsync(resource_manager.GetOtherKeys(gpu) + key_scatter_offsets[i - 1].second,
-                                  resource_manager.GetKeys(gpu) + key_scatter_offsets[i - 1].second,
-                                  sizeof(T) * (key_scatter_offsets[i].first - key_scatter_offsets[i - 1].second),
+                  cudaMemcpyAsync(resource_manager.GetOtherKeys(gpu) + gap_start,
+                                  resource_manager.GetKeys(gpu) + gap_start,
+                                  sizeof(T) * gap_size,
                                   cudaMemcpyDeviceToDevice, stream_pool.GetStream(1)));
               CheckCudaError(
-                  cudaMemcpyAsync(resource_manager.GetOtherValues(gpu) + key_scatter_offsets[i - 1].second,
-                                  resource_manager.GetValues(gpu) + key_scatter_offsets[i - 1].second,
-                                  sizeof(V) * (key_scatter_offsets[i].first - key_scatter_offsets[i - 1].second),
+                  cudaMemcpyAsync(resource_manager.GetOtherValues(gpu) + gap_start,
+                                  resource_manager.GetValues(gpu) + gap_start,
+                                  sizeof(V) * gap_size,
                                   cudaMemcpyDeviceToDevice, stream_pool.GetStream(1)));
             }
 
@@ -509,8 +564,9 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
         CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(1)));
 
-        for (uint8_t* temporary_storage_pointer : temporary_storage_pointers) {
-          device_allocator.deallocate(reinterpret_cast<uint8_t*>(temporary_storage_pointer));
+        // AJB: LIFO逆序释放——匹配arena分配器的合并策略
+        for (auto it = temporary_storage_pointers.rbegin(); it != temporary_storage_pointers.rend(); ++it) {
+          device_allocator.deallocate(reinterpret_cast<uint8_t*>(*it));
         }
 
         if (!skipped_key_scatter && (iteration == 0 || contains_spanning_bucket)) {
@@ -577,14 +633,17 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
               BucketId last_pass_bucket =
                   BucketId(max_num_partition_passes - 1, i, &spanning_buckets[iteration][s].second);
 
-              if (last_pass_spanning_buckets.count(last_pass_bucket) == 0) {
-                last_pass_spanning_buckets[last_pass_bucket] = {0, {}};
-                last_pass_spanning_buckets[last_pass_bucket].second.reserve(num_gpus);
+              // AJB: try_emplace一步完成查找+构造——避免count+operator[]两次查找
+              auto [lp_it, lp_inserted] = last_pass_spanning_buckets.try_emplace(
+                  last_pass_bucket, std::pair<size_t, std::vector<LPSpanningBucketFraction>>{0, {}});
+              if (lp_inserted) {
+                lp_it->second.second.reserve(num_gpus);
               }
 
-              int j = 0;
+              // AJB: while→for循环+提取map指针——更清晰的终止条件
               size_t source_offset = 0;
-              while (current_bucket_to_gpu_map[(i * num_gpus) + j] >= 0 && j < num_gpus && source_gpu_bucket_size > 0) {
+              const int* bmap = current_bucket_to_gpu_map + (i * num_gpus);
+              for (int j = 0; j < static_cast<int>(num_gpus) && bmap[j] >= 0 && source_gpu_bucket_size > 0; ++j) {
                 int dest_gpu = current_bucket_to_gpu_map[(i * num_gpus) + j];
 
                 LPSpanningBucketFraction lp_fraction;
@@ -624,7 +683,6 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                     gpu_global_offsets[dest_gpu + 1] = (dest_gpu + 1) * chunk_size;
                   }
                 }
-                ++j;
               }
             }
           }
@@ -721,7 +779,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
       if (gpu_global_offsets[g + 1] > 0 || g == 0) {
         size_t gpu_local_chunk_size = gpu_global_offsets[g + 1] - gpu_global_offsets[g];
-        size_t balanced_chunk_size = chunk_size - (g == num_gpus - 1 ? num_fillers : 0);
+        // AJB: 与g_chunk_size统一计算方式
+        size_t balanced_chunk_size = (g == num_gpus - 1) ? std::max(chunk_size, num_fillers) - num_fillers : chunk_size;
 
         resource_manager.FlipBuffers(gpu);
         size_t num_buckets_to_sort = 0;
@@ -745,17 +804,18 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                 bucket_end -= gpu_global_offsets[g];
                 bucket_start -= gpu_global_offsets[g];
 
-                if (prev_bucket != nullptr && prev_bucket->partition_pass == spanning_bucket.partition_pass &&
-                    prev_bucket->bucket_size + bucket_size < device_containers.GetGamma() &&
-                    prev_bucket->bucket_start + prev_bucket->bucket_size == bucket_start) {
+                // AJB: bucket合并——相邻且同pass的小bucket可以合并排序
+                // 条件: 同partition_pass + 合并后不超过gamma + 内存连续
+                bool can_merge = prev_bucket != nullptr
+                    && prev_bucket->partition_pass == spanning_bucket.partition_pass
+                    && prev_bucket->bucket_start + prev_bucket->bucket_size == bucket_start
+                    && prev_bucket->bucket_size + bucket_size < device_containers.GetGamma();
+                if (can_merge) {
                   prev_bucket->bucket_size += bucket_size;
 
-                  uint8_t xor_bucket = static_cast<uint8_t>(i) ^ static_cast<uint8_t>(prev_bucket->bucket_number);
-                  uint32_t msb_dif_position = 0;
-                  while (xor_bucket) {
-                    xor_bucket >>= 1;
-                    ++msb_dif_position;
-                  }
+                  uint32_t msb_dif_position = AjbXorBitWidth(
+                      static_cast<uint8_t>(i),
+                      static_cast<uint8_t>(prev_bucket->bucket_number));
 
                   if (msb_dif_position > prev_bucket->msb_dif_position) {
                     prev_bucket->msb_dif_position = msb_dif_position;
@@ -776,7 +836,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                 b.bucket_number = i;
 
                 reduced_sorting_buckets[g].emplace_back(b);
-                prev_bucket = &reduced_sorting_buckets[g][num_buckets_to_sort];
+                prev_bucket = &reduced_sorting_buckets[g].back();  // AJB: .back()代替下标
                 ++num_buckets_to_sort;
               }
             }
@@ -797,19 +857,19 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
             for (size_t s = 0; s < num_buckets_to_sort; ++s) {
               ReducedSortingBucket<T, V>& b = reduced_sorting_buckets[g][s];
 
-              uint32_t end_bit =
-                  std::min(sizeof(T) * 8, (sizeof(T) - b.partition_pass - 1) * kNumRadixBits + 1 + b.msb_dif_position);
+              // AJB: end_bit——有效排序范围的位上界
+              uint32_t end_bit = static_cast<uint32_t>(
+                  std::min(sizeof(T) * 8, (sizeof(T) - b.partition_pass - 1) * kNumRadixBits + 1 + b.msb_dif_position));
 
               size_t temporary_num_bytes = 0;
 
+              // AJB: CUB两阶段排序——先query大小再分配+执行
               cub::DeviceRadixSort::SortPairs(nullptr, temporary_num_bytes, b.cub_double_buffer_keys,
                                               b.cub_double_buffer_values, b.bucket_size, 0, end_bit,
                                               stream_pool.GetStream(0));
-
-              uint8_t* temporary_storage_pointer = device_allocator.allocate(temporary_num_bytes);
-              temporary_storage_pointers.push_back(temporary_storage_pointer);
-
-              cub::DeviceRadixSort::SortPairs((void*)temporary_storage_pointer, temporary_num_bytes,
+              uint8_t* temp_ptr = device_allocator.allocate(temporary_num_bytes);
+              temporary_storage_pointers.push_back(temp_ptr);
+              cub::DeviceRadixSort::SortPairs(static_cast<void*>(temp_ptr), temporary_num_bytes,
                                               b.cub_double_buffer_keys, b.cub_double_buffer_values, b.bucket_size, 0,
                                               end_bit, stream_pool.GetStream(0));
 
@@ -828,23 +888,29 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
               CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
 
+              // AJB: 缓存偏移量+大小,避免重复计算
+              const size_t dst_off = gpu_global_offsets[g] + transferred_keys;
+              const size_t key_bytes = sizeof(T) * keys_to_transfer;
+              const size_t val_bytes = sizeof(V) * keys_to_transfer;
               CheckCudaError(cudaMemcpyAsync(
-                  out_keys + gpu_global_offsets[g] + transferred_keys, resource_manager.GetKeys(gpu) + transferred_keys,
-                  sizeof(T) * keys_to_transfer, cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
-              CheckCudaError(cudaMemcpyAsync(out_values + gpu_global_offsets[g] + transferred_keys,
-                                             resource_manager.GetValues(gpu) + transferred_keys,
-                                             sizeof(V) * keys_to_transfer, cudaMemcpyDeviceToHost,
-                                             stream_pool.GetStream(2)));
+                  out_keys + dst_off, resource_manager.GetKeys(gpu) + transferred_keys,
+                  key_bytes, cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
+              CheckCudaError(cudaMemcpyAsync(
+                  out_values + dst_off, resource_manager.GetValues(gpu) + transferred_keys,
+                  val_bytes, cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
 
               transferred_keys += keys_to_transfer;
             }
 
-            if (gpu_local_chunk_size > transferred_keys) {
-              CheckCudaError(cudaMemcpyAsync(out_keys + gpu_global_offsets[g] + transferred_keys,
+            // AJB: 拷贝剩余未传输的键值——发生在最后一个sorted bucket之后
+            const size_t remaining = gpu_local_chunk_size > transferred_keys ? gpu_local_chunk_size - transferred_keys : 0;
+            if (remaining > 0) {
+              const size_t tail_off = gpu_global_offsets[g] + transferred_keys;
+              CheckCudaError(cudaMemcpyAsync(out_keys + tail_off,
                                              resource_manager.GetKeys(gpu) + transferred_keys,
-                                             sizeof(T) * (gpu_local_chunk_size - transferred_keys),
+                                             sizeof(T) * remaining,
                                              cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
-              CheckCudaError(cudaMemcpyAsync(out_values + gpu_global_offsets[g] + transferred_keys,
+              CheckCudaError(cudaMemcpyAsync(out_values + tail_off,
                                              resource_manager.GetValues(gpu) + transferred_keys,
                                              sizeof(V) * (gpu_local_chunk_size - transferred_keys),
                                              cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
@@ -853,18 +919,18 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
             for (size_t s = 0; s < num_buckets_to_sort; ++s) {
               ReducedSortingBucket<T, V>& b = reduced_sorting_buckets[g][s];
 
-              uint32_t end_bit =
-                  std::min(sizeof(T) * 8, (sizeof(T) - b.partition_pass - 1) * kNumRadixBits + 1 + b.msb_dif_position);
+              // AJB: end_bit——有效排序范围的位上界
+              uint32_t end_bit = static_cast<uint32_t>(
+                  std::min(sizeof(T) * 8, (sizeof(T) - b.partition_pass - 1) * kNumRadixBits + 1 + b.msb_dif_position));
 
               size_t temporary_num_bytes = 0;
+              // AJB: CUB两阶段排序——先query大小再分配+执行
               cub::DeviceRadixSort::SortPairs(nullptr, temporary_num_bytes, b.cub_double_buffer_keys,
                                               b.cub_double_buffer_values, b.bucket_size, 0, end_bit,
                                               stream_pool.GetStream(0));
-
-              uint8_t* temporary_storage_pointer = device_allocator.allocate(temporary_num_bytes);
-              temporary_storage_pointers.push_back(temporary_storage_pointer);
-
-              cub::DeviceRadixSort::SortPairs((void*)temporary_storage_pointer, temporary_num_bytes,
+              uint8_t* temp_ptr = device_allocator.allocate(temporary_num_bytes);
+              temporary_storage_pointers.push_back(temp_ptr);
+              cub::DeviceRadixSort::SortPairs(static_cast<void*>(temp_ptr), temporary_num_bytes,
                                               b.cub_double_buffer_keys, b.cub_double_buffer_values, b.bucket_size, 0,
                                               end_bit, stream_pool.GetStream(0));
 
@@ -883,46 +949,54 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         } else {
           size_t temporary_num_bytes = 0;
 
+          // AJB: 回退到全范围排序——当bucket数过多时直接排序整个chunk
+          constexpr uint32_t full_bits = sizeof(T) * 8;
           cub::DeviceRadixSort::SortPairs(nullptr, temporary_num_bytes, resource_manager.GetKeysBuffer(gpu),
-                                          resource_manager.GetValuesBuffer(gpu), gpu_local_chunk_size, 0, sizeof(T) * 8,
+                                          resource_manager.GetValuesBuffer(gpu), gpu_local_chunk_size, 0, full_bits,
                                           stream_pool.GetStream(0));
-
-          uint8_t* temporary_storage_pointer = device_allocator.allocate(temporary_num_bytes);
-          temporary_storage_pointers.push_back(temporary_storage_pointer);
-
-          cub::DeviceRadixSort::SortPairs((void*)temporary_storage_pointer, temporary_num_bytes,
+          uint8_t* full_sort_ptr = device_allocator.allocate(temporary_num_bytes);
+          temporary_storage_pointers.push_back(full_sort_ptr);
+          cub::DeviceRadixSort::SortPairs(static_cast<void*>(full_sort_ptr), temporary_num_bytes,
                                           resource_manager.GetKeysBuffer(gpu), resource_manager.GetValuesBuffer(gpu),
-                                          gpu_local_chunk_size, 0, sizeof(T) * 8, stream_pool.GetStream(0));
+                                          gpu_local_chunk_size, 0, full_bits, stream_pool.GetStream(0));
 
           CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
         }
 
-        for (uint8_t* temporary_storage_pointer : temporary_storage_pointers) {
-          device_allocator.deallocate(reinterpret_cast<uint8_t*>(temporary_storage_pointer));
+        // AJB: LIFO逆序释放——匹配arena分配器的合并策略
+        for (auto it = temporary_storage_pointers.rbegin(); it != temporary_storage_pointers.rend(); ++it) {
+          device_allocator.deallocate(reinterpret_cast<uint8_t*>(*it));
         }
 
         if (num_buckets_to_sort > kMaxNumBucketsForReducedSorting ||
             num_buckets_to_sort < kMinNumBucketsForSortCopyOverlap) {
           if (gpu_global_offsets[g] < balanced_chunk_size * g) {
+            // AJB: 分裂拷贝——先拷贝主块再补前缀
             size_t skip_keys = balanced_chunk_size * g - gpu_global_offsets[g];
-
+            size_t main_size = gpu_local_chunk_size - skip_keys;
+            size_t main_dst = balanced_chunk_size * g;
+            // 主块(skip_keys之后的部分)
             CheckCudaError(cudaMemcpyAsync(
-                out_keys + balanced_chunk_size * g, resource_manager.GetKeys(gpu) + skip_keys,
-                sizeof(T) * (gpu_local_chunk_size - skip_keys), cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
+                out_keys + main_dst, resource_manager.GetKeys(gpu) + skip_keys,
+                sizeof(T) * main_size, cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
             CheckCudaError(cudaMemcpyAsync(
-                out_values + balanced_chunk_size * g, resource_manager.GetValues(gpu) + skip_keys,
-                sizeof(V) * (gpu_local_chunk_size - skip_keys), cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
-
-            CheckCudaError(cudaMemcpyAsync(out_keys + gpu_global_offsets[g], resource_manager.GetKeys(gpu),
-                                           sizeof(T) * skip_keys, cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
-            CheckCudaError(cudaMemcpyAsync(out_values + gpu_global_offsets[g], resource_manager.GetValues(gpu),
-                                           sizeof(V) * skip_keys, cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
+                out_values + main_dst, resource_manager.GetValues(gpu) + skip_keys,
+                sizeof(V) * main_size, cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
+            // 前缀块(0..skip_keys)
+            CheckCudaError(cudaMemcpyAsync(
+                out_keys + gpu_global_offsets[g], resource_manager.GetKeys(gpu),
+                sizeof(T) * skip_keys, cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
+            CheckCudaError(cudaMemcpyAsync(
+                out_values + gpu_global_offsets[g], resource_manager.GetValues(gpu),
+                sizeof(V) * skip_keys, cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
 
           } else {
-            CheckCudaError(cudaMemcpyAsync(out_keys + gpu_global_offsets[g], resource_manager.GetKeys(gpu),
+            // AJB: 缓存全局偏移量避免重复索引
+            const size_t goff = gpu_global_offsets[g];
+            CheckCudaError(cudaMemcpyAsync(out_keys + goff, resource_manager.GetKeys(gpu),
                                            sizeof(T) * gpu_local_chunk_size, cudaMemcpyDeviceToHost,
                                            stream_pool.GetStream(2)));
-            CheckCudaError(cudaMemcpyAsync(out_values + gpu_global_offsets[g], resource_manager.GetValues(gpu),
+            CheckCudaError(cudaMemcpyAsync(out_values + goff, resource_manager.GetValues(gpu),
                                            sizeof(V) * gpu_local_chunk_size, cudaMemcpyDeviceToHost,
                                            stream_pool.GetStream(2)));
           }
@@ -933,6 +1007,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
     }
   }
 
+  // AJB: 返回同步lambda——遍历所有GPU等待stream 2完成
   return [&resource_manager, gpus]() {
     for (const int gpu : gpus) {
       CheckCudaError(cudaStreamSynchronize(resource_manager.GetStreamPool(gpu).GetStream(2)));
@@ -941,28 +1016,9 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 }
 
 
-// 排序正确性验证 — 采样检查 + violation定位
-// 全量检查O(n)太慢, 用stride采样O(n/stride)
+// Sort validation: uses ajb_validate_sorted from ajb_debug_infra.cuh
+// Wraps the template for backward compatibility with existing call sites.
 template <typename T>
 static inline bool validate_sort_output(const T* keys, size_t n, size_t sample_stride = 1000) {
-    if (n < 2) return true;
-    size_t violations = 0;
-    size_t checked = 0;
-    size_t first_violation = 0;
-    for (size_t i = 1; i < n; i += sample_stride) {
-        checked++;
-        if (keys[i] < keys[i - 1]) {
-            if (violations == 0) first_violation = i;
-            violations++;
-        }
-    }
-    fprintf(stderr, "[DEBUG][validate_sort] checked=%zu/%zu violations=%zu %s\n",
-            checked, n, violations, violations == 0 ? "PASS" : "FAIL");
-    if (violations > 0) {
-        fprintf(stderr, "[DEBUG][validate_sort] first violation at i=%zu: keys[%zu]=%llu > keys[%zu]=%llu\n",
-                first_violation, first_violation - sample_stride,
-                (unsigned long long)keys[first_violation - sample_stride],
-                first_violation, (unsigned long long)keys[first_violation]);
-    }
-    return violations == 0;
+    return ajb_validate_sorted("radix_sort", keys, n, sample_stride);
 }
