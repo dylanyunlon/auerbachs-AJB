@@ -1,88 +1,103 @@
 // =============================================================================
-// wash_data_full.cpp — Data format converter (AJB-instrumented)
+// wash_data_full.cpp — Data format converter (space → pipe-delimited)
 //
-// Origin: upstream/joinrenum/wash.cpp (14 lines, verbatim core)
-// AJB adaptation (~20%): CLI paths, per-line field count validation,
-//   value range tracking per column, malformed line detection with
-//   row number, output line count verification, empty-field warnings.
+// Origin: upstream/joinrenum/wash.cpp (14 lines)
+// Algorithm changes (~30%):
+//   1. IO: ifstream+getline+stringstream → fopen+fgets+strtol pointer walk
+//      (no per-line string/stream construction)
+//   2. Output: ofstream << x << "|" << y per line → snprintf into stack
+//      buffer + fwrite (single syscall per line)
+//   3. Validation: upstream silently skips malformed lines (ss >> x >> y fails)
+//      changed: explicit strtol error detection, count+report parse failures
+//   4. Dedup: upstream passes duplicates through
+//      changed: optional duplicate detection via sorted pair vector + unique
+//      (reports count but still writes all to preserve upstream semantics)
+//   5. Bidirectional expansion: detect if graph is directed (a→b without
+//      b→a) and report asymmetry ratio
 //
-// Build: g++ -O3 wash_data_full.cpp -o wash_full
-// Usage: ./wash_full [input] [output]
+// Build: g++ -O3 wash_data_full.cpp -o wash_data_full
 // =============================================================================
 
 #include <bits/stdc++.h>
 using namespace std;
 
 int main(int argc, char* argv[]) {
-    string input_path  = (argc >= 2) ? argv[1] : "db/Sampled.txt";
-    string output_path = (argc >= 3) ? argv[2] : "db/R1.txt";
+    const char* inpath  = (argc >= 2) ? argv[1] : "db/Sampled.txt";
+    const char* outpath = (argc >= 3) ? argv[2] : "db/R1.txt";
+    fprintf(stderr, "[AJB_BP] wash_data: %s -> %s\n", inpath, outpath);
 
-    fprintf(stderr, "[AJB] ============================================\n");
-    fprintf(stderr, "[AJB] wash_data_full  %s -> %s\n",
-            input_path.c_str(), output_path.c_str());
-    fprintf(stderr, "[AJB] ============================================\n");
-
-    ifstream fin(input_path);
-    if (!fin.is_open()) {
-        fprintf(stderr, "[AJB_FAIL] Cannot open input: %s\n", input_path.c_str());
+    // --- algorithm change 1: fopen/fgets/strtol input ---
+    FILE* fin = fopen(inpath, "r");
+    if (!fin) {
+        fprintf(stderr, "[AJB_FAIL] cannot open %s\n", inpath);
         return 1;
     }
-    ofstream fout(output_path);
-    if (!fout.is_open()) {
-        fprintf(stderr, "[AJB_FAIL] Cannot open output: %s\n", output_path.c_str());
+    // --- algorithm change 2: fopen/snprintf/fwrite output ---
+    FILE* fout = fopen(outpath, "w");
+    if (!fout) {
+        fclose(fin);
+        fprintf(stderr, "[AJB_FAIL] cannot open %s\n", outpath);
         return 1;
     }
 
-    string line;
-    int line_num = 0, written = 0, malformed = 0, empty_fields = 0;
-    // AJB: track value ranges per column
-    long long col0_min = LLONG_MAX, col0_max = LLONG_MIN;
-    long long col1_min = LLONG_MAX, col1_max = LLONG_MIN;
+    char line[4096];
+    char outbuf[256];
+    int total_lines = 0, parsed = 0, errors = 0;
+    // --- algorithm change 4: collect edges for dedup analysis ---
+    vector<pair<int,int>> edges;
+    edges.reserve(1 << 18);
 
-    while (getline(fin, line)) {
-        line_num++;
-        // upstream: parse "x y" and output "x|y"
-        stringstream ss(line);
-        string x, y;
-        ss >> x >> y;
+    while (fgets(line, sizeof(line), fin)) {
+        total_lines++;
+        // --- algorithm change 1+3: strtol with error detection ---
+        char* end;
+        const char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        long x = strtol(p, &end, 10);
+        if (end == p) { errors++; continue; }
+        p = end;
+        while (*p == ' ' || *p == '\t') p++;
+        long y = strtol(p, &end, 10);
+        if (end == p) { errors++; continue; }
 
-        if (x.empty() || y.empty()) {
-            malformed++;
-            if (malformed <= 5)
-                fprintf(stderr, "[AJB_WARN] line %d: malformed (x='%s' y='%s')\n",
-                        line_num, x.c_str(), y.c_str());
-            continue;
-        }
-
-        // AJB: check for empty-looking fields
-        if (x == "0" || y == "0") empty_fields++;
-
-        fout << x << "|" << y << endl;
-        written++;
-
-        // AJB: track value ranges (try numeric parse)
-        try {
-            long long vx = stoll(x), vy = stoll(y);
-            col0_min = min(col0_min, vx); col0_max = max(col0_max, vx);
-            col1_min = min(col1_min, vy); col1_max = max(col1_max, vy);
-        } catch (...) {
-            // non-numeric — skip range tracking
-        }
+        // write pipe-delimited output
+        int n = snprintf(outbuf, sizeof(outbuf), "%ld|%ld\n", x, y);
+        fwrite(outbuf, 1, n, fout);
+        edges.emplace_back((int)x, (int)y);
+        parsed++;
     }
 
-    fprintf(stderr, "[AJB_STATE] === Wash Summary ===\n");
-    fprintf(stderr, "[AJB_STATE] input_lines=%d  written=%d  malformed=%d\n",
-            line_num, written, malformed);
-    if (col0_min != LLONG_MAX) {
-        fprintf(stderr, "[AJB_STATE] col0 range: [%lld, %lld]\n", col0_min, col0_max);
-        fprintf(stderr, "[AJB_STATE] col1 range: [%lld, %lld]\n", col1_min, col1_max);
-    }
-    if (empty_fields > 0)
-        fprintf(stderr, "[AJB_WARN] %d lines contain zero-valued fields\n", empty_fields);
-    if (malformed > 5)
-        fprintf(stderr, "[AJB_WARN] ... and %d more malformed lines (suppressed)\n",
-                malformed - 5);
+    fclose(fin);
+    fclose(fout);
 
-    fprintf(stderr, "[AJB] wash_data_full DONE\n");
+    fprintf(stderr, "[AJB_STATE] lines=%d parsed=%d errors=%d\n",
+            total_lines, parsed, errors);
+
+    // --- algorithm change 4: duplicate detection ---
+    if (!edges.empty()) {
+        vector<pair<int,int>> sorted_edges(edges.begin(), edges.end());
+        sort(sorted_edges.begin(), sorted_edges.end());
+        size_t unique_count = unique(sorted_edges.begin(), sorted_edges.end())
+                              - sorted_edges.begin();
+        int duplicates = (int)(edges.size() - unique_count);
+        fprintf(stderr, "[AJB_STATE] total_edges=%zu unique=%zu duplicates=%d\n",
+                edges.size(), unique_count, duplicates);
+
+        // --- algorithm change 5: asymmetry detection ---
+        // check how many edges (a,b) have a reverse (b,a)
+        int symmetric = 0;
+        for (auto& [a, b] : edges) {
+            if (binary_search(sorted_edges.begin(),
+                              sorted_edges.begin() + unique_count,
+                              make_pair(b, a))) {
+                symmetric++;
+            }
+        }
+        fprintf(stderr, "[AJB_STATE] symmetric_edges=%d/%zu (%.1f%% bidirectional)\n",
+                symmetric, edges.size(),
+                edges.empty() ? 0.0 : 100.0 * symmetric / edges.size());
+    }
+
+    fprintf(stderr, "[AJB_BP] wash_data done\n");
     return 0;
 }

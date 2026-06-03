@@ -16,13 +16,23 @@
 #include "ReadConfig.hpp"
 using namespace std;
 
-// AJB: memory snapshot
+// --- algorithm change: RSS reader via fopen/strtol (no heap string alloc) ---
 static long ajb_rss_kb() {
-    ifstream f("/proc/self/status"); string line;
-    while (getline(f, line))
-        if (line.substr(0, 6) == "VmRSS:")
-            { istringstream iss(line); string k; long v; iss >> k >> v; return v; }
-    return -1;
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char buf[256];
+    long result = -1;
+    while (fgets(buf, sizeof(buf), f)) {
+        if (strncmp(buf, "VmRSS:", 6) == 0) {
+            const char* p = buf + 6;
+            while (*p == ' ' || *p == '\t') p++;
+            char* end;
+            result = strtol(p, &end, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return result;
 }
 
 int main() {
@@ -90,46 +100,68 @@ int main() {
 
     vector<vector<int> > relation = q.getRelations();
     vector<pair<vector<int>, vector<int> > > bound = {};
+    // --- algorithm change: pre-allocated direct-index bound fill ---
+    // upstream: for each relation, empty vector + push_back per dimension
+    // changed: pre-size the vectors, then fill by index — no realloc,
+    //   cache-friendly sequential write
+    const auto& lb = B.getLowerBound();
+    const auto& ub = B.getUpperBound();
     for(size_t i = 0; i < relation.size(); i++) {
-        vector<int> lower_bound = {};
-        vector<int> upper_bound = {};
-        for(size_t j = 0; j < relation[i].size(); j++) {
-            lower_bound.push_back(B.getLowerBound()[relation[i][j]]);
-            upper_bound.push_back(B.getUpperBound()[relation[i][j]]);
+        size_t arity = relation[i].size();
+        vector<int> lower_bound(arity);
+        vector<int> upper_bound(arity);
+        for(size_t j = 0; j < arity; j++) {
+            int dim = relation[i][j];
+            lower_bound[j] = lb[dim];
+            upper_bound[j] = ub[dim];
         }
-        bound.push_back({lower_bound, upper_bound});
+        bound.push_back({move(lower_bound), move(upper_bound)});
     }
 
-    // AJB_STATE: dump computed bounds per relation
+    // debug: dump bounds with span (upper - lower) for each dimension
     fprintf(stderr, "[AJB_STATE] === Per-Relation Bounds ===\n");
     for(size_t i = 0; i < bound.size(); i++) {
-        fprintf(stderr, "[AJB_STATE]   R%zu lower=[", i);
+        fprintf(stderr, "[AJB_STATE]   R%zu dims=[", i);
         for(size_t j = 0; j < bound[i].first.size(); j++) {
-            if (j) fprintf(stderr, ",");
-            fprintf(stderr, "%d", bound[i].first[j]);
-        }
-        fprintf(stderr, "] upper=[");
-        for(size_t j = 0; j < bound[i].second.size(); j++) {
-            if (j) fprintf(stderr, ",");
-            fprintf(stderr, "%d", bound[i].second[j]);
+            if (j) fprintf(stderr, " ");
+            int span = bound[i].second[j] - bound[i].first[j];
+            fprintf(stderr, "%d..%d(Δ%d)", bound[i].first[j],
+                    bound[i].second[j], span);
         }
         fprintf(stderr, "]\n");
     }
 
-    // upstream: treeUpp with bounds vs iters — compare both paths
-    auto t2 = chrono::high_resolution_clock::now();
-    long long upp_bound = tree.treeUpp(B.splitDim, bound);
-    auto t3 = chrono::high_resolution_clock::now();
-    long long upp_iter  = tree.treeUpp(B.splitDim, B.iters);
-    auto t4 = chrono::high_resolution_clock::now();
+    // --- algorithm change: treeUpp with median-of-N timing ---
+    // upstream: single treeUpp call, report one timing
+    // changed: run each path 5 times, sort timings, take median —
+    //   eliminates cold-cache noise from first call
+    const int NRUNS = 5;
+    double bound_times[NRUNS], iter_times[NRUNS];
+    long long upp_bound = 0, upp_iter = 0;
+
+    for (int r = 0; r < NRUNS; r++) {
+        auto ta = chrono::high_resolution_clock::now();
+        upp_bound = tree.treeUpp(B.splitDim, bound);
+        auto tb = chrono::high_resolution_clock::now();
+        bound_times[r] = chrono::duration<double,micro>(tb - ta).count();
+    }
+    for (int r = 0; r < NRUNS; r++) {
+        auto ta = chrono::high_resolution_clock::now();
+        upp_iter = tree.treeUpp(B.splitDim, B.iters);
+        auto tb = chrono::high_resolution_clock::now();
+        iter_times[r] = chrono::duration<double,micro>(tb - ta).count();
+    }
+
+    sort(bound_times, bound_times + NRUNS);
+    sort(iter_times, iter_times + NRUNS);
 
     cout << upp_bound << endl;
     cout << upp_iter << endl;
 
-    fprintf(stderr, "[AJB_TIMER] treeUpp(bound): %.3f us -> %lld\n",
-            chrono::duration<double,micro>(t3 - t2).count(), upp_bound);
-    fprintf(stderr, "[AJB_TIMER] treeUpp(iters): %.3f us -> %lld\n",
-            chrono::duration<double,micro>(t4 - t3).count(), upp_iter);
+    fprintf(stderr, "[AJB_TIMER] treeUpp(bound): median=%.3fus (of %d runs) -> %lld\n",
+            bound_times[NRUNS/2], NRUNS, upp_bound);
+    fprintf(stderr, "[AJB_TIMER] treeUpp(iters): median=%.3fus (of %d runs) -> %lld\n",
+            iter_times[NRUNS/2], NRUNS, upp_iter);
     fprintf(stderr, "[AJB_STATE] treeUpp agreement: %s\n",
             upp_bound == upp_iter ? "MATCH" : "DIVERGE");
 

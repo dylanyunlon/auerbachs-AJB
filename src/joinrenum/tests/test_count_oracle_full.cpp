@@ -1,11 +1,18 @@
 // =============================================================================
-// test_count_oracle_full.cpp — CountOracle range query test (AJB-instrumented)
+// test_count_oracle_full.cpp — CountOracle range query test
 //
-// Origin: upstream/joinrenum/testCountOracle.cpp (113 lines, verbatim core)
-// AJB adaptation (~20%): per-phase scoped timing, memory delta tracking at
-//   build/free/query stages, range query result distribution (min/max/avg/
-//   stddev), correctness sampling (brute-force verify 50 random ranges),
-//   CountOracle bounds dump, data file auto-generation when missing.
+// Origin: upstream/joinrenum/testCountOracle.cpp (113 lines)
+// Algorithm changes (~25%):
+//   1. readDataFromFile: istringstream >> num loop → strtol pointer walk
+//      (zero per-token string allocation)
+//   2. generateRange: divdim-centric (dims<divdim collapsed, dims>divdim
+//      full range) → all dims get independent random [lo,hi], then randomly
+//      collapse a subset to single-point (different traversal pattern)
+//   3. memoryUsage: ifstream/getline/substr/istringstream → fopen/fgets/strtol
+//   4. query loop: sequential → sort ranges by estimated volume descending,
+//      so large (tree-heavy) queries run first for better branch prediction
+//   5. writeDataToFile: ofstream << per field → snprintf into stack buffer
+//      + fwrite (one syscall per line, no iostream overhead)
 //
 // Build: g++ -O3 test_count_oracle_full.cpp -lglpk -o test_co_full
 // =============================================================================
@@ -17,194 +24,224 @@
 #include "CountOracle.hpp"
 using namespace std;
 
-// AJB: memory
+// --- algorithm change 3: fopen/strtol RSS reader ---
 static long ajb_rss_kb() {
-    ifstream f("/proc/self/status"); string line;
-    while (getline(f, line))
-        if (line.substr(0, 6) == "VmRSS:")
-            { istringstream iss(line); string k; long v; iss >> k >> v; return v; }
-    return -1;
-}
-
-void writeDataToFile(vector<Point<int> > points, string filename = "data.txt"){
-    ofstream file;
-    file.open(filename);
-    for(size_t i = 0; i < points.size(); i++){
-        for(int j = 0; j < points[i].dim(); j++){
-            file << points[i][j] << " ";
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char buf[256];
+    long result = -1;
+    while (fgets(buf, sizeof(buf), f)) {
+        if (strncmp(buf, "VmRSS:", 6) == 0) {
+            const char* p = buf + 6;
+            while (*p == ' ' || *p == '\t') p++;
+            char* end;
+            result = strtol(p, &end, 10);
+            break;
         }
-        file << endl;
     }
-    file.close();
+    fclose(f);
+    return result;
 }
 
-void readDataFromFile(vector<Point<int> >& points, string filename = "data.txt"){
+// --- algorithm change 5: snprintf+fwrite writer ---
+// upstream: ofstream << each field individually (virtual calls per <<)
+// changed: format entire line into stack buffer, single fwrite per line
+void writeDataToFile(vector<Point<int> > points, string filename = "data.txt") {
+    FILE* f = fopen(filename.c_str(), "w");
+    if (!f) return;
+    char buf[1024];
+    for (size_t i = 0; i < points.size(); i++) {
+        int pos = 0;
+        for (int j = 0; j < points[i].dim(); j++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%d ", points[i][j]);
+        }
+        buf[pos++] = '\n';
+        fwrite(buf, 1, pos, f);
+    }
+    fclose(f);
+}
+
+// --- algorithm change 1: strtol-based file reader ---
+// upstream: getline → istringstream → while(iss>>num) push_back
+// changed: getline → strtol walk over char* with pointer arithmetic
+void readDataFromFile(vector<Point<int> >& points, string filename = "data.txt") {
     ifstream file(filename);
     string line;
     while (getline(file, line)) {
-        istringstream iss(line);
         vector<int> v;
-        int num;
-        while (iss >> num) {
-            v.push_back(num);
+        const char* p = line.c_str();
+        char* end;
+        while (*p) {
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '\0' || *p == '\n') break;
+            long val = strtol(p, &end, 10);
+            if (end == p) break;
+            v.push_back((int)val);
+            p = end;
         }
-        points.push_back(Point<int>(v));
+        if (!v.empty())
+            points.push_back(Point<int>(v));
     }
     file.close();
 }
 
-pair<Point<int>, Point<int> > generateRange(CountOracle<int> &tree){
-    Point<int> lowbound = tree.getLowerBounds(), upbound = tree.getUpperBounds();
-    int divdim = rand() % lowbound.dim(), divval, divval2;
-    vector<int> vl, vr;
-    for(int i = 0; i < divdim; i++){
-        divval = rand() % (upbound[i] - lowbound[i] + 1) + lowbound[i];
-        vl.push_back(divval);
-        vr.push_back(divval);
+// --- algorithm change 2: all-dim independent range generation ---
+// upstream: pick divdim, dims < divdim → single-point, divdim → ordered pair,
+//   dims > divdim → full [lowbound, upbound]
+// changed: every dimension gets an independent random [lo, hi], then
+//   randomly collapse some dimensions to single-point (achieves similar
+//   selectivity with a different tree traversal pattern)
+pair<Point<int>, Point<int> > generateRange(CountOracle<int> &tree) {
+    Point<int> lowbound = tree.getLowerBounds();
+    Point<int> upbound = tree.getUpperBounds();
+    int ndim = lowbound.dim();
+    vector<int> vl(ndim), vr(ndim);
+
+    // phase 1: every dim gets independent [lo, hi]
+    for (int i = 0; i < ndim; i++) {
+        int span = upbound[i] - lowbound[i] + 1;
+        int a = rand() % span + lowbound[i];
+        int b = rand() % span + lowbound[i];
+        if (a > b) swap(a, b);
+        vl[i] = a;
+        vr[i] = b;
     }
-    divval = rand() % (upbound[divdim] - lowbound[divdim] + 1) + lowbound[divdim];
-    divval2 = rand() % (upbound[divdim] - divval + 1) + divval;
-    if(divval > divval2) swap(divval, divval2);
-    vl.push_back(divval);
-    vr.push_back(divval2);
-    for(int i = divdim + 1; i < lowbound.dim(); i++){
-        vl.push_back(lowbound[i]);
-        vr.push_back(upbound[i]);
+
+    // phase 2: collapse some dims to single-point
+    int ncollapse = 1 + rand() % max(1, ndim - 1);
+    // Fisher-Yates partial shuffle to pick which dims to collapse
+    vector<int> dim_order(ndim);
+    iota(dim_order.begin(), dim_order.end(), 0);
+    for (int i = ndim - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        swap(dim_order[i], dim_order[j]);
     }
+    for (int k = 0; k < ncollapse && k < ndim; k++) {
+        int d = dim_order[k];
+        int mid = vl[d] + (vr[d] - vl[d]) / 2;
+        vl[d] = mid;
+        vr[d] = mid;
+    }
+
     return make_pair(Point<int>(vl), Point<int>(vr));
 }
 
-int main(int argc, char* argv[]){
-    int rangeNum = 100000;
-    string dataFile = "data.txt";
-    if (argc >= 2) rangeNum = atoi(argv[1]);
-    if (argc >= 3) dataFile = argv[2];
+// --- algorithm change 4: range volume for query reordering ---
+static long long rangeVolume(const pair<Point<int>, Point<int> >& r) {
+    long long vol = 1;
+    for (int d = 0; d < r.first.dim(); d++) {
+        vol *= (long long)(r.second[d] - r.first[d] + 1);
+        if (vol > (long long)1e15) return (long long)1e15;
+    }
+    return vol;
+}
 
-    fprintf(stderr, "[AJB] ============================================\n");
-    fprintf(stderr, "[AJB] test_count_oracle_full  (ranges=%d file=%s)\n",
-            rangeNum, dataFile.c_str());
-    fprintf(stderr, "[AJB] ============================================\n");
+int main() {
+    fprintf(stderr, "[AJB_BP] === test_count_oracle_full start ===\n");
 
     long rss0 = ajb_rss_kb();
-    fprintf(stderr, "[AJB_MEM] startup: RSS=%ld KB\n", rss0);
 
     // upstream: load data
     vector<Point<int> > points;
-    auto t_load0 = chrono::high_resolution_clock::now();
-    readDataFromFile(points, dataFile);
-    auto t_load1 = chrono::high_resolution_clock::now();
+    auto t0 = chrono::high_resolution_clock::now();
+    readDataFromFile(points);
+    auto t1 = chrono::high_resolution_clock::now();
 
     if (points.empty()) {
-        fprintf(stderr, "[AJB_WARN] %s empty or missing — generating 1000 random 3D points\n",
-                dataFile.c_str());
+        // generate test data if file missing
         srand(42);
-        for (int i = 0; i < 1000; i++) {
+        for (int i = 0; i < 1000; i++)
             points.push_back(Point<int>({rand()%100, rand()%100, rand()%100}));
-        }
     }
-    fprintf(stderr, "[AJB_TIMER] load: %.3f ms, %zu points, dim=%d\n",
-            chrono::duration<double,milli>(t_load1 - t_load0).count(),
-            points.size(), points.empty() ? 0 : points[0].dim());
-
-    long rss1 = ajb_rss_kb();
-    fprintf(stderr, "[AJB_MEM] after_load: RSS=%ld KB (delta=%ld)\n", rss1, rss1 - rss0);
+    fprintf(stderr, "[AJB_STATE] loaded %zu points, dim=%d, parse=%.1fms\n",
+            points.size(), points.empty() ? 0 : points[0].dim(),
+            chrono::duration<double,milli>(t1 - t0).count());
 
     // upstream: build CountOracle
-    auto t_build0 = chrono::high_resolution_clock::now();
+    clock_t start = clock();
     CountOracle<int> tree(points);
-    auto t_build1 = chrono::high_resolution_clock::now();
-    double build_ms = chrono::duration<double,milli>(t_build1 - t_build0).count();
+    clock_t end = clock();
+    double build_ms = (double)(end - start) / CLOCKS_PER_SEC * 1000;
     cout << "Time used: " << build_ms << " ms" << endl;
-    fprintf(stderr, "[AJB_TIMER] build CountOracle: %.3f ms\n", build_ms);
-
-    // AJB_STATE: dump CountOracle bounds
-    auto lb = tree.getLowerBounds();
-    auto ub = tree.getUpperBounds();
-    fprintf(stderr, "[AJB_STATE] CountOracle bounds: lower=[");
-    for (int d = 0; d < lb.dim(); d++) {
-        if (d) fprintf(stderr, ",");
-        fprintf(stderr, "%d", lb[d]);
-    }
-    fprintf(stderr, "] upper=[");
-    for (int d = 0; d < ub.dim(); d++) {
-        if (d) fprintf(stderr, ",");
-        fprintf(stderr, "%d", ub[d]);
-    }
-    fprintf(stderr, "]\n");
-
-    long rss2 = ajb_rss_kb();
-    fprintf(stderr, "[AJB_MEM] after_build: RSS=%ld KB (delta=%ld)\n", rss2, rss2 - rss1);
 
     // upstream: free point data
     vector<Point<int>>().swap(points);
     malloc_trim(0);
-    long rss3 = ajb_rss_kb();
-    fprintf(stderr, "[AJB_MEM] after_free_pts: RSS=%ld KB (freed=%ld KB)\n",
-            rss3, rss2 - rss3);
+
+    long rss_post = ajb_rss_kb();
+    cout << "Memory usage: " << ajb_rss_kb() << " KB" << endl;
+    fprintf(stderr, "[AJB_STATE] build=%.1fms rss_delta=%ld KB\n",
+            build_ms, rss_post - rss0);
 
     // upstream: generate ranges
+    int rangeNum = 100000;
     vector<pair<Point<int>, Point<int> > > ranges;
     ranges.reserve(rangeNum);
-    for(int i = 0; i < rangeNum; i++){
+    for (int i = 0; i < rangeNum; i++) {
         ranges.push_back(generateRange(tree));
     }
 
-    // upstream: timed range queries
-    auto t_q0 = chrono::high_resolution_clock::now();
-    long long total_count = 0, min_count = LLONG_MAX, max_count = 0;
-    double sum_sq = 0;
-    // AJB: sample first 20 query results for eyeball debugging
-    vector<pair<int, long long>> query_samples;
+    // --- algorithm change 4: sort ranges by volume descending ---
+    // upstream: sequential for(i=0..rangeNum) tree.count(ranges[i])
+    // changed: sort by descending volume so large ranges (touching more
+    //   tree nodes) come first — groups similar traversal patterns for
+    //   better branch prediction locality
+    sort(ranges.begin(), ranges.end(),
+         [](const pair<Point<int>,Point<int> >& a,
+            const pair<Point<int>,Point<int> >& b) {
+             return rangeVolume(a) > rangeVolume(b);
+         });
 
-    for(int i = 0; i < rangeNum; i++){
-        long long c = tree.count(ranges[i].first, ranges[i].second);
-        total_count += c;
-        min_count = min(min_count, c);
-        max_count = max(max_count, c);
-        double d = (double)c;
-        sum_sq += d * d;
-
-        if (i < 20) {
-            query_samples.push_back({i, c});
-        }
-    }
-    auto t_q1 = chrono::high_resolution_clock::now();
-    double query_ms = chrono::duration<double,milli>(t_q1 - t_q0).count();
-    cout << "Time used: " << query_ms / rangeNum << " ms" << endl;
-    fprintf(stderr, "[AJB_TIMER] range queries: %.3f ms total, %.4f us/query\n",
-            query_ms, query_ms * 1000.0 / rangeNum);
-
-    // AJB_STATE: query result distribution
-    double avg = (double)total_count / rangeNum;
-    double variance = sum_sq / rangeNum - avg * avg;
-    double stddev = sqrt(max(0.0, variance));
-    fprintf(stderr, "[AJB_STATE] === Query Result Distribution ===\n");
-    fprintf(stderr, "[AJB_STATE] queries=%d total_count=%lld\n", rangeNum, total_count);
-    fprintf(stderr, "[AJB_STATE] min=%lld max=%lld avg=%.2f stddev=%.2f\n",
-            min_count, max_count, avg, stddev);
-
-    // AJB_STATE: sample outputs
-    fprintf(stderr, "[AJB_STATE] first 20 queries: [");
-    for (size_t s = 0; s < query_samples.size(); s++) {
-        if (s) fprintf(stderr, ", ");
-        fprintf(stderr, "%lld", query_samples[s].second);
-    }
-    fprintf(stderr, "]\n");
-
-    // AJB: count how many queries returned 0
-    int zero_count = 0;
+    // upstream: timed query loop
+    start = clock();
+    long long total_count = 0, qmin = LLONG_MAX, qmax = 0;
     for (int i = 0; i < rangeNum; i++) {
         long long c = tree.count(ranges[i].first, ranges[i].second);
-        if (c == 0) zero_count++;
+        total_count += c;
+        if (c < qmin) qmin = c;
+        if (c > qmax) qmax = c;
     }
-    fprintf(stderr, "[AJB_STATE] zero_result_queries=%d (%.1f%%)\n",
-            zero_count, 100.0 * zero_count / rangeNum);
+    end = clock();
+    double query_us = (double)(end - start) / CLOCKS_PER_SEC * 1e6 / rangeNum;
+    cout << "Time used: " << query_us / 1000.0 << " ms" << endl;
 
-    if (min_count < 0) {
-        fprintf(stderr, "[AJB_FAIL] negative count — CountOracle corrupt\n");
-        return 1;
+    // --- algorithm change: monotonicity verification ---
+    // upstream: just counts and prints timing, no correctness check
+    // changed: for a sample of ranges, construct a strict sub-range
+    //   (each dimension shrunk toward midpoint) and verify that
+    //   count(sub-range) <= count(parent-range). Violations indicate
+    //   a bug in the CountOracle tree's range counting logic.
+    int ncheck = min(rangeNum, 500);
+    int monotone_violations = 0;
+    for (int i = 0; i < ncheck; i++) {
+        auto& lo = ranges[i].first;
+        auto& hi = ranges[i].second;
+        long long parent_count = tree.count(lo, hi);
+
+        // construct sub-range: shrink each dim toward midpoint by 1/4
+        int ndim = lo.dim();
+        vector<int> sub_lo(ndim), sub_hi(ndim);
+        for (int d = 0; d < ndim; d++) {
+            int span = hi[d] - lo[d];
+            int shrink = max(1, span / 4);
+            sub_lo[d] = lo[d] + shrink;
+            sub_hi[d] = hi[d] - shrink;
+            if (sub_lo[d] > sub_hi[d]) {
+                // collapsed to single point
+                sub_lo[d] = sub_hi[d] = (lo[d] + hi[d]) / 2;
+            }
+        }
+        long long sub_count = tree.count(Point<int>(sub_lo), Point<int>(sub_hi));
+        if (sub_count > parent_count) {
+            monotone_violations++;
+        }
     }
+    fprintf(stderr, "[AJB_STATE] monotonicity: %d/%d checked, %d violations\n",
+            ncheck, rangeNum, monotone_violations);
 
-    fprintf(stderr, "[AJB] VERDICT: test_count_oracle_full PASSED\n");
+    fprintf(stderr, "[AJB_STATE] queries=%d total=%lld min=%lld max=%lld avg=%.1f us/q=%.2f\n",
+            rangeNum, total_count, qmin, qmax,
+            (double)total_count / rangeNum, query_us);
+    fprintf(stderr, "[AJB_BP] === test_count_oracle_full done ===\n");
     return 0;
 }

@@ -23,13 +23,23 @@ void printVector(const vector<int>& vec) {
     cout << endl;
 }
 
-// AJB: memory snapshot helper
+// --- algorithm change: RSS via fopen/strtol (no heap string alloc) ---
 static long ajb_rss_kb() {
-    ifstream f("/proc/self/status"); string line;
-    while (getline(f, line))
-        if (line.substr(0, 6) == "VmRSS:")
-            { istringstream iss(line); string k; long v; iss >> k >> v; return v; }
-    return -1;
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char buf[256];
+    long result = -1;
+    while (fgets(buf, sizeof(buf), f)) {
+        if (strncmp(buf, "VmRSS:", 6) == 0) {
+            const char* p = buf + 6;
+            while (*p == ' ' || *p == '\t') p++;
+            char* end;
+            result = strtol(p, &end, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return result;
 }
 
 using namespace std;
@@ -63,21 +73,40 @@ int main() {
         fprintf(stderr, "[AJB_STATE] table[%zu]: %zu points, arity=%zu\n",
                 i, npts, idx.tables[i].rt.points.empty() ? 0 :
                 (size_t)idx.tables[i].rt.points[0].dim());
-        // dump data[][] shape — idx.data[rel][col] is the columnar layout
+        // --- algorithm change: single-pass column stats ---
+        // upstream: separate min_element + max_element + copy+nth_element = 4 passes
+        // changed: one pass computes min, max, running sum; reservoir sample
+        //   of 64 elements → sort that to approximate median (no full copy)
         if (i < idx.data.size()) {
             fprintf(stderr, "[AJB_STATE]   data[%zu]: %zu columns", i, idx.data[i].size());
             for (size_t c = 0; c < idx.data[i].size(); c++) {
-                int len = idx.data[i][c].size();
+                int len = (int)idx.data[i][c].size();
                 if (len > 0) {
-                    // min/max of this column
-                    int cmin = *min_element(idx.data[i][c].begin(), idx.data[i][c].end());
-                    int cmax = *max_element(idx.data[i][c].begin(), idx.data[i][c].end());
-                    // median via nth_element on a copy
-                    vector<int> tmp(idx.data[i][c]);
-                    nth_element(tmp.begin(), tmp.begin() + len/2, tmp.end());
-                    int cmed = tmp[len/2];
-                    fprintf(stderr, " | col%zu[%d]: min=%d med=%d max=%d",
-                            c, len, cmin, cmed, cmax);
+                    int cmin = idx.data[i][c][0], cmax = cmin;
+                    long long csum = 0;
+                    // reservoir sample for approximate median
+                    const int RSAMP = 64;
+                    int reservoir[RSAMP];
+                    int rcount = 0;
+                    unsigned lcg = 2654435761u;  // Knuth multiplicative hash seed
+                    for (int k = 0; k < len; k++) {
+                        int v = idx.data[i][c][k];
+                        if (v < cmin) cmin = v;
+                        if (v > cmax) cmax = v;
+                        csum += v;
+                        // reservoir sampling: keep RSAMP uniform samples
+                        if (rcount < RSAMP) {
+                            reservoir[rcount++] = v;
+                        } else {
+                            lcg = lcg * 1664525u + 1013904223u;
+                            int j = lcg % (k + 1);
+                            if (j < RSAMP) reservoir[j] = v;
+                        }
+                    }
+                    sort(reservoir, reservoir + rcount);
+                    int cmed = reservoir[rcount / 2];
+                    fprintf(stderr, " | col%zu[%d]: min=%d med~%d max=%d avg=%.0f",
+                            c, len, cmin, cmed, cmax, (double)csum / len);
                 }
             }
             fprintf(stderr, "\n");
@@ -100,12 +129,21 @@ int main() {
     idx.jt.print();
     idx.jt.printChildren();
 
-    // upstream: 3.5M MultiHeadBinarySearch stress test
+    // --- algorithm change: LCG test value generation ---
+    // upstream: srand(42) + rand() % BIG — uses global state, implementation-defined
+    // changed: explicit LCG with known constants (Numerical Recipes), fully
+    //   portable and deterministic, no mutex on global rand state
     int testTime = 3500000;
     vector<int> test(testTime);
-    srand(42);  // AJB: fixed seed
-    for(int i = 0; i < testTime; i++) {
-        test[i] = rand() % 2060495465;
+    {
+        uint64_t lcg_state = 42;
+        const uint64_t lcg_a = 6364136223846793005ULL;
+        const uint64_t lcg_c = 1442695040888963407ULL;
+        const int mod = 2060495465;
+        for (int i = 0; i < testTime; i++) {
+            lcg_state = lcg_state * lcg_a + lcg_c;
+            test[i] = (int)((lcg_state >> 16) % mod);
+        }
     }
 
     // upstream: build veciters from idx.data
@@ -119,25 +157,36 @@ int main() {
     long rss_pre = ajb_rss_kb();
     fprintf(stderr, "[AJB_MEM] pre_MHBS: RSS=%ld KB\n", rss_pre);
 
-    // AJB: sample MHBS results to verify distribution
-    vector<int> mhbs_samples;
-    mhbs_samples.reserve(100);
+    // --- algorithm change: MHBS with result histogram + bitwise progress ---
+    // upstream: plain loop with periodic fprintf via modulo
+    // changed: accumulate result distribution into 4-bucket histogram (quartiles
+    //   of AGM range), use bitwise mask for progress check (faster than %),
+    //   track min/max result instead of sampling every 100K into a vector
+    int mhbs_min = INT_MAX, mhbs_max = INT_MIN;
+    long long mhbs_sum = 0;
+    int histogram[4] = {0, 0, 0, 0};
+    int agm_quarter = max(1, (int)(idx.FB.AGM / 4));
 
-    // upstream: timed MHBS loop
+    // progress mask: fire every 2^19 = 524288 iterations (approx 500K)
+    const int PROGRESS_MASK = (1 << 19) - 1;
+
     auto tstart = chrono::high_resolution_clock::now();
     for(int i = 0; i < testTime; i++) {
         int b = MultiHeadBinarySearch(veciters, flag, test[i], q);
 
-        // AJB: sample every 100K for result distribution check
-        if (i % 100000 == 0) {
-            mhbs_samples.push_back(b);
-        }
-        // AJB: progress trace every 500K
-        if ((i+1) % 500000 == 0) {
+        // histogram: which quartile of [0, AGM) does b fall into?
+        int bucket = min(3, b / agm_quarter);
+        histogram[bucket]++;
+        if (b < mhbs_min) mhbs_min = b;
+        if (b > mhbs_max) mhbs_max = b;
+        mhbs_sum += b;
+
+        // bitwise progress (no modulo division)
+        if ((i & PROGRESS_MASK) == 0 && i > 0) {
             auto tnow = chrono::high_resolution_clock::now();
             double elapsed = chrono::duration<double>(tnow - tstart).count();
             fprintf(stderr, "[AJB_TRACE] MHBS %d/%d (%.0f%%) %.3fs\n",
-                    i+1, testTime, 100.0*(i+1)/testTime, elapsed);
+                    i, testTime, 100.0*i/testTime, elapsed);
         }
     }
     auto tend = chrono::high_resolution_clock::now();
@@ -146,13 +195,16 @@ int main() {
     fprintf(stderr, "[AJB_TIMER] MHBS: %.3fs (%d ops, %.1f Mops/s)\n",
             elapsed_time, testTime, testTime / elapsed_time / 1e6);
 
-    // AJB_STATE: dump MHBS result samples
-    fprintf(stderr, "[AJB_STATE] MHBS samples (every 100K): [");
-    for (size_t s = 0; s < mhbs_samples.size(); s++) {
-        if (s) fprintf(stderr, ", ");
-        fprintf(stderr, "%d", mhbs_samples[s]);
+    // debug: MHBS result distribution from histogram
+    fprintf(stderr, "[AJB_STATE] MHBS histogram (quartiles of AGM): [");
+    for (int h = 0; h < 4; h++) {
+        if (h) fprintf(stderr, ", ");
+        fprintf(stderr, "Q%d=%d(%.1f%%)", h, histogram[h],
+                100.0 * histogram[h] / testTime);
     }
     fprintf(stderr, "]\n");
+    fprintf(stderr, "[AJB_STATE] MHBS result: min=%d max=%d avg=%.1f\n",
+            mhbs_min, mhbs_max, (double)mhbs_sum / testTime);
 
     // === splitBucket validation — ACTIVATED from upstream comments ===
     fprintf(stderr, "[AJB_BP] === splitBucket validation ===\n");
@@ -184,12 +236,36 @@ int main() {
         }
         fprintf(stderr, "]\n");
     }
-    // AGM conservation check: sum of children AGMs should equal parent
+    // --- algorithm change: recursive AGM conservation check ---
+    // upstream: no verification of split correctness at all (commented out)
+    // changed: verify that sum of children AGMs == parent AGM,
+    //   then recurse one level deeper — for each child with AGM > 1,
+    //   split again and verify grandchild AGMs sum to child AGM.
+    //   This catches off-by-one errors in the split/AGM calculation.
     long long son_agm_sum = 0;
     for (auto& s : sons) son_agm_sum += s.AGM;
-    fprintf(stderr, "[AJB_STATE] parent_AGM=%lld children_AGM_sum=%lld %s\n",
+    bool level1_ok = (son_agm_sum == B.AGM);
+    fprintf(stderr, "[AJB_STATE] L1 AGM: parent=%lld sum(children)=%lld %s\n",
             (long long)B.AGM, son_agm_sum,
-            son_agm_sum == B.AGM ? "CONSISTENT" : "MISMATCH!");
+            level1_ok ? "CONSISTENT" : "MISMATCH!");
+
+    // Level 2: recurse into each child
+    int l2_checks = 0, l2_mismatches = 0;
+    for (size_t i = 0; i < sons.size(); i++) {
+        if (sons[i].AGM <= 1) continue;
+        idx.setAGMandIters(sons[i]);
+        vector<Bucket> grandsons = idx.splitBucket(sons[i]);
+        long long gs_sum = 0;
+        for (auto& gs : grandsons) gs_sum += gs.AGM;
+        l2_checks++;
+        if (gs_sum != sons[i].AGM) {
+            l2_mismatches++;
+            fprintf(stderr, "[AJB_WARN] L2 son[%zu] AGM=%lld but grandchildren sum=%lld\n",
+                    i, (long long)sons[i].AGM, gs_sum);
+        }
+    }
+    fprintf(stderr, "[AJB_STATE] L2 AGM: %d children checked, %d mismatches\n",
+            l2_checks, l2_mismatches);
 
     // dump ajb_idx_stats
     ajb_idx_stats.dump("index_full");

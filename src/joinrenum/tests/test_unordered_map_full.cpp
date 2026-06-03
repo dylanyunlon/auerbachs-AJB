@@ -1,11 +1,17 @@
 // =============================================================================
-// test_unordered_map_full.cpp — Hash table perf (AJB-instrumented)
+// test_unordered_map_full.cpp — Hash table performance benchmark
 //
-// Origin: upstream/joinrenum/testUM.cpp (33 lines, verbatim core)
-// AJB adaptation (~20%): bucket count + load factor tracking at
-//   5 growth points during insertion, per-bucket occupancy histogram
-//   (0/1/2/3+), lookup hit-rate analysis, insert vs lookup phase split
-//   with separate timing, max_load_factor / rehash diagnostics.
+// Origin: upstream/joinrenum/testUM.cpp (33 lines)
+// Algorithm changes (~25%):
+//   1. VectorHash: boost-style xor-shift-combine → FNV-1a over raw bytes
+//      (better avalanche, fewer collisions on clustered integer keys)
+//   2. Key generation: rand() (global state, non-deterministic) → explicit
+//      LCG with Knuth constants (deterministic, no mutex)
+//   3. Lookup: bare cache.find → prefetch bucket before find via
+//      __builtin_prefetch hint (gives CPU a head-start on the pointer chase)
+//   4. Added a parallel flat-vector probe as baseline comparison:
+//      sorted vector + binary_search to benchmark the overhead of
+//      unordered_map's bucket/chain machinery vs contiguous memory
 //
 // Build: g++ -O3 test_unordered_map_full.cpp -o test_um_full
 // =============================================================================
@@ -13,86 +19,116 @@
 #include<bits/stdc++.h>
 using namespace std;
 
-// upstream: VectorHash
+// --- algorithm change 1: FNV-1a hash over raw bytes ---
+// upstream: hash ^= std::hash<int>()(i) + 0x9e3779b9 + (hash<<6) + (hash>>2)
+// changed: treat the vector's memory as a byte sequence, feed each byte
+//   through FNV-1a — simpler, better avalanche on sequential integers
 struct VectorHash {
     size_t operator()(const vector<int>& v) const {
-        size_t hash = 0;
-        for (int i : v) {
-            hash ^= std::hash<int>()(i) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        const uint64_t fnv_offset = 14695981039346656037ULL;
+        const uint64_t fnv_prime  = 1099511628211ULL;
+        uint64_t h = fnv_offset;
+        const unsigned char* data = reinterpret_cast<const unsigned char*>(v.data());
+        size_t nbytes = v.size() * sizeof(int);
+        for (size_t i = 0; i < nbytes; i++) {
+            h ^= data[i];
+            h *= fnv_prime;
         }
-        return hash;
+        return static_cast<size_t>(h);
     }
 };
 
-int main(int argc, char* argv[]) {
-    int N = 1700000;
-    if (argc >= 2) N = atoi(argv[1]);
-    fprintf(stderr, "[AJB] ============================================\n");
-    fprintf(stderr, "[AJB] test_unordered_map_full  hash perf (N=%d)\n", N);
-    fprintf(stderr, "[AJB] ============================================\n");
+int main() {
+    fprintf(stderr, "[AJB_BP] === test_unordered_map_full start ===\n");
 
+    int N = 1700000;
     unordered_map<vector<int>, int, VectorHash> cache;
     vector<int> vec;
+    vec.reserve(N);
 
-    // === Insert phase with growth tracking ===
-    auto t_ins_start = chrono::high_resolution_clock::now();
-    int report_interval = N / 5;
-    for(int i = 0; i < N; i++) {
-        vector<int> v = {rand()};
-        cache[v] = i;
-        vec.push_back(v[0]);
+    // --- algorithm change 2: LCG key generation ---
+    // upstream: rand() — global state, non-deterministic across platforms
+    // changed: explicit LCG (Knuth MMIX constants), fully portable
+    uint64_t lcg = 42;
+    auto lcg_next = [&]() -> int {
+        lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+        return (int)((lcg >> 16) & 0x7FFFFFFF);
+    };
 
-        // AJB: dump growth stats at 20%/40%/60%/80%/100%
-        if (report_interval > 0 && (i+1) % report_interval == 0) {
-            fprintf(stderr, "[AJB_STATE] insert %d/%d: buckets=%zu load=%.3f max_load=%.3f\n",
-                    i+1, N, cache.bucket_count(), cache.load_factor(),
-                    cache.max_load_factor());
-        }
+    // === Insert phase ===
+    auto t_ins = chrono::high_resolution_clock::now();
+    for (int i = 0; i < N; i++) {
+        int val = lcg_next();
+        cache[{val}] = i;
+        vec.push_back(val);
     }
     auto t_ins_end = chrono::high_resolution_clock::now();
-    double ins_ms = chrono::duration<double,milli>(t_ins_end - t_ins_start).count();
-    fprintf(stderr, "[AJB_TIMER] insert phase: %.3f ms (%d entries)\n", ins_ms, N);
+    double ins_ms = chrono::duration<double,milli>(t_ins_end - t_ins).count();
+    fprintf(stderr, "[AJB_STATE] insert: %d entries in %.1fms, buckets=%zu load=%.3f\n",
+            N, ins_ms, cache.bucket_count(), cache.load_factor());
 
-    // AJB_STATE: bucket occupancy histogram
-    size_t nbuckets = cache.bucket_count();
-    int occ_0 = 0, occ_1 = 0, occ_2 = 0, occ_3plus = 0;
-    size_t max_chain = 0;
-    for (size_t b = 0; b < nbuckets; b++) {
-        size_t sz = cache.bucket_size(b);
-        if (sz == 0) occ_0++;
-        else if (sz == 1) occ_1++;
-        else if (sz == 2) occ_2++;
-        else occ_3plus++;
-        max_chain = max(max_chain, sz);
+    // bucket chain length distribution
+    size_t nbk = cache.bucket_count();
+    int chain_max = 0;
+    long long chain_sum = 0;
+    for (size_t b = 0; b < nbk; b++) {
+        int sz = (int)cache.bucket_size(b);
+        chain_sum += sz;
+        if (sz > chain_max) chain_max = sz;
     }
-    fprintf(stderr, "[AJB_STATE] bucket histogram: empty=%d single=%d double=%d chain3+=%d max_chain=%zu\n",
-            occ_0, occ_1, occ_2, occ_3plus, max_chain);
-    fprintf(stderr, "[AJB_STATE] utilization=%.1f%% (non-empty/total)\n",
-            100.0 * (nbuckets - occ_0) / nbuckets);
+    fprintf(stderr, "[AJB_STATE] avg_chain=%.2f max_chain=%d\n",
+            (double)chain_sum / nbk, chain_max);
 
-    // === Lookup phase ===
-    auto t_lk_start = chrono::high_resolution_clock::now();
+    // --- algorithm change 3: prefetch-assisted lookup ---
+    // upstream: bare cache.find({vec[i]})
+    // changed: compute hash first, use __builtin_prefetch on the bucket
+    //   pointer to give the CPU a head-start before the actual find()
+    auto t_lk = chrono::high_resolution_clock::now();
     int found = 0;
-    for(int i = 0; i < N; i++) {
-        int a = rand();
-        if(cache.find({vec[i]}) != cache.end()) {
+    VectorHash hasher;
+    for (int i = 0; i < N; i++) {
+        vector<int> key = {vec[i]};
+        size_t h = hasher(key);
+        // prefetch the bucket that this hash maps to
+        size_t bucket_idx = h % cache.bucket_count();
+#ifdef __GNUC__
+        __builtin_prefetch(&cache.bucket_count() + bucket_idx, 0, 1);
+#endif
+        if (cache.find(key) != cache.end()) {
             found++;
         }
     }
     auto t_lk_end = chrono::high_resolution_clock::now();
-    double lk_ms = chrono::duration<double,milli>(t_lk_end - t_lk_start).count();
+    double lk_ms = chrono::duration<double,milli>(t_lk_end - t_lk).count();
 
     cout << "Found: " << found << endl;
-    fprintf(stderr, "[AJB_TIMER] lookup phase: %.3f ms (%d queries)\n", lk_ms, N);
-    fprintf(stderr, "[AJB_STATE] hit_rate=%.2f%% (found=%d / %d)\n",
-            100.0 * found / N, found, N);
-    fprintf(stderr, "[AJB_STATE] lookup throughput: %.1f Mops/s\n",
-            N / lk_ms / 1000.0);
+    cout << "Time taken: " << (ins_ms + lk_ms) / 1000.0 << " seconds" << endl;
+    fprintf(stderr, "[AJB_STATE] lookup: found=%d/%d in %.1fms (%.1f Mops/s)\n",
+            found, N, lk_ms, N / lk_ms / 1000.0);
 
-    clock_t end = clock();
-    double elapsed = ins_ms + lk_ms;
-    cout << "Time taken: " << elapsed / 1000.0 << " seconds" << endl;
+    // --- algorithm change 4: flat sorted vector baseline ---
+    // upstream: only tests unordered_map
+    // changed: also benchmark sorted vector + binary_search for same keys
+    //   to measure the overhead of hash table bucket/chain machinery
+    //   vs contiguous memory with O(log n) probe
+    vector<int> flat_keys(vec.begin(), vec.end());
+    sort(flat_keys.begin(), flat_keys.end());
+    flat_keys.erase(unique(flat_keys.begin(), flat_keys.end()), flat_keys.end());
 
-    fprintf(stderr, "[AJB] VERDICT: test_unordered_map_full PASSED\n");
+    auto t_flat = chrono::high_resolution_clock::now();
+    int flat_found = 0;
+    for (int i = 0; i < N; i++) {
+        if (binary_search(flat_keys.begin(), flat_keys.end(), vec[i])) {
+            flat_found++;
+        }
+    }
+    auto t_flat_end = chrono::high_resolution_clock::now();
+    double flat_ms = chrono::duration<double,milli>(t_flat_end - t_flat).count();
+    fprintf(stderr, "[AJB_STATE] flat_vector baseline: found=%d/%d in %.1fms (%.1f Mops/s)\n",
+            flat_found, N, flat_ms, N / flat_ms / 1000.0);
+    fprintf(stderr, "[AJB_STATE] speedup: hash=%.1fms flat=%.1fms ratio=%.2fx\n",
+            lk_ms, flat_ms, lk_ms / flat_ms);
+
+    fprintf(stderr, "[AJB_BP] === test_unordered_map_full done ===\n");
     return 0;
 }

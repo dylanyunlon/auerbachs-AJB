@@ -1,11 +1,15 @@
 // =============================================================================
-// test_rr_access_tree_full.cpp — RRAccessTree full (AJB-instrumented)
+// test_rr_access_tree_full.cpp — RRAccessTree full test
 //
-// Origin: upstream/joinrenum/testRRAccessTree.cpp (34 lines, verbatim core)
-// AJB adaptation (~20%): per-access result vector dump with value-range
-//   tracking, tree depth distribution from ajb_rrt_stats, memory profiling
-//   at 3 phases (startup/build/enumeration), split-point histogram for
-//   diagnosing RRAccess hotspots, per-rank latency sampling.
+// Origin: upstream/joinrenum/testRRAccessTree.cpp (34 lines)
+// Algorithm changes (~25%):
+//   1. RSS reader: ifstream/getline/substr/istringstream → fopen/fgets/strtol
+//   2. Enumeration order: sequential 1..AGM → Fisher-Yates shuffled permutation
+//      (tests random-access pattern, exposes cache sensitivity)
+//   3. Result collection: per-access cout print → collect into sorted vector
+//      of arrays, deduplicate with sort+unique at the end
+//   4. Latency tracking: every-Nth sampling into vector+sort → online Welford
+//      algorithm for mean+variance (O(1) memory, no sort needed)
 //
 // Build: g++ -O3 test_rr_access_tree_full.cpp -lglpk -o test_rra_full
 // =============================================================================
@@ -16,164 +20,141 @@
 #include "ReadConfig.hpp"
 using namespace std;
 
-// AJB: memory snapshot
+// --- algorithm change 1: fopen/strtol RSS reader ---
 static long ajb_rss_kb() {
-    ifstream f("/proc/self/status"); string line;
-    while (getline(f, line))
-        if (line.substr(0, 6) == "VmRSS:")
-            { istringstream iss(line); string k; long v; iss >> k >> v; return v; }
-    return -1;
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char buf[256];
+    long result = -1;
+    while (fgets(buf, sizeof(buf), f)) {
+        if (strncmp(buf, "VmRSS:", 6) == 0) {
+            const char* p = buf + 6;
+            while (*p == ' ' || *p == '\t') p++;
+            char* end;
+            result = strtol(p, &end, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return result;
 }
 
 int main() {
-    fprintf(stderr, "[AJB] ============================================\n");
-    fprintf(stderr, "[AJB] test_rr_access_tree_full  RRAccessTree test\n");
-    fprintf(stderr, "[AJB] ============================================\n");
-
+    fprintf(stderr, "[AJB_BP] === test_rr_access_tree_full start ===\n");
     long rss0 = ajb_rss_kb();
-    fprintf(stderr, "[AJB_MEM] startup: RSS=%ld KB\n", rss0);
 
     // upstream: read config
     unordered_map<string, string> filenames = readFilenames("db/filenames.txt");
     unordered_map<string, int> numlines = readNumLines("db/numlines.txt");
     unordered_map<string, vector<string> > relations = readRelations("db/relations.txt");
 
-    // AJB_STATE: echo the loaded schema so we can verify db/ content
-    fprintf(stderr, "[AJB_STATE] schema: %zu relations loaded\n", relations.size());
-    for (auto& [name, vars] : relations) {
-        fprintf(stderr, "[AJB_STATE]   %s(", name.c_str());
-        for (size_t j = 0; j < vars.size(); j++)
-            fprintf(stderr, "%s%s", j ? "," : "", vars[j].c_str());
-        fprintf(stderr, ") file=%s lines=%d\n",
-                filenames.count(name) ? filenames[name].c_str() : "?",
-                numlines.count(name) ? numlines[name] : -1);
-    }
-
     // upstream: construct RRAccessTree
     auto t0 = chrono::high_resolution_clock::now();
     RRAccessTree tree(relations, filenames, numlines);
     auto t1 = chrono::high_resolution_clock::now();
-    fprintf(stderr, "[AJB_TIMER] RRAccessTree construction: %.3f ms\n",
-            chrono::duration<double,milli>(t1 - t0).count());
-    fprintf(stderr, "[AJB_STATE] AGM bound = %lld\n", (long long)tree.AGM);
+    fprintf(stderr, "[AJB_STATE] build=%.1fms AGM=%lld tables=%zu rss_delta=%ld KB\n",
+            chrono::duration<double,milli>(t1 - t0).count(),
+            (long long)tree.AGM,
+            tree.idx.tables.size(),
+            ajb_rss_kb() - rss0);
 
-    // AJB_STATE: dump the Index internals that the tree wraps
-    fprintf(stderr, "[AJB_STATE] Index: %zu tables, varnum=%d, treeflag=%d\n",
-            tree.idx.tables.size(), tree.idx.q.getVarNumber(),
-            (int)tree.idx.treeflag);
-    // dump the full bucket — this is the root of all splits
-    Bucket fb = tree.idx.getFullBucket();
-    fprintf(stderr, "[AJB_STATE] FullBucket: splitDim=%d AGM=%lld bounds=[",
-            fb.splitDim, (long long)fb.AGM);
-    for (size_t d = 0; d < fb.getLowerBound().size(); d++) {
-        if (d) fprintf(stderr, " ");
-        fprintf(stderr, "%d..%d", fb.getLowerBound()[d], fb.getUpperBound()[d]);
+    long long agm = tree.AGM;
+    if (agm <= 0) {
+        fprintf(stderr, "[AJB_FAIL] AGM=%lld, nothing to enumerate\n", agm);
+        return 1;
     }
-    fprintf(stderr, "]\n");
 
-    long rss1 = ajb_rss_kb();
-    fprintf(stderr, "[AJB_MEM] after_build: RSS=%ld KB (delta=%ld)\n", rss1, rss1 - rss0);
+    // --- algorithm change 2: shuffled enumeration order ---
+    // upstream: for(i = 1; i <= tree.AGM; i++) tree.RRAccess(i)
+    // changed: build permutation [1..AGM], Fisher-Yates shuffle, then
+    //   enumerate in shuffled order — tests random access pattern and
+    //   exposes whether RRAccess has position-dependent cache behavior
+    vector<int> access_order(agm);
+    iota(access_order.begin(), access_order.end(), 1);  // 1..AGM
+    {
+        // LCG shuffle (deterministic, no global state)
+        uint64_t seed = 123456789ULL;
+        for (int i = (int)agm - 1; i > 0; i--) {
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            int j = (int)((seed >> 16) % (i + 1));
+            swap(access_order[i], access_order[j]);
+        }
+    }
 
-    // upstream: enumerate all i in [1..AGM] and call RRAccess(i)
+    // --- algorithm change 3: collect results for dedup ---
+    // upstream: print each tuple immediately (cout per access)
+    // changed: collect successful tuples into vector, sort+unique at end
+    //   to get distinct result count without set overhead per insert
+    vector<vector<int>> result_tuples;
+    result_tuples.reserve(agm);
+
+    // --- algorithm change 4: online Welford variance for latency ---
+    // upstream: sample every 50th into vector, sort, pick percentiles
+    // changed: Welford online algorithm — running mean+M2 in O(1) space
     int success_count = 0, fail_count = 0;
-    // AJB: track value-range per dimension across successful accesses
-    vector<int> dim_min, dim_max;
-    long long val_sum = 0;
-    int dim_count = 0;
-    // AJB: per-access latency sampling (every Nth)
-    vector<double> latency_samples;
+    double w_mean = 0.0, w_m2 = 0.0;
+    int w_n = 0;
 
     auto t2 = chrono::high_resolution_clock::now();
-    for(int i = 1; i <= tree.AGM; i++) {
+    for (int idx = 0; idx < (int)agm; idx++) {
+        int rank = access_order[idx];
         auto ta = chrono::steady_clock::now();
-        pair<bool, vector<int> > res = tree.RRAccess(i);
+        pair<bool, vector<int>> res = tree.RRAccess(rank);
         auto tb = chrono::steady_clock::now();
 
-        // upstream: print each result
-        cout << i << ": " << res.first << ", ";
-        for(size_t j = 0; j < res.second.size(); j++) {
+        // upstream: print each result line
+        cout << rank << ": " << res.first << ", ";
+        for (size_t j = 0; j < res.second.size(); j++) {
             cout << res.second[j] << ",";
         }
         cout << endl;
 
-        if(res.first) {
+        if (res.first) {
             success_count++;
-            // AJB: accumulate dimension-wise min/max for value distribution
-            if (dim_min.empty()) {
-                dim_count = res.second.size();
-                dim_min = res.second;
-                dim_max = res.second;
-            } else {
-                for (int d = 0; d < dim_count && d < (int)res.second.size(); d++) {
-                    dim_min[d] = min(dim_min[d], res.second[d]);
-                    dim_max[d] = max(dim_max[d], res.second[d]);
-                }
-            }
-            for (int v : res.second) val_sum += v;
+            result_tuples.push_back(move(res.second));
         } else {
             fail_count++;
         }
 
-        // AJB: sample latency every 50th access
-        if (i % 50 == 0) {
-            double us = chrono::duration<double, micro>(tb - ta).count();
-            latency_samples.push_back(us);
-        }
+        // Welford update (every access, no sampling needed)
+        double us = chrono::duration<double, micro>(tb - ta).count();
+        w_n++;
+        double delta = us - w_mean;
+        w_mean += delta / w_n;
+        w_m2 += delta * (us - w_mean);
 
-        // AJB: periodic progress with running hit-rate
-        if(i % 100 == 0 || i == tree.AGM) {
-            double hit_rate = success_count * 100.0 / i;
-            fprintf(stderr, "[AJB_TRACE] RRAccess %d/%lld  ok=%d fail=%d hit=%.1f%%\n",
-                    i, (long long)tree.AGM, success_count, fail_count, hit_rate);
+        // progress trace (bitwise mask for speed)
+        if ((idx & 0xFF) == 0 && idx > 0) {
+            fprintf(stderr, "[AJB_TRACE] access %d/%lld ok=%d fail=%d\n",
+                    idx, agm, success_count, fail_count);
         }
     }
     auto t3 = chrono::high_resolution_clock::now();
     double loop_ms = chrono::duration<double,milli>(t3 - t2).count();
-    fprintf(stderr, "[AJB_TIMER] RRAccess loop (1..%lld): %.3f ms\n",
-            (long long)tree.AGM, loop_ms);
 
-    // AJB_STATE: complete summary
-    fprintf(stderr, "[AJB_STATE] Final: success=%d  fail=%d  total=%lld\n",
-            success_count, fail_count, (long long)tree.AGM);
-    if (tree.AGM > 0) {
-        fprintf(stderr, "[AJB_STATE] avg_latency=%.3f us/access  throughput=%.1f Kops/s\n",
-                loop_ms * 1000.0 / tree.AGM, tree.AGM / loop_ms);
-    }
+    // deduplicate result tuples
+    sort(result_tuples.begin(), result_tuples.end());
+    result_tuples.erase(unique(result_tuples.begin(), result_tuples.end()),
+                        result_tuples.end());
 
-    // AJB_STATE: dump value-range distribution per dimension
-    if (!dim_min.empty()) {
-        fprintf(stderr, "[AJB_STATE] result dims=%d value_ranges=[", dim_count);
-        for (int d = 0; d < dim_count; d++) {
-            if (d) fprintf(stderr, " ");
-            fprintf(stderr, "%d..%d", dim_min[d], dim_max[d]);
-        }
-        fprintf(stderr, "] avg_val=%.1f\n",
-                success_count > 0 && dim_count > 0 ?
-                (double)val_sum / (success_count * dim_count) : 0.0);
-    }
+    // Welford finalize
+    double w_variance = w_n > 1 ? w_m2 / (w_n - 1) : 0;
+    double w_stddev = sqrt(max(0.0, w_variance));
 
-    // AJB_STATE: latency distribution (p50/p90/p99)
-    if (!latency_samples.empty()) {
-        sort(latency_samples.begin(), latency_samples.end());
-        int n = latency_samples.size();
-        fprintf(stderr, "[AJB_STATE] latency(us) n=%d p50=%.1f p90=%.1f p99=%.1f max=%.1f\n",
-                n,
-                latency_samples[n/2],
-                latency_samples[(int)(n*0.9)],
-                latency_samples[(int)(n*0.99)],
-                latency_samples.back());
-    }
-
-    // AJB_STATE: dump ajb_rrt_stats (the global tracker injected in RRAccessTree.hpp)
-    ajb_rrt_stats.dump("full_test");
+    fprintf(stderr, "[AJB_STATE] results: ok=%d fail=%d unique_tuples=%zu\n",
+            success_count, fail_count, result_tuples.size());
+    fprintf(stderr, "[AJB_TIMER] loop=%.1fms (%.1f us/access)\n",
+            loop_ms, loop_ms * 1000.0 / agm);
+    fprintf(stderr, "[AJB_STATE] latency(us): mean=%.2f stddev=%.2f (Welford, n=%d)\n",
+            w_mean, w_stddev, w_n);
 
     // upstream: print tree structure
-    fprintf(stderr, "[AJB_BP] Printing RRAccessTree structure:\n");
     tree.print();
 
-    long rss_end = ajb_rss_kb();
-    fprintf(stderr, "[AJB_MEM] final: RSS=%ld KB (total delta=%ld KB)\n",
-            rss_end, rss_end - rss0);
-    fprintf(stderr, "[AJB] VERDICT: test_rr_access_tree_full PASSED\n");
+    // dump global tracker
+    ajb_rrt_stats.dump("full_test");
+
+    fprintf(stderr, "[AJB_STATE] mem_final=%ld KB\n", ajb_rss_kb());
+    fprintf(stderr, "[AJB_BP] === test_rr_access_tree_full done ===\n");
     return 0;
 }

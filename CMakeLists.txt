@@ -210,6 +210,13 @@ if(GLPK_LIBRARY)
   target_compile_features(ajb_test_join_baseline PRIVATE cxx_std_17)
   set_target_properties(ajb_test_join_baseline PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 
+  # --- test_join_baseline_upstream (algorithm-level rewrite: FNV-1a hash,
+  #     flat adjacency array, strtol parser, sort+unique dedup, no GLPK) ---
+  add_executable(ajb_test_join_baseline_upstream "src/joinrenum/tests/test_join_baseline_upstream.cpp")
+  target_include_directories(ajb_test_join_baseline_upstream PRIVATE ${AJB_RENUM_INCLUDE_DIRS})
+  target_compile_features(ajb_test_join_baseline_upstream PRIVATE cxx_std_17)
+  set_target_properties(ajb_test_join_baseline_upstream PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+
   # --- tool targets (original AJB-adapted, Claude-8) ---
   set(AJB_RENUM_TOOLS
     gen_co_data
