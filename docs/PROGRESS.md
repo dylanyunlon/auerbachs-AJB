@@ -89,28 +89,62 @@ Claude-8  M151-M175     d27c9fb  code                   JoinREnum test/tool port
     test_join_baseline_full: 新建, 度分布+join探测+三角采样
     gen_co_data_full/wash_data_full: per-dim分布/碰撞率/值范围
 
-第2位 Claude   M621-M670   ⏳ next     Experiment execution: full suite
-  cadence_sweep, vs_upstream, skew_sensitivity, scalability, auto_tune
-  multi-seed runs (3-5 seeds per config)
-  validate timer consistency, parse .stderr.log for anomalies
+第2位 Claude   M621-M660   ✅ DONE     (本session, 实为接力第1位Claude)
+  算法级改写全部12个_full文件 — 去掉伪算法(strtol/FNV/LCG只是换IO),
+  替换为真正的数据结构/遍历策略/验证逻辑改写:
+    test_bucket_pool: splitDim独立计算, free-list stress, copy independence
+    test_count_oracle: 全维独立range+collapse, volume排序query, monotonicity验证
+    test_enumerator: 多策略对比(option=0vs3), Amdahl瓶颈, 反向RRAccess验证
+    test_index: reservoir sampling中位数, quartile histogram, 递归AGM conservation
+    test_join_baseline: flat adj array+offset table, binary_search R-check
+    test_join_tree: pre-alloc bound fill, median-of-5 timing
+    test_rr_access_tree: Fisher-Yates shuffled枚举, sort+unique dedup, Welford方差
+    test_unordered_map: prefetch lookup, flat vector baseline对比
+    gen_co_data: correlated dim生成, lex sort输出, spatial grid验证(CV)
+    run_bpt: 随机ban intervals, pick uniqueness
+    upper_bound: predecessor binary search, sweep全值域验证, edge case stress
+    wash_data: dedup检测, bidirectional asymmetry
+  新增: test_join_baseline_upstream, build_joinrenum_targets.sh, run_flamegraph.sh
+  16 files changed, +2002 -889
 
-第3位 Claude   M671-M720   ⏳ next     Data analysis + publication figures
-  generate figure JSONs from CSVs, publication-quality plots (Figures 2-5)
-  fill paper Tables 1-2 with measured data
-  anomaly detection (flag >2σ), validate_plot_data pre-check
+─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+  ↓ 6位Claude接力计划 (当前最新规划)  ↓
+─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+第一位Claude在完成: M621-M660 ✅ (已完成,就是上面这个session)
+  算法级改写12个_full文件, 新增3个文件, CMakeLists更新
 
-第4位 Claude   M721-M770   ⏳ next     Paper revision + camera-ready
-  update Sections 5-6 with real data, revise speedup claims vs measured
-  robustness tests (1/4/8-GPU, θ=0.99)
-  camera-ready format, bib check, NeurIPS 2026 submission prep
+第二位Claude在完成: M661-M710
+  GPU build validation + compile fix:
+  • CMake configure + build on CUDA host (sm_70/80/90)
+  • Fix all compilation errors, link all targets
+  • Run _full tests on CPU, verify [AJB_*] trace pipeline
+  • Verify ajb_benchmark links cleanly
 
-第5位 Claude   M771-M820   ⏳ next     Reproducibility + artifacts
-  Docker/Singularity container, README one-command build+run
-  artifact evaluation checklist, Zenodo/GitHub release with DOI
+第三位Claude在完成: M711-M760
+  Experiment execution + data collection:
+  • cadence_sweep, vs_upstream, skew_sensitivity experiments
+  • multi-seed runs (3-5 seeds per config)
+  • Collect result CSVs, validate timer consistency
+  • Parse .stderr.log for anomalies
 
-第6位 Claude   M821-M870   ⏳ next     Final QA + submission
-  cross-check claims vs data, supplementary materials
-  pre-submission review, NeurIPS 2026 OpenReview submission
+第四位Claude在完成: M761-M810
+  Data analysis + publication figures:
+  • Generate figure JSONs from CSVs
+  • Publication-quality plots (Figures 2-5)
+  • Fill paper Tables 1-2 with measured data
+  • Anomaly detection (flag >2σ)
+
+第五位Claude在完成: M811-M860
+  Paper revision + camera-ready:
+  • Update Sections 5-6 with real experimental data
+  • Revise speedup claims, robustness tests (1/4/8-GPU, θ=0.99)
+  • Camera-ready format, bib check
+
+第六位Claude在完成: M861-M900
+  Final QA + submission:
+  • Cross-check claims vs data, supplementary materials
+  • Docker/Singularity container, reproducibility artifacts
+  • Zenodo/GitHub release, NeurIPS 2026 OpenReview submission
 ─────────────────────────────────────────────────────────────────────────────
 ```
 
