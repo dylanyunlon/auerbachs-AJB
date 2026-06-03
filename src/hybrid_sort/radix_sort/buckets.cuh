@@ -1,58 +1,55 @@
-// [AJB] hybrid_sort/radix_sort/buckets.cuh: Radix sort bucket分配
-#include <cstdio>
 #pragma once
-// =============================================================================
-// radix_sort/buckets.cuh — Bucket ID and spanning bucket (AJB-instrumented)
-// AJB: bucket creation trace, spanning detection logging, comparison counting.
-// =============================================================================
-#include <cstdio>
-
-// [AJB] Bucket lifecycle diagnostics
-static thread_local struct {
-    long long bucket_creates = 0;
-    long long comparisons = 0;
-    long long spanning_detections = 0;
-    void dump(const char* tag = "Buckets") {
-        fprintf(stderr, "[AJB_STATE][%s] creates=%lld compares=%lld spanning=%lld\n",
-                tag, bucket_creates, comparisons, spanning_detections);
-    }
-    void reset() { bucket_creates = comparisons = spanning_detections = 0; }
-} ajb_bucket_stats;
-
 
 #include <cub/cub.cuh>
 
 struct BucketId {
-  BucketId() {
-    partition_pass = 0;
-    bucket_number = 0;
-    predecessor = nullptr;
-  }
+  BucketId() : partition_pass(0), bucket_number(0), predecessor(nullptr), depth_(0) {}
 
-  BucketId(size_t partition_pass, size_t bucket_number) {
-    this->partition_pass = partition_pass;
-    this->bucket_number = bucket_number;
-    this->predecessor = nullptr;
-  }
+  BucketId(size_t partition_pass, size_t bucket_number)
+      : partition_pass(partition_pass), bucket_number(bucket_number),
+        predecessor(nullptr), depth_(1) {}
 
-  BucketId(size_t partition_pass, size_t bucket_number, BucketId* predecessor) {
-    this->partition_pass = partition_pass;
-    this->bucket_number = bucket_number;
-    this->predecessor = predecessor;
+  BucketId(size_t partition_pass, size_t bucket_number, BucketId* predecessor)
+      : partition_pass(partition_pass), bucket_number(bucket_number),
+        predecessor(predecessor),
+        depth_(predecessor ? predecessor->depth_ + 1 : 1) {}
+
+  // Upstream: 无法知道一个bucket经过了多少次partition.
+  // AJB: 递归深度跟踪 — 在skew场景下某些bucket会被反复partition,
+  // depth过深说明数据分布极端, 可能需要切换到merge sort路径.
+  size_t depth() const { return depth_; }
+
+  // 完整路径: 从当前bucket回溯到root, 返回每一级的bucket_number
+  // 在调试时可以看到某个bucket是怎么一步步split下来的
+  void trace_path(size_t* out_path, size_t max_len) const {
+    const BucketId* cur = this;
+    size_t i = 0;
+    while (cur && i < max_len) {
+      out_path[i++] = cur->bucket_number;
+      cur = cur->predecessor;
+    }
+    // 反转: out_path现在是root→leaf顺序
+    for (size_t l = 0, r = i - 1; l < r; ++l, --r) {
+      size_t tmp = out_path[l];
+      out_path[l] = out_path[r];
+      out_path[r] = tmp;
+    }
   }
 
   size_t partition_pass;
   size_t bucket_number;
   BucketId* predecessor;
+
+ private:
+  size_t depth_;
 };
 
 struct CompareBucketIds {
   bool operator()(const BucketId& a, const BucketId& b) const {
-    if (a.partition_pass == b.partition_pass) {
-      return a.bucket_number < b.bucket_number;
+    if (a.partition_pass != b.partition_pass) {
+      return a.partition_pass < b.partition_pass;
     }
-
-    return a.partition_pass < b.partition_pass;
+    return a.bucket_number < b.bucket_number;
   }
 };
 
@@ -66,6 +63,12 @@ struct ReducedSortingBucket {
 
   cub::DoubleBuffer<T> cub_double_buffer_keys;
   cub::DoubleBuffer<V> cub_double_buffer_values;
+
+  // Upstream: 无法估算这个bucket的cub sort需要多少临时显存.
+  // AJB: 根据bucket_size估算 — cub radix sort临时空间约=2*n*sizeof(key)
+  size_t estimated_temp_bytes() const {
+    return 2 * bucket_size * sizeof(T);
+  }
 };
 
 template <typename T, typename V>
@@ -81,10 +84,9 @@ struct LPSpanningBucketFraction {
   size_t fraction_size;
   size_t source_offset;
   size_t dest_offset;
-};
 
-// [AJB] hybrid_sort_radix_sort_buckets 诊断报告
-static inline void ajb_report_hybrid_sort_radix_sort_buckets(size_t n, double elapsed_ms, const char* phase) {
-    fprintf(stderr, "[AJB_TIMER][hybrid_sort_radix_sort_buckets] %s: n=%zu elapsed=%.3fms throughput=%.2f M/s\n",
-            phase, n, elapsed_ms, elapsed_ms > 0 ? n / elapsed_ms / 1000.0 : 0.0);
-}
+  // 传输量(字节) — 在bandwidth分析时需要
+  size_t transfer_bytes(size_t element_size) const {
+    return fraction_size * element_size;
+  }
+};

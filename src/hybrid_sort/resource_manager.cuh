@@ -1,10 +1,8 @@
-// [AJB] hybrid_sort/resource_manager.cuh: GPU资源管理: 显存arena + stream分配
-#include <cstdio>
 #pragma once
 
 #include <algorithm>
-#include <map>
 #include <vector>
+#include <cstdio>
 
 #include <cub/cub.cuh>
 #include <thrust/sort.h>
@@ -26,10 +24,23 @@ class ResourceManager {
         device_allocators_(device_allocators),
         stream_pools_(stream_pools),
         keys_double_buffers_(gpus.size()),
-        values_double_buffers_(gpus.size()) {
+        values_double_buffers_(gpus.size()),
+        per_gpu_alloc_bytes_(gpus.size(), 0) {
+
+    // Upstream: std::map<int,int> 做GPU id到index的映射.
+    // AJB改写: 用flat数组+线性扫描替代map.
+    // 理由: GPU数量<=64 (kMaxNumGpus), map的红黑树开销不值得,
+    // 而且在OMP并行区内map的iterator invalidation是隐患.
+    gpu_index_flat_.resize(256, -1);  // 覆盖常见GPU device id范围
     for (size_t g = 0; g < gpus_.size(); ++g) {
-      gpu_index_[gpus_[g]] = g;
+      int dev = gpus_[g];
+      if (dev >= 0 && dev < (int)gpu_index_flat_.size()) {
+        gpu_index_flat_[dev] = (int)g;
+      }
     }
+
+    fprintf(stderr, "[DEBUG][ResourceManager] init: %zu GPUs, %zu streams/GPU, chunk=%zu\n",
+            gpus_.size(), num_streams, chunk_size);
 
 #pragma omp parallel for num_threads(gpus_.size())
     for (size_t g = 0; g < gpus_.size(); ++g) {
@@ -44,6 +55,7 @@ class ResourceManager {
       stream_pools_[g].Initialize(num_streams_);
 
       const size_t adjusted_chunk_size = kChunkSizeMultiplier * chunk_size;
+      size_t buf_bytes = adjusted_chunk_size * (sizeof(T) + sizeof(V)) * 2;
 
       keys_double_buffers_[g].d_buffers[0] =
           reinterpret_cast<T*>(device_allocators_[g].allocate(adjusted_chunk_size * sizeof(T)));
@@ -53,8 +65,20 @@ class ResourceManager {
           reinterpret_cast<V*>(device_allocators_[g].allocate(adjusted_chunk_size * sizeof(V)));
       values_double_buffers_[g].d_buffers[1] =
           reinterpret_cast<V*>(device_allocators_[g].allocate(adjusted_chunk_size * sizeof(V)));
+
+      per_gpu_alloc_bytes_[g] = buf_bytes;
+
+      fprintf(stderr, "[DEBUG][ResourceManager] GPU %d: free=%zuMB total=%zuMB "
+              "arena=%.0fMB buffers=%zuMB\n",
+              gpus_[g], free_global_memory >> 20, total_global_memory >> 20,
+              (kDeviceMemoryUtilization * free_global_memory) / (1 << 20),
+              buf_bytes >> 20);
     }
 
+    // Warmup阶段: 对每个stream做一次小排序, 触发CUDA lazy init.
+    // Upstream用倒序数组 + thrust::sort.
+    // AJB改写: 用 cub::DeviceRadixSort 替代 thrust::sort 做warmup,
+    // 因为实际benchmark用的是cub的radix sort, warmup应该预热同一条代码路径.
 #pragma omp parallel for num_threads(gpus_.size())
     for (size_t g = 0; g < gpus_.size(); ++g) {
       CheckCudaError(cudaSetDevice(gpus_[g]));
@@ -62,28 +86,51 @@ class ResourceManager {
       for (size_t s = 0; s < num_streams_; ++s) {
         int* host_elements =
             reinterpret_cast<int*>(host_allocators_[g].allocate(kNumInitializationElements * sizeof(int)));
-        int* device_elements =
+        int* device_in =
+            reinterpret_cast<int*>(device_allocators_[g].allocate(kNumInitializationElements * sizeof(int)));
+        int* device_out =
             reinterpret_cast<int*>(device_allocators_[g].allocate(kNumInitializationElements * sizeof(int)));
 
         for (size_t i = 0; i < kNumInitializationElements; ++i) {
           host_elements[i] = kNumInitializationElements - i;
         }
 
-        CheckCudaError(cudaMemcpyAsync(device_elements, host_elements, kNumInitializationElements * sizeof(int),
+        CheckCudaError(cudaMemcpyAsync(device_in, host_elements, kNumInitializationElements * sizeof(int),
                                        cudaMemcpyHostToDevice, stream_pools_[g].GetStream(s)));
 
-        thrust::sort(thrust::cuda::par_nosync(device_allocators_[g]).on(stream_pools_[g].GetStream(s)), device_elements,
-                     device_elements + kNumInitializationElements);
+        // cub::DeviceRadixSort需要临时空间, 先query再分配
+        size_t temp_bytes = 0;
+        cub::DeviceRadixSort::SortKeys(nullptr, temp_bytes, device_in, device_out,
+                                       kNumInitializationElements, 0, sizeof(int) * 8,
+                                       stream_pools_[g].GetStream(s));
+        uint8_t* d_temp = device_allocators_[g].allocate(temp_bytes);
+        cub::DeviceRadixSort::SortKeys(d_temp, temp_bytes, device_in, device_out,
+                                       kNumInitializationElements, 0, sizeof(int) * 8,
+                                       stream_pools_[g].GetStream(s));
 
-        CheckCudaError(cudaMemcpyAsync(host_elements, device_elements, kNumInitializationElements * sizeof(int),
+        // 把结果拷回来验证warmup排序正确性
+        CheckCudaError(cudaMemcpyAsync(host_elements, device_out, kNumInitializationElements * sizeof(int),
                                        cudaMemcpyDeviceToHost, stream_pools_[g].GetStream(s)));
-
         CheckCudaError(cudaStreamSynchronize(stream_pools_[g].GetStream(s)));
 
+        // 验证: warmup数组应该有序
+        bool warmup_ok = true;
+        for (size_t i = 1; i < kNumInitializationElements; ++i) {
+          if (host_elements[i] < host_elements[i - 1]) { warmup_ok = false; break; }
+        }
+        if (!warmup_ok) {
+          fprintf(stderr, "[DEBUG][ResourceManager] WARNING: warmup sort FAILED on GPU %d stream %zu\n",
+                  gpus_[g], s);
+        }
+
+        device_allocators_[g].deallocate(d_temp);
+        device_allocators_[g].deallocate(reinterpret_cast<uint8_t*>(device_out));
         host_allocators_[g].deallocate(reinterpret_cast<uint8_t*>(host_elements));
-        device_allocators_[g].deallocate(reinterpret_cast<uint8_t*>(device_elements));
+        device_allocators_[g].deallocate(reinterpret_cast<uint8_t*>(device_in));
       }
     }
+    fprintf(stderr, "[DEBUG][ResourceManager] warmup done (%zu GPUs × %zu streams)\n",
+            gpus_.size(), num_streams_);
   }
 
   ~ResourceManager() {
@@ -98,38 +145,43 @@ class ResourceManager {
     }
   }
 
-  HostAllocator& GetHostAllocator(int gpu) { return host_allocators_[gpu_index_[gpu]]; }
+  // Upstream: map查找. AJB: flat array O(1)直查
+  int GpuIdx(int gpu) const { return gpu_index_flat_[gpu]; }
 
-  DeviceAllocator& GetDeviceAllocator(int gpu) { return device_allocators_[gpu_index_[gpu]]; }
-
-  StreamPool& GetStreamPool(int gpu) { return stream_pools_[gpu_index_[gpu]]; }
-
-  cub::DoubleBuffer<T>& GetKeysBuffer(int gpu) { return keys_double_buffers_[gpu_index_[gpu]]; }
-
-  cub::DoubleBuffer<V>& GetValuesBuffer(int gpu) { return values_double_buffers_[gpu_index_[gpu]]; }
+  HostAllocator& GetHostAllocator(int gpu) { return host_allocators_[GpuIdx(gpu)]; }
+  DeviceAllocator& GetDeviceAllocator(int gpu) { return device_allocators_[GpuIdx(gpu)]; }
+  StreamPool& GetStreamPool(int gpu) { return stream_pools_[GpuIdx(gpu)]; }
+  cub::DoubleBuffer<T>& GetKeysBuffer(int gpu) { return keys_double_buffers_[GpuIdx(gpu)]; }
+  cub::DoubleBuffer<V>& GetValuesBuffer(int gpu) { return values_double_buffers_[GpuIdx(gpu)]; }
 
   void FlipBuffers(int gpu) {
-    values_double_buffers_[gpu_index_[gpu]].selector ^= 1;
-    keys_double_buffers_[gpu_index_[gpu]].selector ^= 1;
+    int idx = GpuIdx(gpu);
+    values_double_buffers_[idx].selector ^= 1;
+    keys_double_buffers_[idx].selector ^= 1;
   }
 
-  T* GetKeys(int gpu) { return keys_double_buffers_[gpu_index_[gpu]].Current(); }
+  T* GetKeys(int gpu) { return keys_double_buffers_[GpuIdx(gpu)].Current(); }
+  V* GetValues(int gpu) { return values_double_buffers_[GpuIdx(gpu)].Current(); }
+  T* GetOtherKeys(int gpu) { return keys_double_buffers_[GpuIdx(gpu)].Alternate(); }
+  V* GetOtherValues(int gpu) { return values_double_buffers_[GpuIdx(gpu)].Alternate(); }
 
-  V* GetValues(int gpu) { return values_double_buffers_[gpu_index_[gpu]].Current(); }
-
-  T* GetOtherKeys(int gpu) { return keys_double_buffers_[gpu_index_[gpu]].Alternate(); }
-
-  V* GetOtherValues(int gpu) { return values_double_buffers_[gpu_index_[gpu]].Alternate(); }
+  // 断点调试: 打印所有GPU的显存使用快照
+  void dump_memory_state(const char* tag = "") const {
+    fprintf(stderr, "[DEBUG][ResourceManager::dump] %s\n", tag);
+    for (size_t g = 0; g < gpus_.size(); ++g) {
+      fprintf(stderr, "  GPU %d: buffer_alloc=%zuMB\n",
+              gpus_[g], per_gpu_alloc_bytes_[g] >> 20);
+    }
+  }
 
  private:
   static constexpr size_t kHostMemory = 64_MB;
   static constexpr double kDeviceMemoryUtilization = 0.98;
   static constexpr double kChunkSizeMultiplier = 1.01;
-
   static constexpr size_t kNumInitializationElements = 10;
 
   std::vector<int> gpus_;
-  std::map<int, int> gpu_index_;
+  std::vector<int> gpu_index_flat_;  // 替代upstream的 std::map<int,int>
 
   const size_t num_streams_;
 
@@ -139,10 +191,6 @@ class ResourceManager {
 
   std::vector<cub::DoubleBuffer<T>> keys_double_buffers_;
   std::vector<cub::DoubleBuffer<V>> values_double_buffers_;
-};
 
-// [AJB] hybrid_sort_resource_manager 诊断报告
-static inline void ajb_report_hybrid_sort_resource_manager(size_t n, double elapsed_ms, const char* phase) {
-    fprintf(stderr, "[AJB_TIMER][hybrid_sort_resource_manager] %s: n=%zu elapsed=%.3fms throughput=%.2f M/s\n",
-            phase, n, elapsed_ms, elapsed_ms > 0 ? n / elapsed_ms / 1000.0 : 0.0);
-}
+  std::vector<size_t> per_gpu_alloc_bytes_;
+};

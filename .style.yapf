@@ -1,0 +1,8 @@
+# Origin: upstream/multi-gpu-sort-merge-join/.style.yapf
+# AJB: dedent_closing_brackets helps with nested dict configs in experiment_specifications
+[style]
+based_on_style = google
+column_limit = 120
+split_before_logical_operator = true
+dedent_closing_brackets = true
+split_complex_comprehension = true

@@ -1,26 +1,7 @@
-// [AJB] hybrid_sort/radix_sort/host_containers.cuh: CPU侧radix sort容器
-#include <cstdio>
 #pragma once
-// =============================================================================
-// radix_sort/host_containers.cuh — CPU-side radix sort containers (AJB-instrumented)
-// AJB: host buffer lifecycle trace, pinned memory tracking, capacity audit.
-// =============================================================================
-#include <cstdio>
 
-// [AJB] HostContainers diagnostics
-static thread_local struct {
-    long long container_creates = 0;
-    long long hist_lookups = 0;
-    void dump(const char* tag = "HostContainers") {
-        fprintf(stderr, "[AJB_STATE][%s] creates=%lld hist_lookups=%lld\n",
-                tag, container_creates, hist_lookups);
-    }
-    void reset() { container_creates = hist_lookups = 0; }
-} ajb_hostcont_stats;
-
-
-#include <map>
 #include <vector>
+#include <cstdio>
 
 #include "buckets.cuh"
 #include "constants.cuh"
@@ -35,8 +16,13 @@ class HostContainers {
         histogram_buffers_(gpus.size()),
         histogram_maps_(gpus.size()),
         next_histogram_index_(gpus.size(), 0) {
+
+    // Upstream: std::map<int,int> → AJB: flat array
+    gpu_index_flat_.resize(256, -1);
     for (size_t g = 0; g < gpus_.size(); ++g) {
-      gpu_index_[gpus_[g]] = g;
+      int dev = gpus_[g];
+      if (dev >= 0 && dev < (int)gpu_index_flat_.size())
+        gpu_index_flat_[dev] = (int)g;
     }
 
     const size_t num_partition_passes = sizeof(T);
@@ -61,7 +47,7 @@ class HostContainers {
   }
 
   HostHistograms* GetHistograms(int gpu, const BucketId& bucket_id) {
-    const int i = gpu_index_[gpu];
+    const int i = GpuIdx(gpu);
     auto bucket_id_iter = histogram_maps_[i].find(bucket_id);
     if (bucket_id_iter != histogram_maps_[i].end()) {
       return &histogram_buffers_[i][bucket_id_iter->second];
@@ -70,7 +56,7 @@ class HostContainers {
   }
 
   void AssignNewHistogramBuffer(int gpu, const BucketId& bucket_id) {
-    const int i = gpu_index_[gpu];
+    const int i = GpuIdx(gpu);
     size_t& next_index = next_histogram_index_[i];
     if (next_index < max_histograms_per_gpu_) {
       histogram_maps_[i].emplace(bucket_id, next_index);
@@ -78,18 +64,29 @@ class HostContainers {
     }
   }
 
+  // host端histogram使用率
+  double histogram_utilization(int gpu) const {
+    const int i = GpuIdx(gpu);
+    if (max_histograms_per_gpu_ == 0) return 0.0;
+    return static_cast<double>(next_histogram_index_[i]) / max_histograms_per_gpu_;
+  }
+
+  // 所有GPU的总histogram使用数
+  size_t total_assigned() const {
+    size_t sum = 0;
+    for (size_t g = 0; g < gpus_.size(); ++g)
+      sum += next_histogram_index_[g];
+    return sum;
+  }
+
  private:
+  int GpuIdx(int gpu) const { return gpu_index_flat_[gpu]; }
+
   std::vector<int> gpus_;
-  std::map<int, int> gpu_index_;
+  std::vector<int> gpu_index_flat_;  // 替代upstream的std::map<int,int>
 
   std::vector<std::vector<HostHistograms>> histogram_buffers_;
   std::vector<std::map<BucketId, size_t, CompareBucketIds>> histogram_maps_;
   std::vector<size_t> next_histogram_index_;
   size_t max_histograms_per_gpu_;
 };
-
-// [AJB] hybrid_sort_radix_sort_host_containers 诊断报告
-static inline void ajb_report_hybrid_sort_radix_sort_host_containers(size_t n, double elapsed_ms, const char* phase) {
-    fprintf(stderr, "[AJB_TIMER][hybrid_sort_radix_sort_host_containers] %s: n=%zu elapsed=%.3fms throughput=%.2f M/s\n",
-            phase, n, elapsed_ms, elapsed_ms > 0 ? n / elapsed_ms / 1000.0 : 0.0);
-}

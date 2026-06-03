@@ -1,17 +1,22 @@
 #pragma once
-// =============================================================================
-// merge_join/constants.cuh — Join kernel tuning constants (AJB-instrumented)
-// AJB: document performance impact of each constant, provide tuning guidance.
-// =============================================================================
-
-// [AJB] kNumJoinThreads: threads per block for join kernel — affects occupancy
-//   Higher = better latency hiding but more register pressure
-//   Optimal: 256 for most GPUs (A100/H100), 128 for older (V100)
-// [AJB] kNumJoinStreams: concurrent join operations — overlap compute+transfer
-//   Higher = better pipeline utilization but more memory pressure
-// [AJB] join也用3个stream, 和sort共享stream编号约定
 
 #include "common/math_utilities.cuh"
 
+// Upstream: 裸常量, 无约束无推导.
+// AJB: 加约束检查 + 提供运行时可查询的内存开销估算,
+// 与radix_sort/constants.cuh保持同样的工程规范.
 constexpr size_t kNumJoinStreams = 3;
 constexpr size_t kNumJoinThreads = 256;
+
+// 每个join stream需要的最小显存: 两个relation的chunk + 输出buffer
+// 调参时用这个估算是否会OOM
+constexpr size_t JoinStreamMemoryPerElement(size_t key_bytes, size_t val_bytes) {
+  // 输入: R和S各一份 + 输出: 最坏情况=|R|*|S|(但实际分chunk后远小于此)
+  // 这里只估算输入buffer
+  return 2 * (key_bytes + val_bytes);
+}
+
+static_assert(kNumJoinThreads > 0 && (kNumJoinThreads & (kNumJoinThreads - 1)) == 0,
+              "kNumJoinThreads must be power of 2 for warp alignment");
+static_assert(kNumJoinStreams >= 2,
+              "need ≥2 streams for compute/transfer overlap");
