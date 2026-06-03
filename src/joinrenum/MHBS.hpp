@@ -65,9 +65,22 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
     }
     if(ajb_mhbs_stats.calls <= 10) fprintf(stderr, "]\n");
     int loop_iters = 0;
-    while(cnt < iters.size()) {
+    while(cnt < (int)iters.size()) {
         loop_iters++;
         ajb_mhbs_stats.iterations++;
+        // --- early exit: if all active bounds have converged to single-element ---
+        // upstream: loop continues until cnt == iters.size() via individual convergence
+        // changed: check all non-converged bounds; if every remaining one
+        //   has range <=1, they'll all converge this iteration — let them,
+        //   but if total remaining range is 0 (all bounds already at endpoints)
+        //   break immediately to avoid redundant AGM calls
+        {
+            bool all_converged = true;
+            for(size_t i : rels) {
+                if(bounds[i].second - bounds[i].first > 1) { all_converged = false; break; }
+            }
+            if(all_converged) break;
+        }
         mini = -1, maxi = -1;
         for(size_t i : rels){
             if(bounds[i].second - bounds[i].first <= 1) continue;

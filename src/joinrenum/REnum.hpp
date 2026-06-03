@@ -31,20 +31,35 @@ class RandOrderEnum {
         fprintf(stderr, "[AJB_BP][REnum] enumerate start: AGM=%lld\n", (long long)idx.AGM());
         auto t0 = std::chrono::steady_clock::now();
         int found = 0;
+        // --- output strategy: batch buffered write replacing per-line cout ---
+        // upstream: for each i, cout << i << ": " << res.first << ...
+        // changed: format each line into a char buffer, accumulate, flush
+        //   every 32KB. Avoids iostream overhead in tight loops.
+        Bucket fb = idx.getFullBucket();
+        vector<char> obuf;
+        obuf.reserve(32768);
+        char tmp[256];
         for(int i = 1; i <= idx.AGM(); i++) {
-            pair<bool, vector<int> > res = idx.randomAccess(idx.getFullBucket(), i);
-            cout << i << ": ";
-            cout << res.first << "::";
-            for(int j = 0; j < res.second.size(); j++) {
-                cout << res.second[j] << ",";
+            pair<bool, vector<int> > res = idx.randomAccess(fb, i);
+            int n = snprintf(tmp, sizeof(tmp), "%d: %d::", i, (int)res.first);
+            obuf.insert(obuf.end(), tmp, tmp + n);
+            for(int j = 0; j < (int)res.second.size(); j++) {
+                n = snprintf(tmp, sizeof(tmp), "%d,", res.second[j]);
+                obuf.insert(obuf.end(), tmp, tmp + n);
             }
-            cout << endl;
+            obuf.push_back('\n');
             if(res.first) found++;
-            // [AJB_TRACE] 每1000次输出进度
+            // flush buffer periodically
+            if(obuf.size() > 30000) {
+                fwrite(obuf.data(), 1, obuf.size(), stdout);
+                obuf.clear();
+            }
             if(i % 1000 == 0 || i == idx.AGM())
                 fprintf(stderr, "[AJB_TRACE][REnum] enumerate progress: %d/%lld found=%d\n",
                         i, (long long)idx.AGM(), found);
         }
+        if(!obuf.empty())
+            fwrite(obuf.data(), 1, obuf.size(), stdout);
         auto t1 = std::chrono::steady_clock::now();
         double sec = std::chrono::duration<double>(t1 - t0).count();
         fprintf(stderr, "[AJB_TIMER][REnum] enumerate done: found=%d/%lld elapsed=%.3fs\n",

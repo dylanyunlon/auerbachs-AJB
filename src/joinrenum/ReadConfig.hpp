@@ -47,18 +47,35 @@ unordered_map<string, vector<string> > readRelations(const string& filename){
     assert(!f.fail()); //assert that opening file succeeded
     
     unordered_map<string, vector<string> > mp;
-    // get each line of f and parse each line like "R(A, B, C)"
+    // --- parser: pointer-walk replacing repeated substr+find ---
+    // upstream: line.find("(") → line.substr → while(line.find(",")) → line.substr
+    //   creates many temporary std::string objects per line
+    // changed: single scan with start/end pointers, extract directly
+    //   into vector<string> — fewer allocations per relation
     string line;
     while(getline(f, line)){
-        size_t pos = line.find("(");
-        string name = line.substr(0, pos);
-        vector<string> columnName = {};
-        line = line.substr(pos + 1);
-        while ((pos = line.find(",")) != string::npos) {
-            columnName.push_back(line.substr(0, pos));
-            line = line.substr(pos + 1);
+        const char* p = line.c_str();
+        const char* end = p + line.size();
+        // find '(' — relation name is everything before it
+        const char* paren = p;
+        while(paren < end && *paren != '(') paren++;
+        if(paren >= end) continue;  // malformed line
+        string name(p, paren - p);
+        // parse comma-separated attributes between '(' and ')'
+        vector<string> columnName;
+        const char* attr_start = paren + 1;
+        for(const char* scan = attr_start; scan <= end; scan++) {
+            if(scan == end || *scan == ',' || *scan == ')') {
+                // trim leading/trailing spaces from attribute name
+                const char* as = attr_start;
+                const char* ae = scan;
+                while(as < ae && *as == ' ') as++;
+                while(ae > as && *(ae-1) == ' ') ae--;
+                if(ae > as) columnName.emplace_back(as, ae - as);
+                attr_start = scan + 1;
+                if(*scan == ')') break;
+            }
         }
-        columnName.push_back(line.substr(0, line.size() - 1));
         mp[name] = columnName;
         // [AJB_TRACE] 解析出的schema: 每个relation的属性列表
         fprintf(stderr, "[AJB_TRACE][ReadConfig] relation %s: arity=%zu attrs=[", name.c_str(), columnName.size());

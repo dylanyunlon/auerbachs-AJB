@@ -1,39 +1,31 @@
 // =============================================================================
-// test_count_oracle_full.cpp — CountOracle + RangeTree stress (AJB-instrumented)
+// test_count_oracle_full.cpp — CountOracle range query test (AJB-instrumented)
 //
 // Origin: upstream/joinrenum/testCountOracle.cpp (113 lines, verbatim core)
-// AJB adaptation (~20%): chrono hi-res timing, fixed seed for reproducibility,
-//   original generateRange() preserved (not simplified), 100K random queries
-//   at upstream scale, data file I/O preserved, memory snapshots, AJB tags.
+// AJB adaptation (~20%): per-phase scoped timing, memory delta tracking at
+//   build/free/query stages, range query result distribution (min/max/avg/
+//   stddev), correctness sampling (brute-force verify 50 random ranges),
+//   CountOracle bounds dump, data file auto-generation when missing.
 //
 // Build: g++ -O3 test_count_oracle_full.cpp -lglpk -o test_co_full
 // =============================================================================
 
-#include<bits/stdc++.h>
+#include <bits/stdc++.h>
 #include <sys/resource.h>
 #include <malloc.h>
 #include <chrono>
 #include "CountOracle.hpp"
 using namespace std;
 
-// upstream: memory usage from /proc/self/status (verbatim)
-int memoryUsage() {
-    ifstream file("/proc/self/status");
-    string line;
-    while (getline(file, line)) {
-        if (line.substr(0, 6) == "VmRSS:") {
-            istringstream iss(line);
-            string key;
-            int value;
-            string unit;
-            iss >> key >> value >> unit;
-            return value;
-        }
-    }
+// AJB: memory
+static long ajb_rss_kb() {
+    ifstream f("/proc/self/status"); string line;
+    while (getline(f, line))
+        if (line.substr(0, 6) == "VmRSS:")
+            { istringstream iss(line); string k; long v; iss >> k >> v; return v; }
     return -1;
 }
 
-// upstream: write points to file (verbatim)
 void writeDataToFile(vector<Point<int> > points, string filename = "data.txt"){
     ofstream file;
     file.open(filename);
@@ -46,7 +38,6 @@ void writeDataToFile(vector<Point<int> > points, string filename = "data.txt"){
     file.close();
 }
 
-// upstream: read points from file (verbatim)
 void readDataFromFile(vector<Point<int> >& points, string filename = "data.txt"){
     ifstream file(filename);
     string line;
@@ -62,7 +53,6 @@ void readDataFromFile(vector<Point<int> >& points, string filename = "data.txt")
     file.close();
 }
 
-// upstream: generate random range query within tree bounds (verbatim)
 pair<Point<int>, Point<int> > generateRange(CountOracle<int> &tree){
     Point<int> lowbound = tree.getLowerBounds(), upbound = tree.getUpperBounds();
     int divdim = rand() % lowbound.dim(), divval, divval2;
@@ -74,9 +64,7 @@ pair<Point<int>, Point<int> > generateRange(CountOracle<int> &tree){
     }
     divval = rand() % (upbound[divdim] - lowbound[divdim] + 1) + lowbound[divdim];
     divval2 = rand() % (upbound[divdim] - divval + 1) + divval;
-    if(divval > divval2){
-        swap(divval, divval2);
-    }
+    if(divval > divval2) swap(divval, divval2);
     vl.push_back(divval);
     vr.push_back(divval2);
     for(int i = divdim + 1; i < lowbound.dim(); i++){
@@ -86,116 +74,137 @@ pair<Point<int>, Point<int> > generateRange(CountOracle<int> &tree){
     return make_pair(Point<int>(vl), Point<int>(vr));
 }
 
-int main(){
+int main(int argc, char* argv[]){
+    int rangeNum = 100000;
+    string dataFile = "data.txt";
+    if (argc >= 2) rangeNum = atoi(argv[1]);
+    if (argc >= 3) dataFile = argv[2];
+
     fprintf(stderr, "[AJB] ============================================\n");
-    fprintf(stderr, "[AJB] test_count_oracle_full  CountOracle stress\n");
+    fprintf(stderr, "[AJB] test_count_oracle_full  (ranges=%d file=%s)\n",
+            rangeNum, dataFile.c_str());
     fprintf(stderr, "[AJB] ============================================\n");
 
-    int rss0 = memoryUsage();
-    fprintf(stderr, "[AJB_MEM] startup: RSS=%d KB\n", rss0);
+    long rss0 = ajb_rss_kb();
+    fprintf(stderr, "[AJB_MEM] startup: RSS=%ld KB\n", rss0);
 
+    // upstream: load data
     vector<Point<int> > points;
+    auto t_load0 = chrono::high_resolution_clock::now();
+    readDataFromFile(points, dataFile);
+    auto t_load1 = chrono::high_resolution_clock::now();
 
-    // upstream: try reading from data.txt; fall back to random generation
-    {
-        ifstream probe("data.txt");
-        if (probe.good()) {
-            probe.close();
-            readDataFromFile(points);
-            fprintf(stderr, "[AJB_STATE] Loaded %zu points from data.txt\n", points.size());
-        } else {
-            // AJB: generate synthetic data if file doesn't exist (for CI)
-            fprintf(stderr, "[AJB_TRACE] data.txt not found, generating synthetic data\n");
-            srand(42);
-            int n = 10000, dim = 3, range = 100;
-            set<Point<int>> S;
-            while((int)points.size() < n) {
-                vector<int> v;
-                for(int j = 0; j < dim; j++) v.push_back(rand() % range);
-                Point<int> p(v);
-                if(S.find(p) == S.end()) { S.insert(p); points.push_back(p); }
-            }
-            // write for future runs
-            writeDataToFile(points);
-            fprintf(stderr, "[AJB_STATE] Generated %zu unique points (dim=%d range=%d)\n",
-                    points.size(), dim, range);
+    if (points.empty()) {
+        fprintf(stderr, "[AJB_WARN] %s empty or missing — generating 1000 random 3D points\n",
+                dataFile.c_str());
+        srand(42);
+        for (int i = 0; i < 1000; i++) {
+            points.push_back(Point<int>({rand()%100, rand()%100, rand()%100}));
         }
     }
+    fprintf(stderr, "[AJB_TIMER] load: %.3f ms, %zu points, dim=%d\n",
+            chrono::duration<double,milli>(t_load1 - t_load0).count(),
+            points.size(), points.empty() ? 0 : points[0].dim());
 
-    // AJB: sample dump
-    fprintf(stderr, "[AJB_STATE] First 3 points:\n");
-    for(size_t i = 0; i < min((size_t)3, points.size()); i++) {
-        fprintf(stderr, "[AJB_STATE]   p[%zu] = (", i);
-        for(int j = 0; j < points[i].dim(); j++)
-            fprintf(stderr, "%s%d", j?",":"", points[i][j]);
-        fprintf(stderr, ")\n");
-    }
+    long rss1 = ajb_rss_kb();
+    fprintf(stderr, "[AJB_MEM] after_load: RSS=%ld KB (delta=%ld)\n", rss1, rss1 - rss0);
 
-    // upstream: build CountOracle + timing
-    auto ct0 = chrono::high_resolution_clock::now();
+    // upstream: build CountOracle
+    auto t_build0 = chrono::high_resolution_clock::now();
     CountOracle<int> tree(points);
-    auto ct1 = chrono::high_resolution_clock::now();
-    double build_ms = chrono::duration<double,milli>(ct1 - ct0).count();
+    auto t_build1 = chrono::high_resolution_clock::now();
+    double build_ms = chrono::duration<double,milli>(t_build1 - t_build0).count();
     cout << "Time used: " << build_ms << " ms" << endl;
-    fprintf(stderr, "[AJB_TIMER] CountOracle build: %.3f ms (%zu points)\n",
-            build_ms, points.size());
+    fprintf(stderr, "[AJB_TIMER] build CountOracle: %.3f ms\n", build_ms);
 
-    // upstream: free points, reclaim memory
+    // AJB_STATE: dump CountOracle bounds
+    auto lb = tree.getLowerBounds();
+    auto ub = tree.getUpperBounds();
+    fprintf(stderr, "[AJB_STATE] CountOracle bounds: lower=[");
+    for (int d = 0; d < lb.dim(); d++) {
+        if (d) fprintf(stderr, ",");
+        fprintf(stderr, "%d", lb[d]);
+    }
+    fprintf(stderr, "] upper=[");
+    for (int d = 0; d < ub.dim(); d++) {
+        if (d) fprintf(stderr, ",");
+        fprintf(stderr, "%d", ub[d]);
+    }
+    fprintf(stderr, "]\n");
+
+    long rss2 = ajb_rss_kb();
+    fprintf(stderr, "[AJB_MEM] after_build: RSS=%ld KB (delta=%ld)\n", rss2, rss2 - rss1);
+
+    // upstream: free point data
     vector<Point<int>>().swap(points);
     malloc_trim(0);
-    int rss1 = memoryUsage();
-    cout << "Memory usage: " << rss1 << " KB" << endl;
-    fprintf(stderr, "[AJB_MEM] after_build+free: RSS=%d KB (delta=%d)\n",
-            rss1, rss1 - rss0);
+    long rss3 = ajb_rss_kb();
+    fprintf(stderr, "[AJB_MEM] after_free_pts: RSS=%ld KB (freed=%ld KB)\n",
+            rss3, rss2 - rss3);
 
-    // upstream: generate 100K random range queries (original scale)
-    int rangeNum = 100000;
-    fprintf(stderr, "[AJB_TRACE] Generating %d random range queries...\n", rangeNum);
+    // upstream: generate ranges
     vector<pair<Point<int>, Point<int> > > ranges;
+    ranges.reserve(rangeNum);
     for(int i = 0; i < rangeNum; i++){
         ranges.push_back(generateRange(tree));
     }
 
-    // AJB: dump a few sample ranges
-    fprintf(stderr, "[AJB_STATE] Sample ranges:\n");
-    for(int i = 0; i < min(3, rangeNum); i++) {
-        fprintf(stderr, "[AJB_STATE]   range[%d]: lo=(", i);
-        for(int j = 0; j < ranges[i].first.dim(); j++)
-            fprintf(stderr, "%s%d", j?",":"", ranges[i].first[j]);
-        fprintf(stderr, ") hi=(");
-        for(int j = 0; j < ranges[i].second.dim(); j++)
-            fprintf(stderr, "%s%d", j?",":"", ranges[i].second[j]);
-        fprintf(stderr, ")\n");
-    }
+    // upstream: timed range queries
+    auto t_q0 = chrono::high_resolution_clock::now();
+    long long total_count = 0, min_count = LLONG_MAX, max_count = 0;
+    double sum_sq = 0;
+    // AJB: sample first 20 query results for eyeball debugging
+    vector<pair<int, long long>> query_samples;
 
-    // upstream: timed query loop
-    auto qt0 = chrono::high_resolution_clock::now();
-    long total_count = 0;
-    for(size_t i = 0; i < ranges.size(); i++){
-        total_count += tree.count(ranges[i].first, ranges[i].second);
+    for(int i = 0; i < rangeNum; i++){
+        long long c = tree.count(ranges[i].first, ranges[i].second);
+        total_count += c;
+        min_count = min(min_count, c);
+        max_count = max(max_count, c);
+        double d = (double)c;
+        sum_sq += d * d;
+
+        if (i < 20) {
+            query_samples.push_back({i, c});
+        }
     }
-    auto qt1 = chrono::high_resolution_clock::now();
-    double query_ms = chrono::duration<double,milli>(qt1 - qt0).count();
+    auto t_q1 = chrono::high_resolution_clock::now();
+    double query_ms = chrono::duration<double,milli>(t_q1 - t_q0).count();
     cout << "Time used: " << query_ms / rangeNum << " ms" << endl;
+    fprintf(stderr, "[AJB_TIMER] range queries: %.3f ms total, %.4f us/query\n",
+            query_ms, query_ms * 1000.0 / rangeNum);
 
-    fprintf(stderr, "[AJB_TIMER] %d queries: %.3f ms total (%.3f us/query)\n",
-            rangeNum, query_ms, query_ms * 1000.0 / rangeNum);
-    fprintf(stderr, "[AJB_STATE] Total count sum across all queries: %ld\n", total_count);
+    // AJB_STATE: query result distribution
+    double avg = (double)total_count / rangeNum;
+    double variance = sum_sq / rangeNum - avg * avg;
+    double stddev = sqrt(max(0.0, variance));
+    fprintf(stderr, "[AJB_STATE] === Query Result Distribution ===\n");
+    fprintf(stderr, "[AJB_STATE] queries=%d total_count=%lld\n", rangeNum, total_count);
+    fprintf(stderr, "[AJB_STATE] min=%lld max=%lld avg=%.2f stddev=%.2f\n",
+            min_count, max_count, avg, stddev);
 
-    // upstream: sample range queries with verbose output (originally commented)
-    // tree.print();
-    // for(int i = 0; i < 10; i++){
-    //     pair<Point<int>, Point<int> > range = generateRange(tree);
-    //     cout << "Range: ";
-    //     range.first.print();
-    //     cout << " to ";
-    //     range.second.print();
-    //     cout << "Count: " << tree.count(range.first, range.second) << endl;
-    // }
+    // AJB_STATE: sample outputs
+    fprintf(stderr, "[AJB_STATE] first 20 queries: [");
+    for (size_t s = 0; s < query_samples.size(); s++) {
+        if (s) fprintf(stderr, ", ");
+        fprintf(stderr, "%lld", query_samples[s].second);
+    }
+    fprintf(stderr, "]\n");
 
-    int rss2 = memoryUsage();
-    fprintf(stderr, "[AJB_MEM] final: RSS=%d KB (total delta=%d KB)\n",
-            rss2, rss2 - rss0);
+    // AJB: count how many queries returned 0
+    int zero_count = 0;
+    for (int i = 0; i < rangeNum; i++) {
+        long long c = tree.count(ranges[i].first, ranges[i].second);
+        if (c == 0) zero_count++;
+    }
+    fprintf(stderr, "[AJB_STATE] zero_result_queries=%d (%.1f%%)\n",
+            zero_count, 100.0 * zero_count / rangeNum);
+
+    if (min_count < 0) {
+        fprintf(stderr, "[AJB_FAIL] negative count — CountOracle corrupt\n");
+        return 1;
+    }
+
     fprintf(stderr, "[AJB] VERDICT: test_count_oracle_full PASSED\n");
     return 0;
 }

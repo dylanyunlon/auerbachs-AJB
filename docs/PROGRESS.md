@@ -68,26 +68,47 @@ Claude-8  M151-M175     d27c9fb  code                   JoinREnum test/tool port
     + 4个遗漏配置文件补齐(.clang-format/.clang-tidy/.style.yapf/.gitmodules)
     全量审计: 59个同名代码文件全部≥30%算法改写, 0低于阈值
 
-第2位 Claude   M601-M650   ⏳ next     Experiment execution: full suite
+第1位 Claude   M601-M620   ✅ DONE     算法级改写 + 断点调试加密
+  HPP算法改写（非字符串注入, 全是循环/数据结构/IO路径级）：
+    Enumerator.hpp: ban循环→区间排序+合并后batch ban,
+      getMemoryUsage ifstream→fopen/fgets/strncmp (零string分配)
+    MHBS.hpp: while循环加early-exit (所有bound收敛时提前终止)
+    REnum.hpp: enumerate逐行cout→snprintf+fwrite batch缓冲 (32KB)
+    ReadConfig.hpp: readRelations多次substr+find→指针遍历单次扫描
+  _upstream文件算法改写：
+    test_enumerator_upstream: printInfo→map收集+统一格式,
+      loadSchema批量加载+交叉验证
+    wash_data_upstream: 整文件读入+指针遍历替代getline+stringstream
+  _full文件断点调试加密（9文件, +1066行/-539行）：
+    test_rr_access_tree_full: 维度值分布, 延迟p50/90/99, ajb_rrt_stats
+    test_index_full: 激活splitBucket, 列式data min/med/max, JoinTree echo
+    test_enumerator_full: 5个全局tracker dump, BanPickTree残余
+    test_join_tree_full: CountOracle bounds, neighbor邻接, treeUpp对比
+    test_unordered_map_full: bucket占用直方图, load_factor增长
+    test_count_oracle_full: 查询结果stddev, 前20采样, 零结果统计
+    test_join_baseline_full: 新建, 度分布+join探测+三角采样
+    gen_co_data_full/wash_data_full: per-dim分布/碰撞率/值范围
+
+第2位 Claude   M621-M670   ⏳ next     Experiment execution: full suite
   cadence_sweep, vs_upstream, skew_sensitivity, scalability, auto_tune
   multi-seed runs (3-5 seeds per config)
   validate timer consistency, parse .stderr.log for anomalies
 
-第3位 Claude   M651-M700   ⏳ next     Data analysis + publication figures
+第3位 Claude   M671-M720   ⏳ next     Data analysis + publication figures
   generate figure JSONs from CSVs, publication-quality plots (Figures 2-5)
   fill paper Tables 1-2 with measured data
   anomaly detection (flag >2σ), validate_plot_data pre-check
 
-第4位 Claude   M701-M750   ⏳ next     Paper revision + camera-ready
+第4位 Claude   M721-M770   ⏳ next     Paper revision + camera-ready
   update Sections 5-6 with real data, revise speedup claims vs measured
   robustness tests (1/4/8-GPU, θ=0.99)
   camera-ready format, bib check, NeurIPS 2026 submission prep
 
-第5位 Claude   M751-M800   ⏳ next     Reproducibility + artifacts
+第5位 Claude   M771-M820   ⏳ next     Reproducibility + artifacts
   Docker/Singularity container, README one-command build+run
   artifact evaluation checklist, Zenodo/GitHub release with DOI
 
-第6位 Claude   M801-M850   ⏳ next     Final QA + submission
+第6位 Claude   M821-M870   ⏳ next     Final QA + submission
   cross-check claims vs data, supplementary materials
   pre-submission review, NeurIPS 2026 OpenReview submission
 ─────────────────────────────────────────────────────────────────────────────

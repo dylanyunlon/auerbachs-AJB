@@ -19,18 +19,24 @@ static thread_local struct {
     void reset() { total_attempts = total_success = total_bans = 0; last_hit_rate = peak_rss_mb = 0.0; }
 } ajb_enum_stats;
 
+// [AJB] getMemoryUsage: fopen+fgets replacing ifstream+getline+substr
+// upstream: std::ifstream → getline → line.substr(0,6) → std::stoul
+// changed: FILE* + fgets + strncmp + strtoul — zero std::string allocations
 size_t getMemoryUsage() {
-    std::ifstream stat_stream("/proc/self/status");
-    std::string line;
+    FILE* f = fopen("/proc/self/status", "r");
+    if(!f) return 0;
+    char buf[256];
     size_t memory = 0;
-
-    while (std::getline(stat_stream, line)) {
-        if (line.substr(0, 6) == "VmRSS:") {
-            std::string mem_str = line.substr(6);
-            memory = std::stoul(mem_str);
+    while(fgets(buf, sizeof(buf), f)) {
+        if(strncmp(buf, "VmRSS:", 6) == 0) {
+            // skip "VmRSS:" then whitespace
+            const char* p = buf + 6;
+            while(*p == ' ' || *p == '\t') p++;
+            memory = strtoul(p, nullptr, 10);
             break;
         }
     }
+    fclose(f);
     return memory; // in KB
 }
 
@@ -127,8 +133,39 @@ public:
             //     cout << cntsuccess << ", " << cnt << ", " << bp.remaining() << ", " << bp.getPercentage() << ", " << elapsed << endl;
             //     }
             if(res) bp.ban(s,s);
-            for(int i = 0; i < access_tree.numti; i++) {
-                bp.ban(access_tree.trivialIntervals[i].first, access_tree.trivialIntervals[i].second);
+            // --- batch ban with interval merging ---
+            // upstream: for(i=0..numti) bp.ban(trivialIntervals[i])
+            // changed: collect intervals, sort by left endpoint, merge
+            //   overlapping/adjacent intervals, then ban merged set.
+            //   Reduces bp.ban() calls when intervals cluster together.
+            if(access_tree.numti > 0) {
+                // sort trivialIntervals[0..numti-1] by .first
+                // use insertion sort since numti is typically small (<20)
+                for(int i = 1; i < access_tree.numti; i++) {
+                    auto tmp = access_tree.trivialIntervals[i];
+                    int j = i - 1;
+                    while(j >= 0 && access_tree.trivialIntervals[j].first > tmp.first) {
+                        access_tree.trivialIntervals[j+1] = access_tree.trivialIntervals[j];
+                        j--;
+                    }
+                    access_tree.trivialIntervals[j+1] = tmp;
+                }
+                // merge overlapping/adjacent and ban
+                long long merge_lo = access_tree.trivialIntervals[0].first;
+                long long merge_hi = access_tree.trivialIntervals[0].second;
+                for(int i = 1; i < access_tree.numti; i++) {
+                    if(access_tree.trivialIntervals[i].first <= merge_hi + 1) {
+                        // extend current merged interval
+                        merge_hi = max(merge_hi, access_tree.trivialIntervals[i].second);
+                    } else {
+                        // gap: ban the accumulated interval, start new one
+                        bp.ban(merge_lo, merge_hi);
+                        ajb_enum_stats.total_bans++;
+                        merge_lo = access_tree.trivialIntervals[i].first;
+                        merge_hi = access_tree.trivialIntervals[i].second;
+                    }
+                }
+                bp.ban(merge_lo, merge_hi);
                 ajb_enum_stats.total_bans++;
             }
             // else bp.ban(access_tree.trivialInterval.first, access_tree.trivialInterval.second);

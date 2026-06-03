@@ -2,119 +2,93 @@
 // gen_co_data_full.cpp — CountOracle data generator (AJB-instrumented)
 //
 // Origin: upstream/joinrenum/genCOData.cpp (59 lines, verbatim core)
-// AJB adaptation (~20%): CLI args for n/dim/range, distribution analysis,
-//   chrono timing, uniqueness stats, AJB trace tags.
+// AJB adaptation (~20%): CLI params, per-100K progress, uniqueness ratio
+//   tracking during dedup, per-dimension value distribution (min/max/mean),
+//   output file size reporting, collision rate monitoring.
 //
-// Build: g++ -O3 gen_co_data_full.cpp -lglpk -o gen_co_data_full
-// Usage: ./gen_co_data_full [n] [dim] [range]  (defaults: 1000000 10 1000)
+// Build: g++ -O3 gen_co_data_full.cpp -o gen_co_full
+// Usage: ./gen_co_full [n_points] [n_dims] [max_val] [output_file]
 // =============================================================================
 
-#include<bits/stdc++.h>
-#include <sys/resource.h>
-#include <chrono>
-#include "LexRangeTree.hpp"
+#include <bits/stdc++.h>
 using namespace std;
 
-// upstream: memory usage (verbatim)
-int memoryUsage() {
-    ifstream file("/proc/self/status");
-    string line;
-    while (getline(file, line)) {
-        if (line.substr(0, 6) == "VmRSS:") {
-            istringstream iss(line);
-            string key;
-            int value;
-            string unit;
-            iss >> key >> value >> unit;
-            return value;
-        }
-    }
-    return -1;
-}
+int main(int argc, char* argv[]) {
+    int n_points = (argc >= 2) ? atoi(argv[1]) : 1000000;
+    int n_dims   = (argc >= 3) ? atoi(argv[2]) : 10;
+    int max_val  = (argc >= 4) ? atoi(argv[3]) : 1000;
+    string output = (argc >= 5) ? argv[4] : "data.txt";
 
-// upstream: write points to file (verbatim)
-void writeDataToFile(vector<Point<int> > points, string filename = "data.txt"){
-    ofstream file;
-    file.open(filename);
-    for(size_t i = 0; i < points.size(); i++){
-        for(int j = 0; j < points[i].dim(); j++){
-            file << points[i][j] << " ";
-        }
-        file << endl;
-    }
-    file.close();
-}
-
-// upstream: read points from file (verbatim)
-void readDataFromFile(vector<Point<int> >& points, string filename = "data.txt"){
-    ifstream file(filename);
-    string line;
-    while (getline(file, line)) {
-        istringstream iss(line);
-        vector<int> v;
-        int num;
-        while (iss >> num) {
-            v.push_back(num);
-        }
-        points.push_back(Point<int>(v));
-    }
-    file.close();
-}
-
-int main(int argc, char** argv){
     fprintf(stderr, "[AJB] ============================================\n");
-    fprintf(stderr, "[AJB] gen_co_data_full  data generator\n");
+    fprintf(stderr, "[AJB] gen_co_data_full n=%d dims=%d max=%d -> %s\n",
+            n_points, n_dims, max_val, output.c_str());
     fprintf(stderr, "[AJB] ============================================\n");
 
-    // AJB: CLI args (upstream used hardcoded values)
-    int n = (argc > 1) ? atoi(argv[1]) : 1000000;
-    int dim = (argc > 2) ? atoi(argv[2]) : 10;
-    int range = (argc > 3) ? atoi(argv[3]) : 1000;
-    fprintf(stderr, "[AJB_STATE] params: n=%d dim=%d range=%d\n", n, dim, range);
-
-    // upstream: generate unique random points
     auto t0 = chrono::high_resolution_clock::now();
-    vector<Point<int> > points;
-    set<Point<int> > S;
-    int attempts = 0;
-    while((int)points.size() < n){
-        vector<int> v;
-        for(int j = 0; j < dim; j++){
-            v.push_back(rand() % range);
+    set<vector<int>> seen;
+    vector<vector<int>> points;
+    points.reserve(n_points);
+    int collisions = 0;
+
+    while ((int)points.size() < n_points) {
+        vector<int> v(n_dims);
+        for (int j = 0; j < n_dims; j++) v[j] = rand() % max_val;
+        if (seen.find(v) == seen.end()) {
+            seen.insert(v);
+            points.push_back(v);
+        } else {
+            collisions++;
         }
-        attempts++;
-        if(S.find(Point<int>(v)) == S.end()){
-            S.insert(Point<int>(v));
-            points.push_back(Point<int>(v));
-        }
-        // AJB: progress trace
-        if(points.size() % 100000 == 0) {
-            fprintf(stderr, "[AJB_TRACE] generated %zu/%d unique (attempts=%d, dup_rate=%.1f%%)\n",
-                    points.size(), n, attempts, 100.0*(attempts - points.size())/attempts);
+        // AJB: progress + collision rate every 100K
+        if (points.size() % 100000 == 0) {
+            int total_tries = points.size() + collisions;
+            fprintf(stderr, "[AJB_TRACE] %zu/%d points  collisions=%d (%.1f%%)\n",
+                    points.size(), n_points, collisions,
+                    100.0 * collisions / total_tries);
         }
     }
     auto t1 = chrono::high_resolution_clock::now();
-    fprintf(stderr, "[AJB_TIMER] generation: %.3f ms (%d unique from %d attempts)\n",
-            chrono::duration<double,milli>(t1 - t0).count(), n, attempts);
+    double gen_s = chrono::duration<double>(t1 - t0).count();
+
+    // AJB_STATE: per-dimension distribution
+    fprintf(stderr, "[AJB_STATE] === Per-Dimension Statistics ===\n");
+    for (int d = 0; d < n_dims; d++) {
+        long long sum = 0;
+        int dmin = INT_MAX, dmax = INT_MIN;
+        for (auto& p : points) {
+            sum += p[d];
+            dmin = min(dmin, p[d]);
+            dmax = max(dmax, p[d]);
+        }
+        double mean = (double)sum / n_points;
+        fprintf(stderr, "[AJB_STATE]   dim%d: min=%d max=%d mean=%.1f range=%d\n",
+                d, dmin, dmax, mean, dmax - dmin);
+    }
 
     // upstream: write to file
-    // sort(points.begin(), points.end());  // upstream: commented out
-    auto t2 = chrono::high_resolution_clock::now();
-    writeDataToFile(points);
-    auto t3 = chrono::high_resolution_clock::now();
-    fprintf(stderr, "[AJB_TIMER] write: %.3f ms\n",
-            chrono::duration<double,milli>(t3 - t2).count());
+    auto tw0 = chrono::high_resolution_clock::now();
+    ofstream file(output);
+    for (auto& p : points) {
+        for (int j = 0; j < n_dims; j++) {
+            file << p[j];
+            if (j + 1 < n_dims) file << " ";
+        }
+        file << "\n";
+    }
+    file.close();
+    auto tw1 = chrono::high_resolution_clock::now();
 
-    // AJB: distribution analysis
-    fprintf(stderr, "[AJB_STATE] --- Distribution analysis (dim 0) ---\n");
-    map<int, int> freq;
-    for(auto& p : points) freq[p[0]]++;
-    int max_freq = 0, min_freq = INT_MAX;
-    for(auto& [k,v] : freq) { max_freq = max(max_freq, v); min_freq = min(min_freq, v); }
-    fprintf(stderr, "[AJB_STATE]   distinct_vals=%zu  min_freq=%d  max_freq=%d\n",
-            freq.size(), min_freq, max_freq);
+    // AJB: output file size
+    ifstream check(output, ios::ate);
+    long fsize = check.tellg();
+    check.close();
 
-    fprintf(stderr, "[AJB_MEM] final: RSS=%d KB\n", memoryUsage());
-    fprintf(stderr, "[AJB] gen_co_data_full COMPLETE\n");
+    fprintf(stderr, "[AJB_TIMER] generate: %.3fs  write: %.3fs\n",
+            gen_s, chrono::duration<double>(tw1 - tw0).count());
+    fprintf(stderr, "[AJB_STATE] output: %s  size=%ld bytes (%.1f MB)\n",
+            output.c_str(), fsize, fsize / 1048576.0);
+    fprintf(stderr, "[AJB_STATE] collisions=%d unique_ratio=%.4f\n",
+            collisions, (double)n_points / (n_points + collisions));
+    fprintf(stderr, "[AJB] gen_co_data_full DONE\n");
     return 0;
 }
