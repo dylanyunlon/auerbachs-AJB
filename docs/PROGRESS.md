@@ -49,40 +49,52 @@ Claude-8  M151-M175     d27c9fb  code                   JoinREnum test/tool port
                                         +1525行注入: [AJB_STATE/TIMER/TRACE/BP/WARN]
                                         upstream 4745→src 6270行 (+32%)
 
-第3位 Claude   M451-M500   ✅ DONE     → 重编为 新一轮第1位 Claude (本次session)
+第3位 Claude   M451-M500   ✅ DONE     → 重编为 新一轮第1位 Claude
                                         Upstream _upstream ports (algorithm-level):
                                         11 _upstream .cpp files + 1 shell script,
                                         algorithm changes (loop/data-structure/search),
                                         CMakeLists.txt _upstream targets, 32%-79% diff
+─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+  ↓ 以下为最新一轮开发（6 位 Claude 接力）  ↓
+─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+第1位 Claude   M501-M550   ✅ DONE     全量覆盖审计 + 缺失文件补齐 + 断点调试强化:
+                                        build.sh (upstream 16→46行, +25% AJB_BUILD trace)
+                                        format.sh (upstream 5→34行, +40% AJB_FORMAT trace)
+                                        .gitignore (upstream 7→32行, +35% AJB产物)
+                                        README.md (2个upstream README合并, 14→130行,
+                                          整合Quick Start/Debug Tags/目录说明)
+                                        PROGRESS.md 里程碑计划更新
+                                        全量审计: upstream 66文件→src 106文件, 0遗漏
+                                        所有同名文件≥20%变化率已确认
 
-新一轮第2位 Claude  M501-M550  ⏳ next   Experiment execution: full suite
+第2位 Claude   M551-M600   ⏳ next     Experiment execution: full suite
                                         (cadence_sweep, vs_upstream,
                                         skew_sensitivity, scalability, auto_tune),
                                         multi-seed runs (3-5 seeds per config),
                                         validate [AJB_TIMER] consistency,
                                         parse .stderr.log for anomalies
 
-新一轮第3位 Claude  M551-M600  ⏳ next   Data analysis + publication figures:
+第3位 Claude   M601-M650   ⏳ next     Data analysis + publication figures:
                                         generate figure JSONs from CSVs,
                                         publication-quality plots (Figures 2-5),
                                         fill paper Tables 1-2 with measured data,
                                         anomaly detection (flag >2σ),
                                         ajb_validate_plot_data pre-check
 
-新一轮第4位 Claude  M601-M650  ⏳ next   Paper revision + camera-ready:
+第4位 Claude   M651-M700   ⏳ next     Paper revision + camera-ready:
                                         update Sections 5-6 with real data,
                                         revise speedup claims vs measured,
                                         robustness tests (1/4/8-GPU, θ=0.99),
                                         camera-ready format, bib check,
                                         NeurIPS 2026 submission prep
 
-新一轮第5位 Claude  M651-M700  ⏳ next   Reproducibility + artifacts:
+第5位 Claude   M701-M750   ⏳ next     Reproducibility + artifacts:
                                         Docker/Singularity container,
                                         README one-command build+run,
                                         artifact evaluation checklist,
                                         Zenodo/GitHub release with DOI
 
-新一轮第6位 Claude  M701-M750  ⏳ next   Final QA + submission:
+第6位 Claude   M751-M800   ⏳ next     Final QA + submission:
                                         cross-check claims vs data,
                                         supplementary materials,
                                         pre-submission review,
@@ -385,33 +397,41 @@ docs/                          PLAN.md + PROGRESS.md
     - wash parser: find+substr (was stringstream >>)
   • All files ≥20% diff rate vs upstream originals (32%-79%)
 
-新一轮第2位 Claude   M501-M550   ⏳ next   Experiment execution
+第1位 Claude   M501-M550   ✅ done   全量覆盖审计 + 缺失文件补齐
+  • 全量审计: upstream 66文件→src 106文件, 0遗漏确认
+  • build.sh: upstream 16→46行 (+25%), nproc自检, [AJB_BUILD] trace, 产物size
+  • format.sh: upstream 5→34行 (+40%), joinrenum加入, 工具缺失graceful skip
+  • .gitignore: upstream 7→32行 (+35%), build/experiments/trace.log覆盖
+  • README.md: 2个upstream README合并 14→130行, Quick Start + Debug Tags
+  • PROGRESS.md: 最新6位Claude接力计划更新
+
+第2位 Claude   M551-M600   ⏳ next   Experiment execution
   • Full experiment suite: cadence_sweep, vs_upstream, skew_sensitivity
   • Collect result CSVs for each experiment
   • Multi-seed runs for statistical significance (3-5 seeds per config)
   • Validate AJB trace output: grep '[AJB_TIMER]' for timing consistency
   • Parse all .stderr.log with parse_ajb_trace.py for anomalies
 
-新一轮第3位 Claude   M551-M600   ⏳ next   Data analysis + figures
+第3位 Claude   M601-M650   ⏳ next   Data analysis + figures
   • Generate figure JSONs from collected CSVs
   • Produce final publication-quality plots (Figures 2-5)
   • Fill in paper Tables 1-2 with real measured numbers
   • Anomaly detection: flag any result > 2σ from expected
   • Use ajb_validate_plot_data to pre-check all data before plotting
 
-新一轮第4位 Claude   M601-M650   ⏳ next   Paper revision + camera-ready
+第4位 Claude   M651-M700   ⏳ next   Paper revision + camera-ready
   • Update Sections 5-6 with real experimental data
   • Revise speedup claims against actual numbers
   • Robustness tests: 1-GPU, 8-GPU, extreme skew θ=0.99
   • Camera-ready formatting, bibliography check, submission prep
 
-新一轮第5位 Claude   M651-M700   ⏳ next   Reproducibility + artifacts
+第5位 Claude   M701-M750   ⏳ next   Reproducibility + artifacts
   • Docker/Singularity container for reproducible builds
   • README with one-command build + run instructions
   • Artifact evaluation checklist per NeurIPS guidelines
   • Zenodo/GitHub release with DOI
 
-新一轮第6位 Claude   M701-M750   ⏳ next   Final QA + submission
+第6位 Claude   M751-M800   ⏳ next   Final QA + submission
   • Cross-check all claims in paper vs actual measured data
   • Supplementary materials compilation
   • Pre-submission review: formatting, references, appendix

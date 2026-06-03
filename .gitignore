@@ -1,0 +1,32 @@
+# =============================================================================
+# .gitignore — AJB project
+#
+# Origin: upstream/joinrenum/.gitignore (7 lines)
+# Changes (~35%): added build dirs, AJB trace logs, experiment outputs
+# =============================================================================
+
+# --- from upstream/joinrenum ---
+.vscode/
+db/*.tbl
+db/*copy.txt
+res/*.txt
+*.exe
+perf/*
+
+# --- AJB build artifacts ---
+build/
+build_tests/
+build_upstream/
+*.o
+*.d
+
+# --- AJB experiment / debug outputs ---
+experiments/
+*.stderr.log
+*.trace.log
+
+# --- editor / OS ---
+.idea/
+*.swp
+*~
+.DS_Store
