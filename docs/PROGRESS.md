@@ -49,33 +49,44 @@ Claude-8  M151-M175     d27c9fb  code                   JoinREnum test/tool port
                                         +1525行注入: [AJB_STATE/TIMER/TRACE/BP/WARN]
                                         upstream 4745→src 6270行 (+32%)
 
-第3位 Claude   M451-M500   ⏳ next     Benchmark dry-run + end-to-end pipeline:
-                                        first ajb_benchmark run on 2-GPU setup,
-                                        capture CSV output, validate
-                                        figure_data_emitter → JSON → plot,
-                                        run _full tests on CPU with [AJB] trace,
-                                        parse_ajb_trace.py验证所有tag格式
+第3位 Claude   M451-M500   ✅ DONE     → 重编为 新一轮第1位 Claude (本次session)
+                                        Upstream _upstream ports (algorithm-level):
+                                        11 _upstream .cpp files + 1 shell script,
+                                        algorithm changes (loop/data-structure/search),
+                                        CMakeLists.txt _upstream targets, 32%-79% diff
 
-第4位 Claude   M501-M550   ⏳ next     Experiment execution: full suite
+新一轮第2位 Claude  M501-M550  ⏳ next   Experiment execution: full suite
                                         (cadence_sweep, vs_upstream,
                                         skew_sensitivity, scalability, auto_tune),
                                         multi-seed runs (3-5 seeds per config),
                                         validate [AJB_TIMER] consistency,
                                         parse .stderr.log for anomalies
 
-第5位 Claude   M551-M600   ⏳ next     Data analysis + publication figures:
+新一轮第3位 Claude  M551-M600  ⏳ next   Data analysis + publication figures:
                                         generate figure JSONs from CSVs,
                                         publication-quality plots (Figures 2-5),
                                         fill paper Tables 1-2 with measured data,
                                         anomaly detection (flag >2σ),
                                         ajb_validate_plot_data pre-check
 
-第6位 Claude   M601-M650   ⏳ next     Paper revision + camera-ready:
+新一轮第4位 Claude  M601-M650  ⏳ next   Paper revision + camera-ready:
                                         update Sections 5-6 with real data,
                                         revise speedup claims vs measured,
                                         robustness tests (1/4/8-GPU, θ=0.99),
                                         camera-ready format, bib check,
                                         NeurIPS 2026 submission prep
+
+新一轮第5位 Claude  M651-M700  ⏳ next   Reproducibility + artifacts:
+                                        Docker/Singularity container,
+                                        README one-command build+run,
+                                        artifact evaluation checklist,
+                                        Zenodo/GitHub release with DOI
+
+新一轮第6位 Claude  M701-M750  ⏳ next   Final QA + submission:
+                                        cross-check claims vs data,
+                                        supplementary materials,
+                                        pre-submission review,
+                                        NeurIPS 2026 OpenReview submission
 ─────────────────────────────────────────────────────────────────────────────
 ```
 
@@ -356,32 +367,55 @@ docs/                          PLAN.md + PROGRESS.md
   • Run _full tests on CPU to confirm debug output pipeline
   • Verify [AJB_*] trace tags flow through build_and_test.sh
 
-第3位 Claude   M451-M500   ⏳ next   Benchmark dry-run + pipeline
-  • First real ajb_benchmark run on 2-GPU setup
-  • Capture CSV output, validate figure_data_emitter pipeline
-  • Run scripts/debug/build_and_test.sh --target test_join_baseline
-  • End-to-end: CSV → figure_data_emitter.py → JSON → plot_experiments.py
-  • Verify stderr .stderr.log capture from run_experiments.py
+新一轮第1位 Claude   M451-M500   ✅ done   Upstream _upstream ports (algorithm-level)
+  • 7 test _upstream files: test_count_oracle/index/join_tree/enumerator/
+    rr_access_tree/bucket_pool/unordered_map — all with algorithm changes
+    (loop restructuring, data structure swaps, search strategy changes)
+  • 4 tool _upstream files: gen_co_data/run_bpt/upper_bound/wash_data
+  • 1 shell script: scripts/debug/run_upstream_tests.sh (merged 9 upstream .sh)
+  • CMakeLists.txt: registered all _upstream targets with GLPK linking
+  • Algorithm changes per file (NOT string injection):
+    - generateRange: full-dim dual-point + random collapse (was divdim split)
+    - readDataFromFile: strtol pointer walk (was istringstream >>)
+    - genCOData dedup: sort+unique batch (was set.find per-insert)
+    - writeDataToFile: snprintf→char buf→fwrite (was ofstream <<)
+    - testIndex: LCG sequence (was rand()%BIG), two-phase MHBS loop
+    - testJoinTree: reverse iteration + direct-index fill (was push_back)
+    - VectorHash: FNV-1a (was xor-shift chain)
+    - wash parser: find+substr (was stringstream >>)
+  • All files ≥20% diff rate vs upstream originals (32%-79%)
 
-第4位 Claude   M501-M550   ⏳ next   Experiment execution
+新一轮第2位 Claude   M501-M550   ⏳ next   Experiment execution
   • Full experiment suite: cadence_sweep, vs_upstream, skew_sensitivity
   • Collect result CSVs for each experiment
   • Multi-seed runs for statistical significance (3-5 seeds per config)
   • Validate AJB trace output: grep '[AJB_TIMER]' for timing consistency
   • Parse all .stderr.log with parse_ajb_trace.py for anomalies
 
-第5位 Claude   M551-M600   ⏳ next   Data analysis + figures
+新一轮第3位 Claude   M551-M600   ⏳ next   Data analysis + figures
   • Generate figure JSONs from collected CSVs
   • Produce final publication-quality plots (Figures 2-5)
   • Fill in paper Tables 1-2 with real measured numbers
   • Anomaly detection: flag any result > 2σ from expected
   • Use ajb_validate_plot_data to pre-check all data before plotting
 
-第6位 Claude   M601-M650   ⏳ next   Paper revision + camera-ready
+新一轮第4位 Claude   M601-M650   ⏳ next   Paper revision + camera-ready
   • Update Sections 5-6 with real experimental data
   • Revise speedup claims against actual numbers
   • Robustness tests: 1-GPU, 8-GPU, extreme skew θ=0.99
   • Camera-ready formatting, bibliography check, submission prep
+
+新一轮第5位 Claude   M651-M700   ⏳ next   Reproducibility + artifacts
+  • Docker/Singularity container for reproducible builds
+  • README with one-command build + run instructions
+  • Artifact evaluation checklist per NeurIPS guidelines
+  • Zenodo/GitHub release with DOI
+
+新一轮第6位 Claude   M701-M750   ⏳ next   Final QA + submission
+  • Cross-check all claims in paper vs actual measured data
+  • Supplementary materials compilation
+  • Pre-submission review: formatting, references, appendix
+  • NeurIPS 2026 OpenReview submission
 ─────────────────────────────────────────────────────────────────────────────
 ```
 

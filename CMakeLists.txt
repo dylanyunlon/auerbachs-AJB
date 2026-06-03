@@ -247,9 +247,59 @@ if(GLPK_LIBRARY)
     set_target_properties(ajb_${tool_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
   endforeach()
 
+  # --- _upstream test targets (Claude-10: upstream files with algorithm-level changes) ---
+  set(AJB_RENUM_TESTS_UPSTREAM
+    test_count_oracle_upstream
+    test_index_upstream
+    test_join_tree_upstream
+    test_enumerator_upstream
+    test_rr_access_tree_upstream
+    test_bucket_pool_upstream
+    test_unordered_map_upstream
+  )
+  # These need GLPK (same as _full except test_unordered_map)
+  set(AJB_UPSTREAM_NEEDS_GLPK
+    test_count_oracle_upstream
+    test_index_upstream
+    test_join_tree_upstream
+    test_enumerator_upstream
+    test_rr_access_tree_upstream
+    test_bucket_pool_upstream
+  )
+
+  foreach(test_name ${AJB_RENUM_TESTS_UPSTREAM})
+    add_executable(ajb_${test_name} "src/joinrenum/tests/${test_name}.cpp")
+    target_include_directories(ajb_${test_name} PRIVATE ${AJB_RENUM_INCLUDE_DIRS})
+    target_compile_features(ajb_${test_name} PRIVATE cxx_std_17)
+    set_target_properties(ajb_${test_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+    list(FIND AJB_UPSTREAM_NEEDS_GLPK ${test_name} _glpk_idx)
+    if(NOT _glpk_idx EQUAL -1)
+      target_link_libraries(ajb_${test_name} PRIVATE ${GLPK_LIBRARY})
+    endif()
+  endforeach()
+
+  # --- _upstream tool targets ---
+  set(AJB_RENUM_TOOLS_UPSTREAM
+    gen_co_data_upstream
+    run_bpt_upstream
+    upper_bound_upstream
+    wash_data_upstream
+  )
+
+  foreach(tool_name ${AJB_RENUM_TOOLS_UPSTREAM})
+    add_executable(ajb_${tool_name} "src/joinrenum/tools/${tool_name}.cpp")
+    target_include_directories(ajb_${tool_name} PRIVATE ${AJB_RENUM_INCLUDE_DIRS})
+    target_compile_features(ajb_${tool_name} PRIVATE cxx_std_17)
+    if(${tool_name} STREQUAL "gen_co_data_upstream")
+      target_link_libraries(ajb_${tool_name} PRIVATE ${GLPK_LIBRARY})
+    endif()
+    set_target_properties(ajb_${tool_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+  endforeach()
+
   # Convenience targets
   add_custom_target(ajb_joinrenum_tests)       # original tests
   add_custom_target(ajb_joinrenum_tests_full)   # _full tests + baseline
+  add_custom_target(ajb_joinrenum_tests_upstream)  # _upstream tests
   add_custom_target(ajb_joinrenum_all)          # everything
 
   foreach(test_name ${AJB_RENUM_TESTS})
@@ -269,6 +319,15 @@ if(GLPK_LIBRARY)
   add_dependencies(ajb_joinrenum_all ajb_test_join_baseline)
   foreach(tool_name ${AJB_RENUM_TOOLS_FULL})
     add_dependencies(ajb_joinrenum_tests_full ajb_${tool_name})
+    add_dependencies(ajb_joinrenum_all ajb_${tool_name})
+  endforeach()
+
+  foreach(test_name ${AJB_RENUM_TESTS_UPSTREAM})
+    add_dependencies(ajb_joinrenum_tests_upstream ajb_${test_name})
+    add_dependencies(ajb_joinrenum_all ajb_${test_name})
+  endforeach()
+  foreach(tool_name ${AJB_RENUM_TOOLS_UPSTREAM})
+    add_dependencies(ajb_joinrenum_tests_upstream ajb_${tool_name})
     add_dependencies(ajb_joinrenum_all ajb_${tool_name})
   endforeach()
 
