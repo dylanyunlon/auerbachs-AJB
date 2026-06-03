@@ -1,45 +1,4 @@
-// =============================================================================
-// gpu_sort_benchmark.cu — Gpu Sort Benchmark (AJB-instrumented)
-//
-// AJB adaptation: experiment lifecycle logging, per-run timing with
-//   statistical aggregation (mean/min/max/stddev), parameter echo to stderr
-//   for reproducibility, warm-up run detection, result validation checksum,
-//   and memory usage snapshot at peak.
-// =============================================================================
-#include <cstdio>
-#include <chrono>
-#include <cmath>
-#include <numeric>
-
-// [AJB] Benchmark harness diagnostics
-static struct {
-    long long total_runs = 0;
-    long long warmup_runs = 0;
-    double    sum_ms = 0.0;
-    double    sum_sq_ms = 0.0;
-    double    min_ms = 1e18;
-    double    max_ms = 0.0;
-    void record(double ms, bool is_warmup = false) {
-        total_runs++;
-        if(is_warmup) { warmup_runs++; return; }
-        sum_ms += ms;
-        sum_sq_ms += ms * ms;
-        if(ms < min_ms) min_ms = ms;
-        if(ms > max_ms) max_ms = ms;
-    }
-    void dump(const char* tag = "Gpu Sort Benchmark") {
-        long long n = total_runs - warmup_runs;
-        double avg = n > 0 ? sum_ms / n : 0.0;
-        double var = n > 1 ? (sum_sq_ms - sum_ms * sum_ms / n) / (n - 1) : 0.0;
-        double sd = var > 0 ? std::sqrt(var) : 0.0;
-        fprintf(stderr, "[AJB_STATE][%s] runs=%lld warmup=%lld min=%.3fms avg=%.3fms max=%.3fms sd=%.3fms\n",
-                tag, total_runs, warmup_runs, min_ms, avg, max_ms, sd);
-    }
-    void reset() { total_runs = warmup_runs = 0; sum_ms = sum_sq_ms = 0.0; min_ms = 1e18; max_ms = 0.0; }
-} ajb_bench_stats;
-
 #include <algorithm>
-#include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -60,9 +19,6 @@ static struct {
 #include "common/profile_utilities.cuh"
 #include "common/resource_context.cuh"
 #include "common/stream_pool.cuh"
-
-// [AJB] gpu_sort_benchmark: benchmark entry point
-// 诊断注入: 在main()入口、每个benchmark循环、结果输出前后加breakpoint
 
 constexpr size_t kDeviceMemoryOverhead = 1024_MB;
 
@@ -90,8 +46,14 @@ void RunGpuSortBenchmark(Settings& settings) {
 
   CheckCudaError(cudaSetDevice(0));
 
+  // Upstream: allocator size computed inline.
+  // Changed: pre-compute required_bytes for clarity and to make the
+  // element-size calculation explicit (avoids silent type narrowing).
+  const size_t per_element = sizeof(T) + sizeof(V);
+  const size_t required_bytes = 2 * settings.num_elements * per_element + kDeviceMemoryOverhead;
+
   DeviceAllocator device_allocator;
-  device_allocator.Initialize(2 * settings.num_elements * (sizeof(T) + sizeof(V)) + kDeviceMemoryOverhead);
+  device_allocator.Initialize(required_bytes);
 
   StreamPool stream_pool;
   stream_pool.Initialize(1);
@@ -163,17 +125,23 @@ void RunGpuSortBenchmark(Settings& settings) {
   std::cout << std::fixed << std::setprecision(9) << termcolor::green
             << TimeDurations::Get().GetDuration("gpu_sort_phase") << termcolor::reset << std::endl;
 
-  if (!std::is_sorted(keys.begin(), keys.end())) {
-    printf("[ERROR] RunGpuSortBenchmark: Invalid order.\n");
+  auto inv = std::adjacent_find(keys.begin(), keys.end(), [](const T& a, const T& b) { return b < a; });
+  if (inv != keys.end()) {
+    size_t pos = std::distance(keys.begin(), inv);
+    printf("[ERROR] RunGpuSortBenchmark: Invalid order at index %zu.\n", pos);
   }
 }
 
-int main(int argc, char* argv[]) {
-  fprintf(stderr, "[AJB_BP][Gpu Sort Benchmark] === benchmark start ===\n");
-  auto _ajb_bench_t0 = std::chrono::high_resolution_clock::now();
+static bool ValidateSettings(const Settings& s) {
+  if (!OptionsLimits::IsValidNumElements(s.num_elements) ||
+      !OptionsLimits::IsValidNumThreads(s.num_threads)) return false;
+  if (!OptionsLimits::IsValidGpuSortAlgorithm(s.gpu_sort_algorithm)) return false;
+  if (!OptionsLimits::IsValidType(s.key_type) || !OptionsLimits::IsValidType(s.value_type)) return false;
+  if (!OptionsLimits::IsValidRandomSeed(s.random_seed)) return false;
+  return true;
+}
 
-  fprintf(stderr, "[AJB_BP][gpu_sort_benchmark] benchmark start\n", argv[0]);
-  auto ajb_bench_start = std::chrono::steady_clock::now();
+int main(int argc, char* argv[]) {
   cxxopts::Options options("gpu_sort_benchmark");
 
   options.set_width(250);
@@ -201,29 +169,14 @@ int main(int argc, char* argv[]) {
                 parse_result["value_type"].as<std::string>(),
                 parse_result["random_seed"].as<uint32_t>()};
 
-  if (!OptionsLimits::IsValidNumElements(s.num_elements) || !OptionsLimits::IsValidNumThreads(s.num_threads) ||
-      !OptionsLimits::IsValidGpuSortAlgorithm(s.gpu_sort_algorithm) || !OptionsLimits::IsValidType(s.key_type) ||
-      !OptionsLimits::IsValidType(s.value_type) || !OptionsLimits::IsValidRandomSeed(s.random_seed) ||
-      parse_result["help"].as<bool>()) {
+  if (!ValidateSettings(s) || parse_result["help"].as<bool>()) {
     std::cout << options.help() << std::endl;
-    auto ajb_bench_end = std::chrono::steady_clock::now();
-  double ajb_total_sec = std::chrono::duration<double>(ajb_bench_end - ajb_bench_start).count();
-  fprintf(stderr, "[AJB_TIMER][gpu_sort_benchmark] total benchmark: %.3fs\n", ajb_total_sec);
-  fprintf(stderr, "[AJB_BP][gpu_sort_benchmark] benchmark end\n");
-  return 0;
+    return 0;
   }
 
   if (s.key_type == "int" && s.value_type == "int") {
     RunGpuSortBenchmark<int, int>(s);
   }
 
-  auto ajb_bench_end = std::chrono::steady_clock::now();
-  double ajb_total_sec = std::chrono::duration<double>(ajb_bench_end - ajb_bench_start).count();
-  fprintf(stderr, "[AJB_TIMER][gpu_sort_benchmark] total benchmark: %.3fs\n", ajb_total_sec);
-  fprintf(stderr, "[AJB_BP][gpu_sort_benchmark] benchmark end\n");
-  auto _ajb_bench_t1 = std::chrono::high_resolution_clock::now();
-  double _ajb_total = std::chrono::duration<double, std::milli>(_ajb_bench_t1 - _ajb_bench_t0).count();
-  fprintf(stderr, "[AJB_BP][Gpu Sort Benchmark] === benchmark end: %.2fms total ===\n", _ajb_total);
-  ajb_bench_stats.dump();
   return 0;
 }

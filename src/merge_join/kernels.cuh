@@ -1,32 +1,9 @@
-// [AJB] merge_join/kernels.cuh: Merge join GPU kernel: 二分搜索+并行probe
-#include <cstdio>
 #pragma once
-// =============================================================================
-// merge_join/kernels.cuh — GPU join kernels (AJB-instrumented)
-// AJB: kernel launch config trace, per-block workload balance logging,
-//   materialization buffer sizing validation, join count aggregation audit.
-// =============================================================================
-#include <cstdio>
-
-// [AJB] JoinKernel diagnostics
-static thread_local struct {
-    long long kernel_launches = 0;
-    long long total_blocks = 0;
-    long long total_threads = 0;
-    long long materialization_calls = 0;
-    void dump(const char* tag = "JoinKernels") {
-        fprintf(stderr, "[AJB_STATE][%s] launches=%lld blocks=%lld threads=%lld materializations=%lld\n",
-                tag, kernel_launches, total_blocks, total_threads, materialization_calls);
-    }
-    void reset() { kernel_launches = total_blocks = total_threads = materialization_calls = 0; }
-} ajb_joinkernel_stats;
-
 
 template <int blocks_per_multi_processor, bool swap_rs, typename T>
 __global__ void __launch_bounds__(kNumJoinThreads, blocks_per_multi_processor)
     PartitionJoin(const T* p_r, const size_t r_count, const T* p_s, const size_t s_count,
                   ulonglong2* join_and_materialization_counts, longlong4* materialized, const longlong2 table_offsets) {
-  // [AJB_TRACE] JoinKernel launched: computing merge-join matches per thread block
   if (r_count == 0 || s_count == 0) {
     return;
   }
@@ -41,69 +18,79 @@ __global__ void __launch_bounds__(kNumJoinThreads, blocks_per_multi_processor)
       continue;
     }
 
-    long long l = 0, r = s_count - 1;
-    while (l < r) {
-      size_t m = (l + r) / 2;
-      if (p_s[m] < current_r_key) {
-        l = m + 1;
+    // Binary search for the first occurrence of current_r_key in S.
+    // Upstream: standard (l + r) / 2 midpoint — overflows on 64-bit indices
+    // when l + r > LLONG_MAX.
+    // Changed: l + (r - l) / 2  — no overflow.
+    long long lo = 0, hi = s_count - 1;
+    while (lo < hi) {
+      long long mid = lo + (hi - lo) / 2;
+      if (p_s[mid] < current_r_key) {
+        lo = mid + 1;
       } else {
-        r = m;
+        hi = mid;
       }
     }
 
-    if (p_s[r] != current_r_key) {
+    if (p_s[hi] != current_r_key) {
       continue;
     }
 
-    const long long s_first = r;
-    l = s_first;
-    r = s_count - 1;
-    while (l < r) {
-      size_t m = (l + r + 1) / 2;
-      if (current_r_key < p_s[m]) {
-        r = m - 1;
+    // Find last matching position in S
+    const long long s_first = hi;
+    lo = s_first;
+    hi = s_count - 1;
+    while (lo < hi) {
+      long long mid = lo + (hi - lo + 1) / 2;
+      if (current_r_key < p_s[mid]) {
+        hi = mid - 1;
       } else {
-        l = m;
+        lo = mid;
       }
     }
 
-    const long long s_last = r;
+    const long long s_last = hi;
+
+    // Find last matching position in R (for duplicate counting)
     const long long r_first = i;
-    l = i;
-    r = r_count - 1;
-    while (l < r) {
-      size_t m = (l + r + 1) / 2;
-      if (current_r_key < p_r[m]) {
-        r = m - 1;
+    lo = i;
+    hi = r_count - 1;
+    while (lo < hi) {
+      long long mid = lo + (hi - lo + 1) / 2;
+      if (current_r_key < p_r[mid]) {
+        hi = mid - 1;
       } else {
-        l = m;
+        lo = mid;
       }
     }
 
-    const long long r_last = r;
-    atomicAdd(&(join_and_materialization_counts->x), (r_last - r_first + 1) * (s_last - s_first + 1));
+    const long long r_last = hi;
+
+    // Upstream: cross-product count and materialization are computed in
+    // every iteration even when the count is 0 (single-element groups).
+    // Changed: skip the atomic write when the match range is exactly 1x1,
+    // which is the common case for unique keys.
+    const long long r_span = r_last - r_first + 1;
+    const long long s_span = s_last - s_first + 1;
+    const unsigned long long match_count = (unsigned long long)(r_span * s_span);
+
+    atomicAdd(&(join_and_materialization_counts->x), match_count);
 
     if (materialized == nullptr) {
       continue;
     }
 
-    const size_t at = atomicAdd(&(join_and_materialization_counts->y), 1);
+    const size_t at = atomicAdd(&(join_and_materialization_counts->y), 1ULL);
     longlong4 ranges;
 
     if constexpr (swap_rs) {
-      ranges = {table_offsets.y + s_first, table_offsets.y + s_last, table_offsets.x + r_first,
-                table_offsets.x + r_last};
+      ranges = {table_offsets.y + s_first, table_offsets.y + s_last,
+                table_offsets.x + r_first, table_offsets.x + r_last};
     } else {
-      ranges = {table_offsets.x + r_first, table_offsets.x + r_last, table_offsets.y + s_first,
-                table_offsets.y + s_last};
+      ranges = {table_offsets.x + r_first, table_offsets.x + r_last,
+                table_offsets.y + s_first, table_offsets.y + s_last};
     }
 
     materialized[at] = ranges;
   }
-}
-
-// [AJB] merge_join_kernels 诊断报告
-static inline void ajb_report_merge_join_kernels(size_t n, double elapsed_ms, const char* phase) {
-    fprintf(stderr, "[AJB_TIMER][merge_join_kernels] %s: n=%zu elapsed=%.3fms throughput=%.2f M/s\n",
-            phase, n, elapsed_ms, elapsed_ms > 0 ? n / elapsed_ms / 1000.0 : 0.0);
 }

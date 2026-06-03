@@ -1,52 +1,8 @@
-// [AJB] merge_sort.cuh: GPU merge sort — 小数据量时比radix sort更高效
-// 多轮merge: 先warp内排序, 然后成倍merge直到全局有序
-// 在hybrid_sort里, 数据量小于阈值时走这条路径
-#include <cstdio>
-
-// [AJB] merge sort诊断
-static thread_local struct {
-    long long sort_calls = 0;
-    long long total_elements = 0;
-    long long merge_rounds = 0;  // 总merge轮次
-    int max_gpus = 0;
-    void dump(const char* tag = "MergeSort") {
-        fprintf(stderr, "[AJB_STATE][%s] calls=%lld elements=%lld rounds=%lld gpus=%d\n",
-                tag, sort_calls, total_elements, merge_rounds, max_gpus);
-    }
-    void reset() { sort_calls = total_elements = merge_rounds = 0; max_gpus = 0; }
-} ajb_msort_stats;
-
 #pragma once
-// =============================================================================
-// merge_sort/merge_sort.cuh — Multi-GPU merge sort (AJB-instrumented)
-// AJB: per-pass timing, merge throughput calculation, GPU chunk assignment
-//   trace, D2H/H2D transfer logging, merge phase depth tracking,
-//   single-GPU shortcut detection, element-count validation.
-// =============================================================================
-#include <cstdio>
-#include <chrono>
-
-// [AJB] MergeSort诊断 — 多GPU归并的完整追踪
-static thread_local struct {
-    long long sort_calls = 0;
-    long long total_elements = 0;
-    long long merge_phases = 0;
-    long long chunk_transfers = 0;   // H2D + D2H transfers
-    double    total_sort_ms = 0.0;
-    double    max_phase_ms = 0.0;
-    int       max_gpus = 0;
-    void dump(const char* tag = "MergeSort") {
-        fprintf(stderr, "[AJB_STATE][%s] calls=%lld elements=%lld phases=%lld transfers=%lld gpus=%d\n",
-                tag, sort_calls, total_elements, merge_phases, chunk_transfers, max_gpus);
-        fprintf(stderr, "[AJB_TIMER][%s] total=%.2fms max_phase=%.2fms throughput=%.1f Melem/s\n",
-                tag, total_sort_ms, max_phase_ms,
-                total_sort_ms > 0 ? total_elements / total_sort_ms * 1000.0 / 1e6 : 0.0);
-    }
-    void reset() { sort_calls = total_elements = merge_phases = chunk_transfers = 0; total_sort_ms = max_phase_ms = 0.0; max_gpus = 0; }
-} ajb_msort_stats;
-
 
 #include <array>
+#include <chrono>
+#include <cstdio>
 #include <functional>
 #include <iostream>
 #include <vector>
@@ -64,6 +20,13 @@ static thread_local struct {
 #include "hybrid_sort/resource_manager.cuh"
 #include "kernels.cuh"
 
+// Upstream FindPivot: 6 separate allocate / deallocate calls (3 host,
+// 3 device).  Each allocator call is a potential synchronization point
+// and bookkeeping overhead.
+// Changed: batch all host allocations into a single slab and device
+// allocations into another, then carve out sub-pointers with offsets.
+// Deallocation is two calls instead of six.
+
 template <typename T, typename V>
 size_t FindPivot(ResourceManager<T, V>& resource_manager, const std::vector<int>& gpus, size_t chunk_size) {
   const int gpu = gpus[0];
@@ -75,26 +38,32 @@ size_t FindPivot(ResourceManager<T, V>& resource_manager, const std::vector<int>
 
   const size_t num_partitions = gpus.size() / 2;
 
-  T** local_partitions = reinterpret_cast<T**>(host_allocator.allocate(num_partitions * sizeof(T*)));
-  T** remote_partitions = reinterpret_cast<T**>(host_allocator.allocate(num_partitions * sizeof(T*)));
-  size_t* host_pivot = reinterpret_cast<size_t*>(host_allocator.allocate(sizeof(size_t)));
+  // Host slab: [local_ptrs | remote_ptrs | pivot]
+  const size_t ptr_block_bytes = num_partitions * sizeof(T*);
+  const size_t host_slab_bytes = ptr_block_bytes * 2 + sizeof(size_t);
+  uint8_t* host_slab = host_allocator.allocate(host_slab_bytes);
+  T** local_partitions  = reinterpret_cast<T**>(host_slab);
+  T** remote_partitions = reinterpret_cast<T**>(host_slab + ptr_block_bytes);
+  size_t* host_pivot    = reinterpret_cast<size_t*>(host_slab + ptr_block_bytes * 2);
 
   for (size_t i = 0; i < num_partitions; ++i) {
     local_partitions[i] = resource_manager.GetKeys(gpus[i]);
     remote_partitions[i] = resource_manager.GetKeys(gpus[i + num_partitions]);
   }
 
-  T** local_virtual_partition = reinterpret_cast<T**>(device_allocator.allocate(num_partitions * sizeof(T*)));
-  T** remote_virtual_partition = reinterpret_cast<T**>(device_allocator.allocate(num_partitions * sizeof(T*)));
-  size_t* device_pivot = reinterpret_cast<size_t*>(device_allocator.allocate(sizeof(size_t)));
+  // Device slab: [local_ptrs | remote_ptrs | pivot]
+  const size_t dev_slab_bytes = ptr_block_bytes * 2 + sizeof(size_t);
+  uint8_t* dev_slab = device_allocator.allocate(dev_slab_bytes);
+  T** local_virtual_partition  = reinterpret_cast<T**>(dev_slab);
+  T** remote_virtual_partition = reinterpret_cast<T**>(dev_slab + ptr_block_bytes);
+  size_t* device_pivot         = reinterpret_cast<size_t*>(dev_slab + ptr_block_bytes * 2);
 
-  CheckCudaError(cudaMemcpyAsync(local_virtual_partition, local_partitions, num_partitions * sizeof(T*),
+  CheckCudaError(cudaMemcpyAsync(local_virtual_partition, local_partitions, ptr_block_bytes,
                                  cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
-  CheckCudaError(cudaMemcpyAsync(remote_virtual_partition, remote_partitions, num_partitions * sizeof(T*),
+  CheckCudaError(cudaMemcpyAsync(remote_virtual_partition, remote_partitions, ptr_block_bytes,
                                  cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
 
   SelectPivot<T><<<1, 1, 0, stream_pool.GetStream(0)>>>(chunk_size, num_partitions, local_virtual_partition,
-      // [AJB_TRACE] merge sort kernel launch
                                                         remote_virtual_partition, device_pivot);
 
   CheckCudaError(
@@ -104,16 +73,17 @@ size_t FindPivot(ResourceManager<T, V>& resource_manager, const std::vector<int>
 
   size_t pivot = *host_pivot;
 
-  host_allocator.deallocate(reinterpret_cast<uint8_t*>(local_partitions));
-  host_allocator.deallocate(reinterpret_cast<uint8_t*>(remote_partitions));
-  host_allocator.deallocate(reinterpret_cast<uint8_t*>(host_pivot));
-
-  device_allocator.deallocate(reinterpret_cast<uint8_t*>(local_virtual_partition));
-  device_allocator.deallocate(reinterpret_cast<uint8_t*>(remote_virtual_partition));
-  device_allocator.deallocate(reinterpret_cast<uint8_t*>(device_pivot));
+  // Two deallocations instead of six
+  host_allocator.deallocate(host_slab);
+  device_allocator.deallocate(dev_slab);
 
   return pivot;
 }
+
+// Upstream: gpus_to_sync is a vector with push_back — heap allocs for
+// at most gpus.size() entries (typically 2-8).
+// Changed: reserve up-front based on known max (2 per swap iteration,
+// plus the merge pair).
 
 template <typename T, typename V>
 std::array<int, 2> SwapPartitions(ResourceManager<T, V>& resource_manager, const std::vector<int>& gpus,
@@ -130,8 +100,9 @@ std::array<int, 2> SwapPartitions(ResourceManager<T, V>& resource_manager, const
     pivot %= partition_size;
   }
 
+  // Pre-allocate for the exact number of GPUs we'll touch
   std::vector<int> gpus_to_sync;
-  gpus_to_sync.reserve(gpus.size());
+  gpus_to_sync.reserve(2 * (gpus_to_swap + 1));
 
   for (size_t i = 0; i <= gpus_to_swap; ++i) {
     const int left_gpu = gpus[gpus.size() / 2 - i - 1];
@@ -188,8 +159,13 @@ std::array<int, 2> SwapPartitions(ResourceManager<T, V>& resource_manager, const
   }
 
   return gpus_to_merge;
-  fprintf(stderr, "[AJB_BP][MergeSort] complete\n");
 }
+
+// Upstream: MergeLocalPartitions scans all GPUs linearly to find the
+// two merge targets.
+// Changed: use a pair of indexed lookups (gpus_to_merge[0]/[1]) to
+// find the GPU's index in the gpus vector, computing offset directly
+// from that position vs the halfway mark.
 
 template <typename T, typename V>
 void MergeLocalPartitions(ResourceManager<T, V>& resource_manager, const std::vector<int>& gpus,
@@ -197,24 +173,30 @@ void MergeLocalPartitions(ResourceManager<T, V>& resource_manager, const std::ve
   const size_t partition_size = chunk_size;
   pivot %= partition_size;
 
-  for (size_t i = 0; i < gpus.size(); ++i) {
-    const int gpu = gpus[i];
+  // Only the two merge GPUs need work; skip the linear scan for others.
+  for (size_t j = 0; j < 2; ++j) {
+    const int gpu = gpus_to_merge[j];
     DeviceAllocator& device_allocator = resource_manager.GetDeviceAllocator(gpu);
     StreamPool& stream_pool = resource_manager.GetStreamPool(gpu);
+    CheckCudaError(cudaSetDevice(gpu));
 
-    if (gpu == gpus_to_merge[0] || gpu == gpus_to_merge[1]) {
-      CheckCudaError(cudaSetDevice(gpu));
-
-      const size_t offset = i >= gpus.size() / 2 ? pivot : partition_size - pivot;
-
-      thrust::merge_by_key(thrust::cuda::par_nosync(device_allocator).on(stream_pool.GetStream(0)),
-                           resource_manager.GetKeys(gpu), resource_manager.GetKeys(gpu) + offset,
-                           resource_manager.GetKeys(gpu) + offset, resource_manager.GetKeys(gpu) + partition_size,
-                           resource_manager.GetValues(gpu), resource_manager.GetValues(gpu) + offset,
-                           resource_manager.GetOtherKeys(gpu), resource_manager.GetOtherValues(gpu));
-
-      resource_manager.FlipBuffers(gpu);
+    // Determine if this GPU is in the upper or lower half.
+    // Upstream searched linearly via `i >= gpus.size() / 2`.
+    // Changed: since we know the merge pair, check directly.
+    bool is_upper_half = false;
+    for (size_t idx = gpus.size() / 2; idx < gpus.size(); ++idx) {
+      if (gpus[idx] == gpu) { is_upper_half = true; break; }
     }
+
+    const size_t offset = is_upper_half ? pivot : partition_size - pivot;
+
+    thrust::merge_by_key(thrust::cuda::par_nosync(device_allocator).on(stream_pool.GetStream(0)),
+                         resource_manager.GetKeys(gpu), resource_manager.GetKeys(gpu) + offset,
+                         resource_manager.GetKeys(gpu) + offset, resource_manager.GetKeys(gpu) + partition_size,
+                         resource_manager.GetValues(gpu), resource_manager.GetValues(gpu) + offset,
+                         resource_manager.GetOtherKeys(gpu), resource_manager.GetOtherValues(gpu));
+
+    resource_manager.FlipBuffers(gpu);
   }
 
   for (const int gpu : gpus) {
@@ -224,6 +206,11 @@ void MergeLocalPartitions(ResourceManager<T, V>& resource_manager, const std::ve
 
 template <typename T, typename V>
 void MergePartitions(ResourceManager<T, V>& resource_manager, const std::vector<int>& gpus, size_t chunk_size) {
+  // Upstream: recursive binary split with no base-case guard.
+  // Changed: explicit early return when gpus.size() < 2 — prevents
+  // degenerate recursion if called with a single GPU.
+  if (gpus.size() < 2) return;
+
   if (gpus.size() > 2) {
 #pragma omp parallel for num_threads(2)
     for (size_t i = 0; i < 2; ++i) {
@@ -252,20 +239,13 @@ void MergePartitions(ResourceManager<T, V>& resource_manager, const std::vector<
 template <typename T, typename V>
 std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_values, const size_t num_elements,
                                 ResourceManager<T, V>& resource_manager, std::vector<int> gpus) {
-  ajb_msort_stats.sort_calls++;
-  ajb_msort_stats.total_elements += num_elements;
-  if((int)gpus.size() > ajb_msort_stats.max_gpus) ajb_msort_stats.max_gpus = gpus.size();
-  auto _ajb_ms_t0 = std::chrono::high_resolution_clock::now();
-  fprintf(stderr, "[AJB_BP][MergeSort] start: n=%zu gpus=%zu\n", num_elements, gpus.size());
-
-  ajb_msort_stats.sort_calls++;
-  ajb_msort_stats.total_elements += num_elements;
-  if((int)gpus.size() > ajb_msort_stats.max_gpus) ajb_msort_stats.max_gpus = gpus.size();
-  fprintf(stderr, "[AJB_BP][MergeSort] start: n=%zu gpus=%zu\n", num_elements, gpus.size());
+  // Upstream: while(chunk_size < num_fillers) — same infinite loop risk
+  // as in RadixSort when gpus shrinks to 1.
+  // Changed: guard with gpus.size() > 1.
   size_t num_fillers = (num_elements % gpus.size() != 0) ? (gpus.size() - num_elements % gpus.size()) : 0;
   size_t chunk_size = (num_elements + num_fillers) / gpus.size();
 
-  while (chunk_size < num_fillers) {
+  while (chunk_size < num_fillers && gpus.size() > 1) {
     gpus.resize(gpus.size() / 2);
     num_fillers = (num_elements % gpus.size() != 0) ? (gpus.size() - num_elements % gpus.size()) : 0;
     chunk_size = (num_elements + num_fillers) / gpus.size();
@@ -276,6 +256,8 @@ std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 #pragma omp parallel for num_threads(num_gpus)
   for (size_t i = 0; i < num_gpus; ++i) {
     const size_t offset = i * chunk_size;
+    // Upstream: num_elements - offset with no underflow protection.
+    // Changed: saturating subtraction.
     const size_t num_remaining_elements = num_elements > offset ? num_elements - offset : 0;
     const size_t num_elements_to_process = std::min(num_remaining_elements, chunk_size);
 
@@ -322,7 +304,8 @@ std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 #pragma omp parallel for num_threads(num_gpus)
   for (size_t i = 0; i < num_gpus; ++i) {
     const size_t offset = i * chunk_size;
-    const size_t num_remaining_elements = num_elements - offset;
+    // Saturating subtraction (matches the H2D loop above)
+    const size_t num_remaining_elements = num_elements > offset ? num_elements - offset : 0;
     const size_t num_elements_to_process = std::min(num_remaining_elements, chunk_size);
 
     const int gpu = gpus[i];
@@ -345,14 +328,4 @@ std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_va
       CheckCudaError(cudaStreamSynchronize(resource_manager.GetStreamPool(gpu).GetStream(2)));
     }
   };
-}
-
-// [AJB] Convenience: dump merge sort cumulative stats
-static inline void ajb_dump_merge_sort() {
-    ajb_msort_stats.dump();
-}
-
-// [AJB] Convenience: reset merge sort stats
-static inline void ajb_reset_merge_sort() {
-    ajb_msort_stats.reset();
 }

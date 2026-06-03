@@ -1,30 +1,7 @@
 #pragma once
-// =============================================================================
-// data_generator.cuh — Multi-distribution data generator (AJB-instrumented)
-// AJB adaptation: per-distribution timing, dispatch tracing, element count
-//   validation, seed tracking, distribution quality metrics (min/max/mean).
-// =============================================================================
-#include <cstdio>
-
-// [AJB] DataGenerator诊断 — 追踪每种分布的调用次数和耗时
-static thread_local struct {
-    long long gen_calls = 0;
-    long long total_elements = 0;
-    double    total_gen_ms = 0.0;
-    double    max_gen_ms = 0.0;
-    long long uniform_calls = 0, normal_calls = 0, zipf_calls = 0;
-    long long sorted_calls = 0, staggered_calls = 0, other_calls = 0;
-    void dump(const char* tag = "DataGen") {
-        fprintf(stderr, "[AJB_STATE][%s] calls=%lld elems=%lld uniform=%lld normal=%lld zipf=%lld sorted=%lld staggered=%lld other=%lld\n",
-                tag, gen_calls, total_elements, uniform_calls, normal_calls, zipf_calls, sorted_calls, staggered_calls, other_calls);
-        fprintf(stderr, "[AJB_TIMER][%s] total=%.2fms max=%.2fms avg=%.4fms\n",
-                tag, total_gen_ms, max_gen_ms, gen_calls > 0 ? total_gen_ms / gen_calls : 0.0);
-    }
-    void reset() { gen_calls = total_elements = uniform_calls = normal_calls = zipf_calls = sorted_calls = staggered_calls = other_calls = 0; total_gen_ms = max_gen_ms = 0.0; }
-} ajb_datagen_stats;
-
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -49,54 +26,30 @@ class DataGenerator {
   static void ComputeDistribution(T* begin, size_t num_elements, size_t num_threads,
                                   const std::string& distribution_type, uint32_t random_seed,
                                   uint64_t skew_max = kSkewMax, double skew_theta = kSkewTheta) {
-    ajb_datagen_stats.gen_calls++;
-    ajb_datagen_stats.total_elements += num_elements;
-    auto _ajb_gen_t0 = std::chrono::high_resolution_clock::now();
-    fprintf(stderr, "[AJB_BP][DataGen] ComputeDistribution: dist=%s n=%zu threads=%zu seed=%u\n",
-            distribution_type.c_str(), num_elements, num_threads, random_seed);
     if (distribution_type == "uniform") {
-      ajb_datagen_stats.uniform_calls++;
       ComputeUniformDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "normal") {
-      ajb_datagen_stats.normal_calls++;
       ComputeNormalDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "zero") {
       ComputeZeroDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "staggered") {
-      ajb_datagen_stats.staggered_calls++;
       ComputeStaggeredDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "sorted") {
-      ajb_datagen_stats.sorted_calls++;
       ComputeSortedDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "reverse-sorted") {
-      ajb_datagen_stats.sorted_calls++;
       ComputeReverseSortedDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "nearly-sorted") {
-      ajb_datagen_stats.sorted_calls++;
       ComputeNearlySortedDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "bucket-sorted") {
-      ajb_datagen_stats.sorted_calls++;
       ComputeBucketSortedDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "zipf") {
-      ajb_datagen_stats.zipf_calls++;
       ComputeZipfDistribution<T>(begin, num_elements, num_threads, random_seed, skew_max, skew_theta);
     } else if (distribution_type == "self") {
-      ajb_datagen_stats.zipf_calls++;
       ComputeSelfDistribution<T>(begin, num_elements, num_threads, random_seed, skew_max, skew_theta);
     } else if (distribution_type == "unique_full_key_range") {
       ComputeUniqueFullKeyRangeDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "unique_partial_key_range") {
       ComputeUniquePartialKeyRangeDistribution<T>(begin, num_elements, num_threads, random_seed);
-    }
-    auto _ajb_gen_t1 = std::chrono::high_resolution_clock::now();
-    double _ajb_ms = std::chrono::duration<double, std::milli>(_ajb_gen_t1 - _ajb_gen_t0).count();
-    ajb_datagen_stats.total_gen_ms += _ajb_ms;
-    if(_ajb_ms > ajb_datagen_stats.max_gen_ms) ajb_datagen_stats.max_gen_ms = _ajb_ms;
-    // [AJB_STATE] post-generation: sample first/last/middle element for sanity
-    if(num_elements > 2) {
-        fprintf(stderr, "[AJB_STATE][DataGen] sample: first=%llu mid=%llu last=%llu (%.2fms)\n",
-                (unsigned long long)begin[0], (unsigned long long)begin[num_elements/2],
-                (unsigned long long)begin[num_elements-1], _ajb_ms);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kSleepDuration));
   }
@@ -143,12 +96,12 @@ class DataGenerator {
     }
   }
 
+  // Upstream: OMP parallel loop writing zero element-by-element.
+  // Changed: std::memset — single call, no thread overhead for a
+  // trivial zero-fill.  Valid because T is always an arithmetic type.
   template <typename T>
   static void ComputeZeroDistribution(T* begin, size_t num_elements, size_t num_threads, uint32_t random_seed) {
-#pragma omp parallel for num_threads(num_threads)
-    for (size_t i = 0; i < num_elements; ++i) {
-      *(begin + i) = 0;
-    }
+    std::memset(begin, 0, num_elements * sizeof(T));
   }
 
   template <typename T>
@@ -256,9 +209,22 @@ class DataGenerator {
       }
     }
 
+    // Upstream: sorts num_buckets+1 ranges (the +1 is the remainder
+    // after the last full bucket).  The remainder range may be empty
+    // when num_elements is divisible by num_buckets.
+    // Changed: only sort buckets that actually have elements; skip
+    // the empty remainder case explicitly.
+    const size_t actual_buckets = num_elements / bucket_size;
+    const size_t remainder_start = actual_buckets * bucket_size;
+
 #pragma omp parallel for num_threads(num_threads)
-    for (size_t i = 0; i <= num_buckets; ++i) {
-      __gnu_parallel::sort(begin + (i * bucket_size), std::min(begin + (i + 1) * bucket_size, begin + num_elements));
+    for (size_t i = 0; i < actual_buckets; ++i) {
+      __gnu_parallel::sort(begin + (i * bucket_size), begin + ((i + 1) * bucket_size));
+    }
+
+    // Sort the remainder (elements after the last full bucket)
+    if (remainder_start < num_elements) {
+      __gnu_parallel::sort(begin + remainder_start, begin + num_elements);
     }
   }
 
@@ -341,13 +307,17 @@ class DataGenerator {
     __gnu_parallel::random_shuffle(begin, begin + num_elements, __gnu_parallel::_RandomNumber(random_seed));
   }
 
+  // Upstream: allocates a std::vector for seed expansion — heap
+  // allocation on every call in a hot parallel region.
+  // Changed: std::array on the stack (size known at compile time).
+  // Also: (-1 & 31) == 31 — made explicit for clarity.
   static std::mt19937 RandomGenerator(uint32_t random_seed) {
-    const size_t seeds_bytes = sizeof(std::mt19937::result_type) * std::mt19937::state_size;
-    const size_t seeds_length = seeds_bytes / sizeof(std::seed_seq::result_type);
+    constexpr size_t seeds_bytes = sizeof(std::mt19937::result_type) * std::mt19937::state_size;
+    constexpr size_t seeds_length = seeds_bytes / sizeof(std::seed_seq::result_type);
 
-    std::vector<std::seed_seq::result_type> seeds(seeds_length);
+    std::array<std::seed_seq::result_type, seeds_length> seeds;
     std::generate(seeds.begin(), seeds.end(), [&]() {
-      random_seed = (random_seed << 1) | (random_seed >> (-1 & 31));
+      random_seed = (random_seed << 1) | (random_seed >> 31);
       return random_seed;
     });
     std::seed_seq seed_sequence(seeds.begin(), seeds.end());
@@ -359,28 +329,3 @@ class DataGenerator {
   static constexpr uint64_t kSkewMax = std::numeric_limits<uint32_t>::max();
   static constexpr double kSkewTheta = 0.2;
 };
-
-// [AJB] 数据生成诊断: 输出key分布的前/中/尾统计
-#include <cstdio>
-#include <algorithm>
-template<typename T>
-static inline void ajb_report_generated_data(const T* data, size_t n, const char* tag) {
-    if(n == 0) return;
-    T first = data[0], mid = data[n/2], last = data[n-1];
-    fprintf(stderr, "[AJB_STATE][DataGen] %s: n=%zu first=%lld mid=%lld last=%lld\n",
-            tag, n, (long long)first, (long long)mid, (long long)last);
-}
-// [AJB] skew检测: 检查Zipf分布的实际偏斜度
-template<typename T>
-static inline void ajb_report_key_distribution(const T* keys, size_t n, const char* tag) {
-    if(n < 10) return;
-    // 采样1000个位置统计重复率
-    size_t sample_size = std::min(n, (size_t)1000);
-    size_t step = n / sample_size;
-    size_t duplicates = 0;
-    for(size_t i = step; i < n; i += step)
-        if(keys[i] == keys[i - step]) duplicates++;
-    double dup_rate = (double)duplicates / (sample_size > 1 ? sample_size - 1 : 1);
-    fprintf(stderr, "[AJB_STATE][DataGen] %s: n=%zu sampled_dup_rate=%.4f (high=skewed)\n",
-            tag, n, dup_rate);
-}

@@ -1,17 +1,8 @@
-// =============================================================================
-// join_benchmark.cu — Multi-GPU Sort-Merge Join Benchmark (AJB-instrumented)
-//
-// Origin: upstream/multi-gpu-sort-merge-join/src/join_benchmark.cu (258 lines)
-// AJB adaptation (~20%): Settings::DebugPrint for full config dump, per-phase
-//   [AJB_TIMER] breakpoints around sort/merge/join, per-GPU memory snapshots
-//   before and after pipeline, key distribution quick-stats (min/max/median),
-//   relation cardinality check, ANSI-strip for clean CSV piping, and structured
-//   [AJB_FAIL] on join count mismatch with detailed diagnostics.
-// =============================================================================
-
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -23,7 +14,6 @@
 
 #include "common/config_utilities.cuh"
 #include "common/data_generator.cuh"
-#include "common/debug_utilities.cuh"   // AJB: breakpoint + dump + timer macros
 #include "common/device_allocator.cuh"
 #include "common/host_allocator.cuh"
 #include "common/math_utilities.cuh"
@@ -56,82 +46,37 @@ struct Settings {
   bool save;
   bool materialize;
   bool print;
-
-  // AJB: dump the full config to stderr so every run is self-documenting
-  void DebugPrint() const {
-    fprintf(stderr, "[AJB_STATE] === join_benchmark Settings ===\n");
-    fprintf(stderr, "[AJB_STATE]   R=%zu  S=%zu  threads=%zu  gpus=[",
-            r_num_elements, s_num_elements, num_threads);
-    for (size_t i = 0; i < gpus.size(); ++i)
-      fprintf(stderr, "%s%d", i ? "," : "", gpus[i]);
-    fprintf(stderr, "]\n");
-    fprintf(stderr, "[AJB_STATE]   sort=%s  join=%s  chunk=%zu\n",
-            sort_algorithm.c_str(), join_algorithm.c_str(), chunk_size);
-    fprintf(stderr, "[AJB_STATE]   key=%s/%s  val=%s/%s  seed=%u  θ=%u  σ=%u\n",
-            key_type.c_str(), key_distribution.c_str(),
-            value_type.c_str(), value_distribution.c_str(),
-            random_seed, theta, sigma);
-    fprintf(stderr, "[AJB_STATE]   r_sort=%d  s_sort=%d  save=%d  mat=%d  print=%d\n",
-            r_sort, s_sort, save, materialize, print);
-    fprintf(stderr, "[AJB_STATE] ==============================\n");
-  }
 };
 
-// AJB: quick key stats (first/last/mid) for distribution sanity check
-template <typename T>
-static void AJBDumpKeyStats(const char* name, const T* keys, size_t n) {
-  if (n == 0) { fprintf(stderr, "[AJB_STATE] %s: empty\n", name); return; }
-  T first = keys[0], last = keys[n - 1], mid = keys[n / 2];
-  fprintf(stderr, "[AJB_STATE] %s: n=%zu  first=%s  mid=%s  last=%s\n",
-          name, n, std::to_string(first).c_str(),
-          std::to_string(mid).c_str(), std::to_string(last).c_str());
+// Upstream: save uses two identical loops with csv::make_csv_writer.
+// Changed: factored into a helper lambda.
+template <typename T, typename V>
+static void SaveRelation(const char* filename, PinnedVector<T>& keys, PinnedVector<V>& values, size_t n) {
+  std::ofstream file(filename);
+  auto writer = csv::make_csv_writer(file);
+  for (size_t i = 0; i < n; ++i) {
+    writer << std::make_tuple(keys[i], values[i]);
+  }
 }
 
+// Upstream: sorts R and S with near-identical blocks for merge vs radix.
+// Changed: factor the sort-one-relation pattern into a template lambda to
+// avoid the 4x copy-paste (merge R, merge S, radix R, radix S).
 template <typename T, typename V>
 void RunJoinBenchmark(Settings& settings) {
-  // AJB: full config dump + initial memory snapshot
-  settings.DebugPrint();
-  AJBReportMemory("join_benchmark_pre");
-  for (int gpu : settings.gpus) AJBReportGPUMemory(gpu, "join_benchmark_pre");
-
   ConfigureMultiProcess(settings.num_threads);
   ConfigurePeerAccess(settings.gpus);
 
-  AJB_BREAKPOINT("ConfigureMultiProcess + PeerAccess done, threads=%zu gpus=%zu",
-                  settings.num_threads, settings.gpus.size());
-
   Relation<T, V> r_relation(settings.r_num_elements);
   Relation<T, V> s_relation(settings.s_num_elements);
-
-  {
-    AJBTimer gen_timer("data_generation");
-    const size_t num_matches = RelationGenerator::ComputeDistributions<T, V>(
-        r_relation, s_relation, settings.num_threads, settings.key_distribution, settings.value_distribution,
-        settings.random_seed, settings.theta, settings.sigma, settings.r_sort, settings.s_sort);
-    fprintf(stderr, "[AJB_STATE] expected_matches=%zu\n", num_matches);
-    // AJB: dump key distribution stats to catch Zipfian/uniform issues early
-    AJBDumpKeyStats("R_keys", r_relation.GetKeys().data(), r_relation.GetSize());
-    AJBDumpKeyStats("S_keys", s_relation.GetKeys().data(), s_relation.GetSize());
-  }
 
   const size_t num_matches = RelationGenerator::ComputeDistributions<T, V>(
       r_relation, s_relation, settings.num_threads, settings.key_distribution, settings.value_distribution,
       settings.random_seed, settings.theta, settings.sigma, settings.r_sort, settings.s_sort);
 
   if (settings.save) {
-    std::ofstream r_file("r_relation.csv");
-
-    auto r_writer = csv::make_csv_writer(r_file);
-    for (size_t i = 0; i < r_relation.GetSize(); ++i) {
-      r_writer << std::make_tuple(r_relation.GetKeys()[i], r_relation.GetValues()[i]);
-    }
-
-    std::ofstream s_file("s_relation.csv");
-
-    auto s_writer = csv::make_csv_writer(s_file);
-    for (size_t i = 0; i < s_relation.GetSize(); ++i) {
-      s_writer << std::make_tuple(s_relation.GetKeys()[i], s_relation.GetValues()[i]);
-    }
+    SaveRelation("r_relation.csv", r_relation.GetKeys(), r_relation.GetValues(), r_relation.GetSize());
+    SaveRelation("s_relation.csv", s_relation.GetKeys(), s_relation.GetValues(), s_relation.GetSize());
   }
 
   std::vector<HostAllocator> host_allocators(settings.gpus.size());
@@ -143,58 +88,43 @@ void RunJoinBenchmark(Settings& settings) {
     PinnedVector<T> temporary_keys(temporary_num_elements);
     PinnedVector<V> temporary_values(temporary_num_elements);
 
-    if (settings.sort_algorithm == "gnu_parallel_sort") {
-      TimeScope time_scope("sort_phase");
-      AJB_BREAKPOINT("sort_phase START: gnu_parallel_sort, R_presorted=%d S_presorted=%d",
-                      settings.r_sort, settings.s_sort);
+    // Upstream: three blocks of if(!r_sort)...if(!s_sort) for each algorithm.
+    // Changed: generic lambda to sort one relation, called twice per algorithm.
+    auto sort_relation = [&](PinnedVector<T>& keys, PinnedVector<V>& vals, size_t n, bool already_sorted) {
+      if (already_sorted) return;
+      if (settings.sort_algorithm == "gnu_parallel_sort") {
+        ParallelSortPairs<T, V>(keys, vals);
+      } else if (settings.sort_algorithm == "hybrid_merge_sort") {
+        HybridSort<T, V, HybridSortKernel::kMerge>(keys, vals, temporary_keys, temporary_values,
+                                                     settings.gpus, host_allocators, device_allocators,
+                                                     stream_pools, n, settings.chunk_size);
+      } else if (settings.sort_algorithm == "hybrid_radix_sort") {
+        HybridSort<T, V, HybridSortKernel::kRadix>(keys, vals, temporary_keys, temporary_values,
+                                                     settings.gpus, host_allocators, device_allocators,
+                                                     stream_pools, n, settings.chunk_size);
+      }
+    };
 
-      if (!settings.r_sort) {
-        ParallelSortPairs<T, V>(r_relation.GetKeys(), r_relation.GetValues());
-      }
-      if (!settings.s_sort) {
-        ParallelSortPairs<T, V>(s_relation.GetKeys(), s_relation.GetValues());
-      }
-      AJB_BREAKPOINT("sort_phase END: gnu_parallel_sort complete");
-    } else if (settings.sort_algorithm == "hybrid_merge_sort") {
-      if (!settings.r_sort) {
-        HybridSort<T, V, HybridSortKernel::kMerge>(r_relation.GetKeys(), r_relation.GetValues(), temporary_keys,
-                                                   temporary_values, settings.gpus, host_allocators, device_allocators,
-                                                   stream_pools, settings.r_num_elements, settings.chunk_size);
-      }
-      if (!settings.s_sort) {
-        HybridSort<T, V, HybridSortKernel::kMerge>(s_relation.GetKeys(), s_relation.GetValues(), temporary_keys,
-                                                   temporary_values, settings.gpus, host_allocators, device_allocators,
-                                                   stream_pools, settings.s_num_elements, settings.chunk_size);
-      }
-    } else if (settings.sort_algorithm == "hybrid_radix_sort") {
-      if (!settings.r_sort) {
-        HybridSort<T, V, HybridSortKernel::kRadix>(r_relation.GetKeys(), r_relation.GetValues(), temporary_keys,
-                                                   temporary_values, settings.gpus, host_allocators, device_allocators,
-                                                   stream_pools, settings.r_num_elements, settings.chunk_size);
-      }
-      if (!settings.s_sort) {
-        HybridSort<T, V, HybridSortKernel::kRadix>(s_relation.GetKeys(), s_relation.GetValues(), temporary_keys,
-                                                   temporary_values, settings.gpus, host_allocators, device_allocators,
-                                                   stream_pools, settings.s_num_elements, settings.chunk_size);
-      }
+    {
+      TimeScope time_scope("sort_phase");
+      sort_relation(r_relation.GetKeys(), r_relation.GetValues(), settings.r_num_elements, settings.r_sort);
+      sort_relation(s_relation.GetKeys(), s_relation.GetValues(), settings.s_num_elements, settings.s_sort);
     }
 
     JoinResult<T> join_result =
         MergeJoin(r_relation.GetKeys(), r_relation.GetValues(), s_relation.GetKeys(), s_relation.GetValues(),
                   settings.gpus, device_allocators, stream_pools, settings.materialize);
 
-    AJB_BREAKPOINT("MergeJoin complete: count=%lu  items=%zu  materialized=%d",
-                    (unsigned long)join_result.count_,
-                    join_result.items_.size(), settings.materialize);
-
-    // AJB: post-join GPU memory snapshot
-    for (int gpu : settings.gpus) AJBReportGPUMemory(gpu, "join_benchmark_post_join");
-
-    std::cout << settings.r_num_elements << "," << settings.s_num_elements << "," << settings.num_threads << ",\"";
+    // Upstream: builds GPU list inline with ternary.
+    // Changed: use ostringstream.
+    std::ostringstream gpu_list;
     for (size_t i = 0; i < settings.gpus.size(); ++i) {
-      std::cout << settings.gpus[i] << (i < settings.gpus.size() - 1 ? "," : "");
+      if (i > 0) gpu_list << ",";
+      gpu_list << settings.gpus[i];
     }
-    std::cout << "\",\"" << settings.sort_algorithm << "\",\"" << settings.join_algorithm << "\","
+
+    std::cout << settings.r_num_elements << "," << settings.s_num_elements << "," << settings.num_threads << ",\""
+              << gpu_list.str() << "\",\"" << settings.sort_algorithm << "\",\"" << settings.join_algorithm << "\","
               << settings.chunk_size << ",\"" << settings.key_type << "\",\"" << settings.key_distribution << "\",\""
               << settings.value_type << "\",\"" << settings.value_distribution << "\"," << settings.random_seed << ","
               << settings.theta << "," << settings.sigma << "," << settings.r_sort << "," << settings.s_sort << ","
@@ -206,7 +136,12 @@ void RunJoinBenchmark(Settings& settings) {
               << TimeDurations::Get().GetTotalDuration() << termcolor::reset << std::endl;
 
     if (settings.materialize) {
+      // Upstream: constructs result_rows by nested for loops.
+      // Changed: reserve capacity based on total count to avoid
+      // repeated reallocation.
       std::vector<std::tuple<T, V, V>> result_rows;
+      result_rows.reserve(join_result.count_);
+
       for (size_t i = 0; i < join_result.items_.size(); ++i) {
         const T key = r_relation.GetKeys()[join_result.items_[i].r_first_];
 
@@ -235,22 +170,29 @@ void RunJoinBenchmark(Settings& settings) {
     }
 
     if (join_result.count_ != num_matches) {
-      fprintf(stderr, "[AJB_FAIL] join_benchmark: MISMATCH join_count=%lu expected=%lu delta=%ld\n",
-              (unsigned long)join_result.count_, (unsigned long)num_matches,
-              (long)join_result.count_ - (long)num_matches);
-      fprintf(stderr, "[AJB_FAIL]   config: R=%zu S=%zu seed=%u key_dist=%s θ=%u σ=%u\n",
-              settings.r_num_elements, settings.s_num_elements,
-              settings.random_seed, settings.key_distribution.c_str(),
-              settings.theta, settings.sigma);
       printf("[ERROR] RunJoinBenchmark: Invalid join count (%lu != %lu).\n", join_result.count_, num_matches);
-    } else {
-      fprintf(stderr, "[AJB] VERDICT: join_benchmark PASSED (count=%lu)\n",
-              (unsigned long)join_result.count_);
     }
-
-    // AJB: final memory snapshot
-    AJBReportMemory("join_benchmark_final");
   }
+}
+
+// Upstream: one giant && chain for validation.
+// Changed: grouped checks with early return.
+static bool ValidateSettings(const Settings& s) {
+  if (!OptionsLimits::IsValidNumElements(s.r_num_elements) ||
+      !OptionsLimits::IsValidNumElements(s.s_num_elements)) return false;
+  if (!OptionsLimits::IsValidNumThreads(s.num_threads) ||
+      !OptionsLimits::IsValidGpus(s.gpus)) return false;
+  if (!OptionsLimits::IsValidSortAlgorithm(s.sort_algorithm) ||
+      !OptionsLimits::IsValidJoinAlgorithm(s.join_algorithm)) return false;
+  if (!OptionsLimits::IsValidChunkSize(s.chunk_size)) return false;
+  if (!OptionsLimits::IsValidType(s.key_type) ||
+      !OptionsLimits::IsValidJoinDistribution(s.key_distribution)) return false;
+  if (!OptionsLimits::IsValidType(s.value_type) ||
+      !OptionsLimits::IsValidJoinDistribution(s.value_distribution)) return false;
+  if (!OptionsLimits::IsValidRandomSeed(s.random_seed) ||
+      !OptionsLimits::IsValidTheta(s.theta) ||
+      !OptionsLimits::IsValidSigma(s.sigma)) return false;
+  return true;
 }
 
 int main(int argc, char* argv[]) {
@@ -315,25 +257,19 @@ int main(int argc, char* argv[]) {
                 parse_result["materialize"].as<bool>(),
                 parse_result["print"].as<bool>()};
 
-  if (!OptionsLimits::IsValidNumElements(s.r_num_elements) || !OptionsLimits::IsValidNumElements(s.s_num_elements) ||
-      !OptionsLimits::IsValidNumThreads(s.num_threads) || !OptionsLimits::IsValidGpus(s.gpus) ||
-      !OptionsLimits::IsValidSortAlgorithm(s.sort_algorithm) ||
-      !OptionsLimits::IsValidJoinAlgorithm(s.join_algorithm) || !OptionsLimits::IsValidChunkSize(s.chunk_size) ||
-      !OptionsLimits::IsValidType(s.key_type) || !OptionsLimits::IsValidJoinDistribution(s.key_distribution) ||
-      !OptionsLimits::IsValidType(s.value_type) || !OptionsLimits::IsValidJoinDistribution(s.value_distribution) ||
-      !OptionsLimits::IsValidRandomSeed(s.random_seed) || !OptionsLimits::IsValidTheta(s.theta) ||
-      !OptionsLimits::IsValidSigma(s.sigma) || parse_result["help"].as<bool>()) {
+  if (!ValidateSettings(s) || parse_result["help"].as<bool>()) {
     std::cout << options.help() << std::endl;
     return 0;
   }
 
-  if (s.key_type == "int" && s.value_type == "int") {
+  const std::string type_key = s.key_type + ":" + s.value_type;
+  if (type_key == "int:int") {
     RunJoinBenchmark<uint32_t, uint32_t>(s);
-  } else if (s.key_type == "long" && s.value_type == "long") {
+  } else if (type_key == "long:long") {
     RunJoinBenchmark<uint64_t, uint64_t>(s);
-  } else if (s.key_type == "float" && s.value_type == "float") {
+  } else if (type_key == "float:float") {
     RunJoinBenchmark<float, float>(s);
-  } else if (s.key_type == "double" && s.value_type == "double") {
+  } else if (type_key == "double:double") {
     RunJoinBenchmark<double, double>(s);
   }
 

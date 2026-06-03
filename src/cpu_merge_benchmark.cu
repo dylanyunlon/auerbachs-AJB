@@ -1,45 +1,4 @@
-// =============================================================================
-// cpu_merge_benchmark.cu — Cpu Merge Benchmark (AJB-instrumented)
-//
-// AJB adaptation: experiment lifecycle logging, per-run timing with
-//   statistical aggregation (mean/min/max/stddev), parameter echo to stderr
-//   for reproducibility, warm-up run detection, result validation checksum,
-//   and memory usage snapshot at peak.
-// =============================================================================
-#include <cstdio>
-#include <chrono>
-#include <cmath>
-#include <numeric>
-
-// [AJB] Benchmark harness diagnostics
-static struct {
-    long long total_runs = 0;
-    long long warmup_runs = 0;
-    double    sum_ms = 0.0;
-    double    sum_sq_ms = 0.0;
-    double    min_ms = 1e18;
-    double    max_ms = 0.0;
-    void record(double ms, bool is_warmup = false) {
-        total_runs++;
-        if(is_warmup) { warmup_runs++; return; }
-        sum_ms += ms;
-        sum_sq_ms += ms * ms;
-        if(ms < min_ms) min_ms = ms;
-        if(ms > max_ms) max_ms = ms;
-    }
-    void dump(const char* tag = "Cpu Merge Benchmark") {
-        long long n = total_runs - warmup_runs;
-        double avg = n > 0 ? sum_ms / n : 0.0;
-        double var = n > 1 ? (sum_sq_ms - sum_ms * sum_ms / n) / (n - 1) : 0.0;
-        double sd = var > 0 ? std::sqrt(var) : 0.0;
-        fprintf(stderr, "[AJB_STATE][%s] runs=%lld warmup=%lld min=%.3fms avg=%.3fms max=%.3fms sd=%.3fms\n",
-                tag, total_runs, warmup_runs, min_ms, avg, max_ms, sd);
-    }
-    void reset() { total_runs = warmup_runs = 0; sum_ms = sum_sq_ms = 0.0; min_ms = 1e18; max_ms = 0.0; }
-} ajb_bench_stats;
-
 #include <algorithm>
-#include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -56,9 +15,6 @@ static struct {
 #include "common/parallel_algorithms.cuh"
 #include "common/pinned_vector.cuh"
 #include "common/profile_utilities.cuh"
-
-// [AJB] cpu_merge_benchmark: benchmark entry point
-// 诊断注入: 在main()入口、每个benchmark循环、结果输出前后加breakpoint
 
 const std::string kKeyDistributionType = "sorted";
 const std::string kValueDistributionType = "uniform";
@@ -85,7 +41,11 @@ void RunCpuMergeBenchmark(Settings& settings) {
 
   for (size_t i = 0; i < settings.chunk_count; ++i) {
     const size_t chunk_size_offset = i * chunk_size;
-    const size_t num_elements = std::min(chunk_size, settings.num_elements - chunk_size_offset);
+    // Upstream: settings.num_elements - chunk_size_offset — no underflow guard.
+    // Changed: saturating subtraction.
+    const size_t remaining = settings.num_elements > chunk_size_offset
+                                 ? settings.num_elements - chunk_size_offset : 0;
+    const size_t num_elements = std::min(chunk_size, remaining);
 
     DataGenerator::ComputeDistribution(keys.data() + chunk_size_offset, num_elements, settings.num_threads,
                                        kKeyDistributionType, settings.random_seed * (i + 1));
@@ -142,10 +102,9 @@ void RunCpuMergeBenchmark(Settings& settings) {
       {
         TimeScope time_scope("memory_deallocate_phase");
 
-        key_value_pairs.clear();
-        key_value_pairs.shrink_to_fit();
-        merged_key_value_pairs.clear();
-        merged_key_value_pairs.shrink_to_fit();
+        // Swap with empty — guaranteed deallocation vs non-binding shrink_to_fit.
+        std::vector<KeyValuePair<T, V>>().swap(key_value_pairs);
+        std::vector<KeyValuePair<T, V>>().swap(merged_key_value_pairs);
       }
     }
   }
@@ -159,17 +118,25 @@ void RunCpuMergeBenchmark(Settings& settings) {
             << TimeDurations::Get().GetDuration("memory_deallocate_phase") << termcolor::reset << ","
             << termcolor::magenta << TimeDurations::Get().GetTotalDuration() << termcolor::reset << std::endl;
 
-  if (!std::is_sorted(merged_keys.begin(), merged_keys.end())) {
-    printf("[ERROR] RunCpuMergeBenchmark: Invalid order.\n");
+  auto inv = std::adjacent_find(merged_keys.begin(), merged_keys.end(),
+                                [](const T& a, const T& b) { return b < a; });
+  if (inv != merged_keys.end()) {
+    size_t pos = std::distance(merged_keys.begin(), inv);
+    printf("[ERROR] RunCpuMergeBenchmark: Invalid order at index %zu.\n", pos);
   }
 }
 
-int main(int argc, char* argv[]) {
-  fprintf(stderr, "[AJB_BP][Cpu Merge Benchmark] === benchmark start ===\n");
-  auto _ajb_bench_t0 = std::chrono::high_resolution_clock::now();
+static bool ValidateSettings(const Settings& s) {
+  if (!OptionsLimits::IsValidNumElements(s.num_elements) ||
+      !OptionsLimits::IsValidNumThreads(s.num_threads)) return false;
+  if (!OptionsLimits::IsValidCpuMergeAlgorithm(s.cpu_merge_algorithm) ||
+      !OptionsLimits::IsValidChunkCount(s.chunk_count)) return false;
+  if (!OptionsLimits::IsValidType(s.key_type) || !OptionsLimits::IsValidType(s.value_type)) return false;
+  if (!OptionsLimits::IsValidRandomSeed(s.random_seed)) return false;
+  return true;
+}
 
-  fprintf(stderr, "[AJB_BP][cpu_merge_benchmark] benchmark start\n", argv[0]);
-  auto ajb_bench_start = std::chrono::steady_clock::now();
+int main(int argc, char* argv[]) {
   cxxopts::Options options("cpu_merge_benchmark");
 
   options.set_width(250);
@@ -202,36 +169,21 @@ int main(int argc, char* argv[]) {
                 parse_result["random_seed"].as<uint32_t>(),
                 parse_result["zip"].as<bool>()};
 
-  if (!OptionsLimits::IsValidNumElements(s.num_elements) || !OptionsLimits::IsValidNumThreads(s.num_threads) ||
-      !OptionsLimits::IsValidCpuMergeAlgorithm(s.cpu_merge_algorithm) ||
-      !OptionsLimits::IsValidChunkCount(s.chunk_count) || !OptionsLimits::IsValidType(s.key_type) ||
-      !OptionsLimits::IsValidType(s.value_type) || !OptionsLimits::IsValidRandomSeed(s.random_seed) ||
-      parse_result["help"].as<bool>()) {
+  if (!ValidateSettings(s) || parse_result["help"].as<bool>()) {
     std::cout << options.help() << std::endl;
-    auto ajb_bench_end = std::chrono::steady_clock::now();
-  double ajb_total_sec = std::chrono::duration<double>(ajb_bench_end - ajb_bench_start).count();
-  fprintf(stderr, "[AJB_TIMER][cpu_merge_benchmark] total benchmark: %.3fs\n", ajb_total_sec);
-  fprintf(stderr, "[AJB_BP][cpu_merge_benchmark] benchmark end\n");
-  return 0;
+    return 0;
   }
 
-  if (s.key_type == "int" && s.value_type == "int") {
+  const std::string type_key = s.key_type + ":" + s.value_type;
+  if (type_key == "int:int") {
     RunCpuMergeBenchmark<uint32_t, uint32_t>(s);
-  } else if (s.key_type == "long" && s.value_type == "long") {
+  } else if (type_key == "long:long") {
     RunCpuMergeBenchmark<uint64_t, uint64_t>(s);
-  } else if (s.key_type == "float" && s.value_type == "float") {
+  } else if (type_key == "float:float") {
     RunCpuMergeBenchmark<float, float>(s);
-  } else if (s.key_type == "double" && s.value_type == "double") {
+  } else if (type_key == "double:double") {
     RunCpuMergeBenchmark<double, double>(s);
   }
 
-  auto ajb_bench_end = std::chrono::steady_clock::now();
-  double ajb_total_sec = std::chrono::duration<double>(ajb_bench_end - ajb_bench_start).count();
-  fprintf(stderr, "[AJB_TIMER][cpu_merge_benchmark] total benchmark: %.3fs\n", ajb_total_sec);
-  fprintf(stderr, "[AJB_BP][cpu_merge_benchmark] benchmark end\n");
-  auto _ajb_bench_t1 = std::chrono::high_resolution_clock::now();
-  double _ajb_total = std::chrono::duration<double, std::milli>(_ajb_bench_t1 - _ajb_bench_t0).count();
-  fprintf(stderr, "[AJB_BP][Cpu Merge Benchmark] === benchmark end: %.2fms total ===\n", _ajb_total);
-  ajb_bench_stats.dump();
   return 0;
 }

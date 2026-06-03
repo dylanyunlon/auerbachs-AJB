@@ -1,26 +1,4 @@
 #pragma once
-// =============================================================================
-// relation_generator.cuh — Join relation R/S generator (AJB-instrumented)
-// AJB adaptation: per-relation timing, cardinality trace, selectivity
-//   estimation, data distribution quality check (unique ratio).
-// =============================================================================
-#include <cstdio>
-#include <chrono>
-#include <unordered_set>
-
-// [AJB] RelationGenerator诊断
-static thread_local struct {
-    long long gen_calls = 0;
-    long long total_r = 0;
-    long long total_s = 0;
-    double    total_ms = 0.0;
-    void dump(const char* tag = "RelGen") {
-        fprintf(stderr, "[AJB_STATE][%s] calls=%lld total_R=%lld total_S=%lld time=%.2fms\n",
-                tag, gen_calls, total_r, total_s, total_ms);
-    }
-    void reset() { gen_calls = total_r = total_s = 0; total_ms = 0.0; }
-} ajb_relgen_stats;
-
 
 #include <string>
 
@@ -61,6 +39,21 @@ class RelationGenerator {
 
     size_t num_matches = s_relation.GetSize();
 
+    // Upstream: the sigma<100 and sigma>=100 branches share a common
+    // pattern: generate S keys by copying from R with modular indexing,
+    // then shuffle.  The only difference is that sigma<100 first makes
+    // R keys unique (even values) and then corrupts some S keys.
+    // Changed: extract the shared "derive S from R" logic into a lambda.
+    auto derive_s_keys_from_r = [&](size_t s_size, size_t r_size, size_t threads) {
+      if (r_size == 0) return;
+#pragma omp parallel for num_threads(threads)
+      for (size_t i = 0; i < s_size; ++i) {
+        s_relation.GetKeys()[i] = r_relation.GetKeys()[i % r_size];
+      }
+      __gnu_parallel::random_shuffle(s_relation.GetKeys().begin(), s_relation.GetKeys().end(),
+                                     __gnu_parallel::_RandomNumber(random_seed));
+    };
+
     if (theta > 0) {
       const uint64_t skew_max = r_relation.GetSize() - 1;
       const double skew_theta = static_cast<double>(theta) / 100;
@@ -75,24 +68,18 @@ class RelationGenerator {
       __gnu_parallel::random_shuffle(r_relation.GetKeys().begin(), r_relation.GetKeys().end(),
                                      __gnu_parallel::_RandomNumber(random_seed));
 
-#pragma omp parallel for num_threads(num_threads)
-      for (size_t i = 0; i < s_relation.GetSize(); ++i) {
-        s_relation.GetKeys()[i] = r_relation.GetKeys()[i % r_relation.GetSize()];
-      }
+      derive_s_keys_from_r(s_relation.GetSize(), r_relation.GetSize(), num_threads);
+
       num_matches = (static_cast<double>(sigma) / 100) * s_relation.GetSize();
 #pragma omp parallel for num_threads(num_threads)
       for (size_t i = num_matches; i < s_relation.GetSize(); ++i) {
         ++s_relation.GetKeys()[i];
       }
+      // Re-shuffle after corruption
       __gnu_parallel::random_shuffle(s_relation.GetKeys().begin(), s_relation.GetKeys().end(),
                                      __gnu_parallel::_RandomNumber(random_seed));
     } else {
-#pragma omp parallel for num_threads(num_threads)
-      for (size_t i = 0; i < s_relation.GetSize(); ++i) {
-        s_relation.GetKeys()[i] = r_relation.GetKeys()[i % r_relation.GetSize()];
-      }
-      __gnu_parallel::random_shuffle(s_relation.GetKeys().begin(), s_relation.GetKeys().end(),
-                                     __gnu_parallel::_RandomNumber(random_seed));
+      derive_s_keys_from_r(s_relation.GetSize(), r_relation.GetSize(), num_threads);
     }
     DataGenerator::ComputeDistribution<V>(s_relation.GetValues().data(), s_relation.GetSize(), num_threads,
                                           value_distribution, random_seed >> 1);
@@ -108,10 +95,3 @@ class RelationGenerator {
     return num_matches;
   }
 };
-
-// [AJB] relation生成诊断: R/S两表的大小和key overlap
-#include <cstdio>
-static inline void ajb_report_relation_pair(size_t r_size, size_t s_size, double selectivity, const char* tag) {
-    fprintf(stderr, "[AJB_STATE][RelGen] %s: R=%zu S=%zu selectivity=%.6f expected_join=%.0f\n",
-            tag, r_size, s_size, selectivity, r_size * s_size * selectivity);
-}

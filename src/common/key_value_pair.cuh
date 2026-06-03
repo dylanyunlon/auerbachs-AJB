@@ -1,6 +1,3 @@
-// [AJB] KVP zip/unzip: sort/join用key排序时需要value跟着走
-// zip把两个数组合成pair数组, unzip拆回去
-// 这是sort pipeline的关键步骤, zip/unzip的带宽开销不容忽视
 #pragma once
 
 #include <vector>
@@ -13,17 +10,28 @@ struct KeyValuePair {
 
   bool operator<=(const KeyValuePair& other) const { return (key <= other.key); }
 
+  // Upstream: no equality operator.
+  // Changed: add operator== for use with std::adjacent_find and other
+  // algorithms that need equality comparison.
+  bool operator==(const KeyValuePair& other) const { return key == other.key && value == other.value; }
+
   T key;
   V value;
 };
+
+// Upstream: Zip and Unzip access key_value_pairs[i].key and .value as
+// separate stores.  On x86 with wide SIMD, this prevents vectorization
+// because the struct fields are interleaved in memory.
+// Changed: access through a reference to coalesce the two stores into
+// a single struct write per iteration.
 
 template <typename T, typename V>
 void ZipKeyValuePairs(const PinnedVector<T>& keys, const PinnedVector<V>& values, const size_t num_elements,
                       std::vector<KeyValuePair<T, V>>& key_value_pairs) {
 #pragma omp parallel for
   for (size_t i = 0; i < num_elements; ++i) {
-    key_value_pairs[i].key = keys[i];
-    key_value_pairs[i].value = values[i];
+    auto& kvp = key_value_pairs[i];
+    kvp = {keys[i], values[i]};
   }
 }
 
@@ -32,15 +40,8 @@ void UnzipKeyValuePairs(const std::vector<KeyValuePair<T, V>>& key_value_pairs, 
                         PinnedVector<T>& keys, PinnedVector<V>& values) {
 #pragma omp parallel for
   for (size_t i = 0; i < num_elements; ++i) {
-    keys[i] = key_value_pairs[i].key;
-    values[i] = key_value_pairs[i].value;
+    const auto& kvp = key_value_pairs[i];
+    keys[i] = kvp.key;
+    values[i] = kvp.value;
   }
-}
-
-// [AJB] zip/unzip bandwidth估算
-#include <cstdio>
-static inline void ajb_report_kvp_bandwidth(size_t n, double elapsed_ms, const char* op) {
-    double gb = (double)n * sizeof(int64_t) * 2 / 1e9; // 读+写
-    fprintf(stderr, "[AJB_TIMER][KVP] %s: n=%zu elapsed=%.3fms bandwidth=%.2f GB/s\n",
-            op, n, elapsed_ms, elapsed_ms > 0 ? gb / (elapsed_ms / 1000.0) : 0.0);
 }

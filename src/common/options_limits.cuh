@@ -1,26 +1,4 @@
 #pragma once
-// =============================================================================
-// options_limits.cuh — Experiment configuration limits (AJB-instrumented)
-// AJB adaptation: runtime config validation, bound-check warnings,
-//   config dump to stderr for reproducibility, parameter range assertions.
-// =============================================================================
-#include <cstdio>
-
-// [AJB] 配置参数验证 — 检查实验参数是否在合理范围内
-struct AjbConfigValidator {
-    static void validate_and_dump(size_t num_elements, size_t num_gpus, const char* dist_type,
-                                   double skew_theta, uint32_t seed) {
-        fprintf(stderr, "[AJB_STATE][Config] n=%zu gpus=%zu dist=%s theta=%.4f seed=%u\n",
-                num_elements, num_gpus, dist_type, skew_theta, seed);
-        if(num_elements > 1ULL << 34)
-            fprintf(stderr, "[AJB_WARN][Config] num_elements=%zu exceeds 16B — possible OOM\n", num_elements);
-        if(num_gpus > 16)
-            fprintf(stderr, "[AJB_WARN][Config] num_gpus=%zu > 16 — check topology\n", num_gpus);
-        if(skew_theta > 1.5)
-            fprintf(stderr, "[AJB_WARN][Config] theta=%.4f > 1.5 — extreme skew, Zipf may be slow\n", skew_theta);
-    }
-};
-
 
 #include <algorithm>
 #include <cmath>
@@ -77,8 +55,6 @@ class OptionsLimits {
 
   static std::string GetDefaultSigma() { return std::to_string(100); }
 
-  // [AJB] Limits getters — each returns a human-readable string of valid ranges
-  // [AJB_BP] Use these to debug "invalid parameter" errors at benchmark startup
   static std::string GetNumElementsLimits() { return LimitsToString(kValidNumElements); }
 
   static std::string GetNumThreadsLimits() { return LimitsToString(kValidNumThreads); }
@@ -113,99 +89,62 @@ class OptionsLimits {
 
   static std::string GetSigmaLimits() { return LimitsToString(kValidSigmas); }
 
-  // [AJB] Dump all valid options to stderr for debugging config issues
-  static void ajb_dump_valid_options() {
-    fprintf(stderr, "[AJB_STATE][Options] valid_threads=[%zu,%zu] gpus=%zu\n",
-            kValidNumThreads.first, kValidNumThreads.second, kValidGpus.size());
-    fprintf(stderr, "[AJB_STATE][Options] sort_algos=%zu join_algos=%zu distributions=%zu\n",
-            kValidSortAlgorithms.size(), kValidJoinAlgorithms.size(), kValidSortDistributions.size());
-  }
-
   static bool IsValidNumElements(size_t num_elements) {
-    bool valid = num_elements >= kValidNumElements.first && num_elements <= kValidNumElements.second;
-    if(!valid) fprintf(stderr, "[AJB_WARN][Options] num_elements=%zu out of range\n", num_elements);
-    return valid;
+    return num_elements >= kValidNumElements.first && num_elements <= kValidNumElements.second;
   }
 
   static bool IsValidNumThreads(size_t num_threads) {
-    bool valid = num_threads >= kValidNumThreads.first && num_threads <= kValidNumThreads.second;
-    if(!valid) fprintf(stderr, "[AJB_WARN][Options] num_threads=%zu out of range\n", num_threads);
-    return valid;
+    return num_threads >= kValidNumThreads.first && num_threads <= kValidNumThreads.second;
   }
 
+  // Upstream: IsValidGpus constructs a std::set to check uniqueness,
+  // then does a linear find per element.  O(n log n + n*k).
+  // Changed: sort a copy and use std::unique for O(n log n) uniqueness
+  // check without heap-allocating a std::set.
   static bool IsValidGpus(const std::vector<int>& gpus) {
-    if (std::set<int>(gpus.begin(), gpus.end()).size() != gpus.size()) {
+    std::vector<int> sorted_gpus(gpus);
+    std::sort(sorted_gpus.begin(), sorted_gpus.end());
+    if (std::unique(sorted_gpus.begin(), sorted_gpus.end()) != sorted_gpus.end()) {
       return false;
     }
 
-    for (const int gpu : gpus) {
-      if (std::find(kValidGpus.begin(), kValidGpus.end(), gpu) == kValidGpus.end()) {
-        return false;
-      }
-    }
-
-    return true;
+    return std::all_of(gpus.begin(), gpus.end(), [](int gpu) {
+      return std::find(kValidGpus.begin(), kValidGpus.end(), gpu) != kValidGpus.end();
+    });
   }
 
-  static bool IsValidSortAlgorithm(const std::string& sort_algorithm) {
-    return std::find(kValidSortAlgorithms.begin(), kValidSortAlgorithms.end(), sort_algorithm) !=
-           kValidSortAlgorithms.end();
+  // Upstream: 7 separate IsValid*Algorithm functions that are identical
+  // except for the container they search.
+  // Changed: single generic helper that works with any container.
+  template <typename Container>
+  static bool IsValidOption(const Container& valid_options, const typename Container::value_type& value) {
+    return std::find(valid_options.begin(), valid_options.end(), value) != valid_options.end();
   }
 
-  static bool IsValidJoinAlgorithm(const std::string& join_algorithm) {
-    return std::find(kValidJoinAlgorithms.begin(), kValidJoinAlgorithms.end(), join_algorithm) !=
-           kValidJoinAlgorithms.end();
+  static bool IsValidSortAlgorithm(const std::string& v) { return IsValidOption(kValidSortAlgorithms, v); }
+  static bool IsValidJoinAlgorithm(const std::string& v) { return IsValidOption(kValidJoinAlgorithms, v); }
+  static bool IsValidCpuMergeAlgorithm(const std::string& v) { return IsValidOption(kValidCpuMergeAlgorithms, v); }
+  static bool IsValidCpuSortAlgorithm(const std::string& v) { return IsValidOption(kValidCpuSortAlgorithms, v); }
+  static bool IsValidGpuMergeAlgorithm(const std::string& v) { return IsValidOption(kValidGpuMergeAlgorithms, v); }
+  static bool IsValidGpuSortAlgorithm(const std::string& v) { return IsValidOption(kValidGpuSortAlgorithms, v); }
+
+  // Upstream: range checks written separately for each type.
+  // Changed: generic range checker.
+  template <typename T>
+  static bool IsInRange(T value, const std::pair<T, T>& range) {
+    return value >= range.first && value <= range.second;
   }
 
-  static bool IsValidCpuMergeAlgorithm(const std::string& cpu_merge_algorithm) {
-    return std::find(kValidCpuMergeAlgorithms.begin(), kValidCpuMergeAlgorithms.end(), cpu_merge_algorithm) !=
-           kValidCpuMergeAlgorithms.end();
-  }
+  static bool IsValidChunkSize(size_t v) { return IsInRange(v, kValidChunkSizes); }
+  static bool IsValidChunkCount(size_t v) { return IsInRange(v, kValidChunkCounts); }
 
-  static bool IsValidCpuSortAlgorithm(const std::string& cpu_sort_algorithm) {
-    return std::find(kValidCpuSortAlgorithms.begin(), kValidCpuSortAlgorithms.end(), cpu_sort_algorithm) !=
-           kValidCpuSortAlgorithms.end();
-  }
+  static bool IsValidType(const std::string& v) { return IsValidOption(kValidTypes, v); }
+  static bool IsValidSortDistribution(const std::string& v) { return IsValidOption(kValidSortDistributions, v); }
+  static bool IsValidJoinDistribution(const std::string& v) { return IsValidOption(kValidJoinDistributions, v); }
 
-  static bool IsValidGpuMergeAlgorithm(const std::string& gpu_merge_algorithm) {
-    return std::find(kValidGpuMergeAlgorithms.begin(), kValidGpuMergeAlgorithms.end(), gpu_merge_algorithm) !=
-           kValidGpuMergeAlgorithms.end();
-  }
-
-  static bool IsValidGpuSortAlgorithm(const std::string& gpu_sort_algorithm) {
-    return std::find(kValidGpuSortAlgorithms.begin(), kValidGpuSortAlgorithms.end(), gpu_sort_algorithm) !=
-           kValidGpuSortAlgorithms.end();
-  }
-
-  static bool IsValidChunkSize(size_t chunk_size) {
-    return chunk_size >= kValidChunkSizes.first && chunk_size <= kValidChunkSizes.second;
-  }
-
-  static bool IsValidChunkCount(size_t chunk_count) {
-    return chunk_count >= kValidChunkCounts.first && chunk_count <= kValidChunkCounts.second;
-  }
-
-  static bool IsValidType(const std::string& type) {
-    return std::find(kValidTypes.begin(), kValidTypes.end(), type) != kValidTypes.end();
-  }
-
-  static bool IsValidSortDistribution(const std::string& sort_distribution) {
-    return std::find(kValidSortDistributions.begin(), kValidSortDistributions.end(), sort_distribution) !=
-           kValidSortDistributions.end();
-  }
-
-  static bool IsValidJoinDistribution(const std::string& join_distribution) {
-    return std::find(kValidJoinDistributions.begin(), kValidJoinDistributions.end(), join_distribution) !=
-           kValidJoinDistributions.end();
-  }
-
-  static bool IsValidRandomSeed(uint32_t random_seed) {
-    return random_seed >= kValidRandomSeeds.first && random_seed <= kValidRandomSeeds.second;
-  }
-
-  static bool IsValidTheta(uint32_t theta) { return theta >= kValidThetas.first && theta <= kValidThetas.second; }
-
-  static bool IsValidSigma(uint32_t sigma) { return sigma >= kValidSigmas.first && sigma <= kValidSigmas.second; }
+  static bool IsValidRandomSeed(uint32_t v) { return IsInRange(v, kValidRandomSeeds); }
+  static bool IsValidTheta(uint32_t v) { return IsInRange(v, kValidThetas); }
+  static bool IsValidSigma(uint32_t v) { return IsInRange(v, kValidSigmas); }
 
  private:
   template <typename T>
@@ -273,21 +212,3 @@ const std::vector<std::string> OptionsLimits::kValidJoinDistributions = {"unique
 const std::pair<uint32_t, uint32_t> OptionsLimits::kValidRandomSeeds = {0, std::numeric_limits<uint32_t>::max()};
 const std::pair<uint32_t, uint32_t> OptionsLimits::kValidThetas = {0, 100};
 const std::pair<uint32_t, uint32_t> OptionsLimits::kValidSigmas = {0, 100};
-
-// [AJB] 完整GPU设备信息dump — 在benchmark启动时调用一次
-#include <cstdio>
-static inline void ajb_dump_gpu_info() {
-    int count = 0;
-    cudaGetDeviceCount(&count);
-    fprintf(stderr, "[AJB_STATE][Options] %d CUDA devices detected\n", count);
-    for(int i = 0; i < count; i++){
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, i);
-        fprintf(stderr, "[AJB_STATE][GPU%d] %s: SM=%d mem=%.0fMB clock=%dMHz bus=%dbit\n",
-                i, prop.name, prop.multiProcessorCount,
-                prop.totalGlobalMem / 1048576.0, prop.clockRate / 1000, prop.memoryBusWidth);
-        fprintf(stderr, "[AJB_STATE][GPU%d] compute=%d.%d maxThreads=%d sharedMem=%zuKB L2=%dKB\n",
-                i, prop.major, prop.minor, prop.maxThreadsPerMultiProcessor,
-                prop.sharedMemPerMultiprocessor / 1024, prop.l2CacheSize / 1024);
-    }
-}

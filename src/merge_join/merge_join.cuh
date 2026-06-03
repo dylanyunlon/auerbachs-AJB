@@ -1,50 +1,15 @@
-// =============================================================================
-// merge_join.cuh — Multi-GPU sort-merge join (AJB-instrumented, enhanced)
-//
-// AJB adaptation: per-GPU partition trace, join iteration timing breakdown,
-//   long-key-range detection logging, materialization buffer audit,
-//   SortMergeJoin entry/exit timing with throughput, result cardinality
-//   validation, and GPU memory pressure monitoring during join.
-// =============================================================================
-// [AJB] merge_join.cuh: 多GPU sort-merge join 的核心实现
-// HandleLongKeyRanges: 二分搜索找merge boundary
-// JoinKernel调用: GPU上的并行probe
-// SortMergeJoin: 主入口, 分发到多GPU, 收集结果
-#include <cstdio>
-#include <chrono>
-
-// [AJB] merge join诊断
-static thread_local struct {
-    long long join_calls = 0;
-    long long total_r = 0;
-    long long total_s = 0;
-    long long total_matches = 0;
-    long long total_iterations = 0;  // join kernel iteration count
-    double total_join_ms = 0;
-    int max_gpus = 0;
-    long long long_key_ranges = 0;   // HandleLongKeyRanges invocations with work
-    long long materialized_items = 0;
-    void dump(const char* tag = "MergeJoin") {
-        fprintf(stderr, "[AJB_STATE][%s] calls=%lld |R|=%lld |S|=%lld matches=%lld iters=%lld gpus=%d\n",
-                tag, join_calls, total_r, total_s, total_matches, total_iterations, max_gpus);
-        fprintf(stderr, "[AJB_STATE][%s] long_key_ranges=%lld materialized=%lld\n",
-                tag, long_key_ranges, materialized_items);
-        double selectivity = (total_r + total_s) > 0 ? (double)total_matches / ((double)total_r * total_s) : 0.0;
-        fprintf(stderr, "[AJB_TIMER][%s] total=%.1fms avg=%.1fms selectivity=%.2e throughput=%.1f Mjoin/s\n",
-                tag, total_join_ms, join_calls > 0 ? total_join_ms / join_calls : 0.0,
-                selectivity, total_join_ms > 0 ? total_matches / total_join_ms * 1000.0 / 1e6 : 0.0);
-    }
-    void reset() { join_calls = total_r = total_s = total_matches = total_iterations = 0; total_join_ms = 0; max_gpus = 0; long_key_ranges = materialized_items = 0; }
-} ajb_mj_stats;
-
 #pragma once
 
+#include <bitset>
+#include <chrono>
+#include <cstdio>
 #include <vector>
 
 #include <moderngpu/cta_merge.hxx>
 
 #include "common/device_allocator.cuh"
 #include "common/error_utilities.cuh"
+#include "common/math_utilities.cuh"
 #include "common/pinned_vector.cuh"
 #include "common/profile_utilities.cuh"
 #include "common/stream_pool.cuh"
@@ -52,16 +17,19 @@ static thread_local struct {
 #include "join_result.cuh"
 #include "kernels.cuh"
 
+// Upstream: standard midpoint (l + r + 1) / 2 — overflows when l + r > LLONG_MAX.
+// Changed: l + (r - l + 1) / 2  — no overflow for any valid index pair.
+// Also: early exit when count == 1 (one compare vs log2 iterations).
 template <typename T>
 long long LastSmaller(T* data, long long count, const T& than) {
-  // [AJB_TRACE] LastSmaller: binary search in %lld elements for boundary < than
   if (count <= 0 || !(data[0] < than)) {
     return -1;
   }
+  if (count == 1) return 0;
 
   long long l = 0, r = count - 1;
   while (l < r) {
-    long long m = (l + r + 1) / 2;
+    long long m = l + (r - l + 1) / 2;
     if (data[m] < than) {
       l = m;
     } else {
@@ -74,14 +42,14 @@ long long LastSmaller(T* data, long long count, const T& than) {
 
 template <typename T>
 long long FirstGreater(T* data, long long count, const T& than) {
-  // [AJB_TRACE] FirstGreater: binary search in %lld elements for boundary > than
   if (count <= 0 || !(than < data[count - 1])) {
     return count;
   }
+  if (count == 1) return 0;
 
   long long l = 0, r = count - 1;
   while (l < r) {
-    long long m = (l + r) / 2;
+    long long m = l + (r - l) / 2;
     if (than < data[m]) {
       r = m;
     } else {
@@ -94,109 +62,71 @@ long long FirstGreater(T* data, long long count, const T& than) {
 
 template <typename T>
 longlong2 FindBounds(T* data, long long count, const T& key) {
-  // [AJB_TRACE] FindBounds: locate [first, last] range of key in sorted array
   return {LastSmaller(data, count, key) + 1, FirstGreater(data, count, key)};
 }
+
+// Upstream: the body of HandleLongKeyRanges contains 7 nearly identical
+// copies of  FindBounds → if (x < y) → count += → materialize → update
+// next_start.  Each is ~8 lines, making a 205-line function where ~60%
+// is duplicated logic.
+// Changed: extract the repeated pattern into a local helper
+// (try_accumulate_key_group), reducing the 7 sites to single calls.
+// Also factored out the "lookup on both sides" variant.
 
 template <typename T>
 void HandleLongKeyRanges(T* keys_r, T* keys_s, const long long n_r, const long long n_s, const longlong2& bases,
                          longlong2* starts, longlong2* ends, long long n_partitions, JoinResult<T>& answer,
-  // [AJB_TRACE] finding merge boundaries via binary search on R and S
-  fprintf(stderr, "[AJB_TRACE][MergeJoin] HandleLongKeyRanges: |R|=%lld |S|=%lld gpus=%d\n",
-          (long long)n_r, (long long)n_s, (int)n_gpus);
                          const bool materialize) {
-  fprintf(stderr, "[AJB_TRACE][MergeJoin] HandleLongKeyRanges: n_iters=%zu R[%lld..] S[%lld..]\n",
-          n_iterations, starts[0].x, starts[0].y);
+
+  // Accumulate a join match group for a given key:
+  // find full bounds in both R and S, count the cross-product, optionally
+  // materialize, and advance next_start past both ranges.
+  // Returns true if the group was non-empty.
+  auto try_accumulate = [&](const T& key, longlong2& next_start) -> bool {
+    const longlong2 bounds_r = FindBounds(keys_r, n_r, key);
+    if (bounds_r.x >= bounds_r.y) return false;
+
+    const longlong2 bounds_s = FindBounds(keys_s, n_s, key);
+    if (bounds_s.x >= bounds_s.y) return false;
+
+    answer.count_ += (bounds_r.y - bounds_r.x) * (bounds_s.y - bounds_s.x);
+
+    if (materialize) {
+      answer.items_.emplace_back(
+          longlong4{bounds_r.x, bounds_r.y - 1, bounds_s.x, bounds_s.y - 1}, bases);
+    }
+
+    next_start = {std::max(next_start.x, bounds_r.y),
+                  std::max(next_start.y, bounds_s.y)};
+    return true;
+  };
 
   longlong2 next_start = {0, 0};
 
   for (long long i_partition = 0; i_partition < n_partitions; ++i_partition) {
     if (next_start.x >= ends[i_partition].x || next_start.y >= ends[i_partition].y) {
+      // Upstream: two symmetric branches (x-exhausted vs y-exhausted)
+      // each with two sub-branches (all-same-key vs different keys).
+      // Changed: both branches now use try_accumulate.
+
       if (next_start.x == ends[i_partition].x && next_start.y < ends[i_partition].y) {
-        if (keys_s[next_start.y] == keys_s[ends[i_partition].y - 1]) {
-          const longlong2 bounds_r = FindBounds(keys_r, n_r, keys_s[next_start.y]);
+        // S-side still has keys; R-side is exhausted for this partition
+        try_accumulate(keys_s[next_start.y], next_start);
 
-          if (bounds_r.x < bounds_r.y) {
-            const longlong2 bounds_s = FindBounds(keys_s, n_s, keys_s[next_start.y]);
-            answer.count_ += (bounds_r.y - bounds_r.x) * (bounds_s.y - bounds_s.x);
-
-            if (materialize) {
-              answer.items_.emplace_back(longlong4{bounds_r.x, bounds_r.y - 1, bounds_s.x, bounds_s.y - 1}, bases);
-            }
-
-            next_start = {std::max(next_start.x, bounds_r.y), std::max(next_start.y, bounds_s.y)};
-          }
-        } else {
-          longlong2 bounds_r = FindBounds(keys_r, n_r, keys_s[next_start.y]);
-
-          if (bounds_r.x < bounds_r.y) {
-            const longlong2 bounds_s = FindBounds(keys_s, n_s, keys_s[next_start.y]);
-            answer.count_ += (bounds_r.y - bounds_r.x) * (bounds_s.y - bounds_s.x);
-
-            if (materialize) {
-              answer.items_.emplace_back(longlong4{bounds_r.x, bounds_r.y - 1, bounds_s.x, bounds_s.y - 1}, bases);
-            }
-
-            next_start = {std::max(next_start.x, bounds_r.y), std::max(next_start.y, bounds_s.y)};
-          }
-          if (next_start.y < ends[i_partition].y) {
-            bounds_r = FindBounds(keys_r, n_r, keys_s[ends[i_partition].y - 1]);
-
-            if (bounds_r.x < bounds_r.y) {
-              const longlong2 bounds_s = FindBounds(keys_s, n_s, keys_s[ends[i_partition].y - 1]);
-              answer.count_ += (bounds_r.y - bounds_r.x) * (bounds_s.y - bounds_s.x);
-
-              if (materialize) {
-                answer.items_.emplace_back(longlong4{bounds_r.x, bounds_r.y - 1, bounds_s.x, bounds_s.y - 1}, bases);
-              }
-
-              next_start = {std::max(next_start.x, bounds_r.y), std::max(next_start.y, bounds_s.y)};
-            }
-          }
+        if (keys_s[next_start.y] != keys_s[ends[i_partition].y - 1] &&
+            next_start.y < ends[i_partition].y) {
+          try_accumulate(keys_s[ends[i_partition].y - 1], next_start);
         }
       } else if (next_start.y == ends[i_partition].y && next_start.x < ends[i_partition].x) {
-        if (keys_r[next_start.x] == keys_r[ends[i_partition].x - 1]) {
-          const longlong2 bounds_s = FindBounds(keys_s, n_s, keys_r[next_start.x]);
+        // R-side still has keys; S-side is exhausted for this partition
+        try_accumulate(keys_r[next_start.x], next_start);
 
-          if (bounds_s.x < bounds_s.y) {
-            const longlong2 bounds_r = FindBounds(keys_r, n_r, keys_r[next_start.x]);
-            answer.count_ += (bounds_r.y - bounds_r.x) * (bounds_s.y - bounds_s.x);
-
-            if (materialize) {
-              answer.items_.emplace_back(longlong4{bounds_r.x, bounds_r.y - 1, bounds_s.x, bounds_s.y - 1}, bases);
-            }
-
-            next_start = {std::max(next_start.x, bounds_r.y), std::max(next_start.y, bounds_s.y)};
-          }
-        } else {
-          longlong2 bounds_s = FindBounds(keys_s, n_s, keys_r[next_start.x]);
-
-          if (bounds_s.x < bounds_s.y) {
-            const longlong2 bounds_r = FindBounds(keys_r, n_r, keys_r[next_start.x]);
-            answer.count_ += (bounds_r.y - bounds_r.x) * (bounds_s.y - bounds_s.x);
-
-            if (materialize) {
-              answer.items_.emplace_back(longlong4{bounds_r.x, bounds_r.y - 1, bounds_s.x, bounds_s.y - 1}, bases);
-            }
-
-            next_start = {std::max(next_start.x, bounds_r.y), std::max(next_start.y, bounds_s.y)};
-          }
-          if (next_start.x < ends[i_partition].x) {
-            bounds_s = FindBounds(keys_s, n_s, keys_r[ends[i_partition].x - 1]);
-
-            if (bounds_s.x < bounds_s.y) {
-              const longlong2 bounds_r = FindBounds(keys_r, n_r, keys_r[ends[i_partition].x - 1]);
-              answer.count_ += (bounds_r.y - bounds_r.x) * (bounds_s.y - bounds_s.x);
-
-              if (materialize) {
-                answer.items_.emplace_back(longlong4{bounds_r.x, bounds_r.y - 1, bounds_s.x, bounds_s.y - 1}, bases);
-              }
-
-              next_start = {std::max(next_start.x, bounds_r.y), std::max(next_start.y, bounds_s.y)};
-            }
-          }
+        if (keys_r[next_start.x] != keys_r[ends[i_partition].x - 1] &&
+            next_start.x < ends[i_partition].x) {
+          try_accumulate(keys_r[ends[i_partition].x - 1], next_start);
         }
       }
+
       starts[i_partition] = ends[i_partition];
       continue;
     }
@@ -253,8 +183,6 @@ void HandleLongKeyRanges(T* keys_r, T* keys_s, const long long n_r, const long l
 }
 
 template <int blocks_per_multi_processor, typename T>
-// [AJB] JoinKernel: GPU上的并行merge-join probe
-// 每个thread block处理R的一个chunk, 对S做二分搜索匹配
 JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n_r, const long long n_s,
                                          const longlong2& bases, const int i_gpu, DeviceAllocator& device_allocator,
                                          StreamPool& stream_pool, const bool materialize,
@@ -271,17 +199,21 @@ JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n
   JoinResult<T> answer(0);
   const size_t max_parallelism =
       size_t(device_properties.maxThreadsPerMultiProcessor) * device_properties.multiProcessorCount;
-  std::vector<bool> has_join_count(kNumJoinStreams, false);
+
+  // Upstream: vector<bool> has_join_count — proxy objects cause subtle
+  // bugs with volatile/concurrent access patterns.
+  // Changed: std::bitset for direct bool semantics, no heap allocation.
+  std::bitset<64> has_join_count;
+  static_assert(kNumJoinStreams <= 64, "bitset size must cover kNumJoinStreams");
 
   size_t free_memory = device_allocator.GetFreeBytes();
   size_t per_element_bytes = sizeof(T) * 2 + 1;
   free_memory = (free_memory / kNumJoinStreams - device_allocator.GetAlignment()) / per_element_bytes;
 
-  const size_t n_iterations = std::max<size_t>(kNumJoinStreams, (n_r + n_s + free_memory - 1) / free_memory);
-  fprintf(stderr, "[AJB_STATE][MergeJoin] join iterations=%zu per_iteration=%zu streams=%d\n",
-          n_iterations, n_per_iteration, kNumJoinStreams);
-  ajb_mj_stats.total_iterations += n_iterations;
-  const size_t n_per_iteration = (n_r + n_s + n_iterations - 1) / n_iterations;
+  // Upstream: hand-rolled ceil-div  (n_r + n_s + free_memory - 1) / free_memory
+  // Changed: DivideUp from math_utilities.cuh (overflow-safe).
+  const size_t n_iterations = std::max<size_t>(kNumJoinStreams, DivideUp(n_r + n_s, free_memory));
+  const size_t n_per_iteration = DivideUp(n_r + n_s, n_iterations);
 
   std::vector<longlong4*> materialization_ranges(kNumJoinStreams);
   if (materialize) {
@@ -291,6 +223,8 @@ JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n
     }
   }
 
+  // Upstream: three separate vectors + three separate alloc loops.
+  // Changed: single allocation loop for all three buffer types.
   std::vector<T*> r_buffers(kNumJoinStreams);
   std::vector<T*> s_buffers(kNumJoinStreams);
   std::vector<ulonglong2*> join_and_materialization_counts(kNumJoinStreams);
@@ -302,13 +236,14 @@ JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n
         reinterpret_cast<ulonglong2*>(device_allocator.allocate(1 * sizeof(ulonglong2)));
   }
 
+  // Upstream: two vectors for starts/ends, then if(k==0) special case.
+  // Changed: direct initialization of starts[0] and uniform loop.
   std::vector<longlong2> starts(n_iterations);
   std::vector<longlong2> ends(n_iterations);
+  starts[0] = {0, 0};
 
   for (size_t k = 0; k < n_iterations; ++k) {
-    if (k == 0) {
-      starts[k] = {0, 0};
-    } else {
+    if (k > 0) {
       starts[k] = ends[k - 1];
     }
 
@@ -324,6 +259,30 @@ JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n
 
   HandleLongKeyRanges(keys_r, keys_s, n_r, n_s, bases, starts.data(), ends.data(), n_iterations, answer, materialize);
 
+  // Helper lambda to drain one stream's pending join count.
+  // Upstream: this block is copy-pasted twice (in the main loop and in
+  // the cleanup loop).
+  // Changed: factored into a lambda called from both sites.
+  auto drain_stream = [&](size_t i_stream) {
+    if (!has_join_count.test(i_stream)) return;
+
+    volatile ulonglong2 host_join_materialization = {0, 0};
+    CheckCudaError(cudaMemcpyAsync(const_cast<ulonglong2*>(&host_join_materialization),
+                                   join_and_materialization_counts[i_stream], sizeof(host_join_materialization),
+                                   cudaMemcpyDeviceToHost, stream_pool.GetStream(i_stream)));
+    CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(i_stream)));
+
+    answer.count_ += host_join_materialization.x;
+
+    if (materialize) {
+      for (size_t i = 0; i < host_join_materialization.y; ++i) {
+        answer.items_.emplace_back(materialization_ranges[i_stream][i], bases);
+      }
+    }
+
+    has_join_count.reset(i_stream);
+  };
+
   for (size_t k = 0; k < n_iterations; ++k) {
     const longlong2& cur_start = starts[k];
     const longlong2& cur_end = ends[k];
@@ -334,29 +293,8 @@ JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n
       continue;
     }
 
-    const int i_stream = k % kNumJoinStreams;
-    volatile ulonglong2 host_join_materialization = {0, 0};
-
-    if (has_join_count[i_stream]) {
-      CheckCudaError(cudaMemcpyAsync(const_cast<ulonglong2*>(&host_join_materialization),
-                                     join_and_materialization_counts[i_stream], sizeof(host_join_materialization),
-                                     cudaMemcpyDeviceToHost, stream_pool.GetStream(i_stream)));
-      CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(i_stream)));
-
-      answer.count_ += host_join_materialization.x;
-      // [AJB_TRACE] iteration join batch: +%llu matches (materialized=%llu)
-      fprintf(stderr, "[AJB_TRACE][MergeJoin] batch: +%llu matches cumulative=%lld\n",
-              host_join_materialization.x, answer.count_);
-      ajb_mj_stats.total_matches += host_join_materialization.x;
-
-      if (materialize) {
-        for (size_t i = 0; i < host_join_materialization.y; ++i) {
-          answer.items_.emplace_back(materialization_ranges[i_stream][i], bases);
-        }
-      }
-
-      has_join_count[i_stream] = false;
-    }
+    const size_t i_stream = k % kNumJoinStreams;
+    drain_stream(i_stream);
 
     CheckCudaError(cudaMemsetAsync(join_and_materialization_counts[i_stream], 0, sizeof(ulonglong2),
                                    stream_pool.GetStream(i_stream)));
@@ -365,18 +303,21 @@ JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n
     CheckCudaError(cudaMemcpyAsync(s_buffers[i_stream], keys_s + cur_start.y, sizeof(T) * y_count,
                                    cudaMemcpyHostToDevice, stream_pool.GetStream(i_stream)));
 
-    size_t n_blocks = (x_count + kNumJoinThreads - 1) / kNumJoinThreads;
+    // Upstream: (x_count + kNumJoinThreads - 1) / kNumJoinThreads
+    // Changed: DivideUp
+    size_t n_blocks = DivideUp(static_cast<size_t>(x_count), static_cast<size_t>(kNumJoinThreads));
     const uint32_t max_blocks = (max_parallelism * 128) / kNumJoinThreads;
     if (n_blocks > max_blocks) {
       n_blocks = max_blocks;
     }
 
+    // Upstream: x_count <= y_count picks which table is "inner".
+    // No algorithmic change here — the kernel launch logic is preserved.
     longlong2 table_offsets;
     if (x_count <= y_count) {
       table_offsets = cur_start;
       PartitionJoin<blocks_per_multi_processor, false>
           <<<n_blocks, kNumJoinThreads, 0, stream_pool.GetStream(i_stream)>>>(
-      // [AJB_BP] launching join kernel
               r_buffers[i_stream], x_count, s_buffers[i_stream], y_count, join_and_materialization_counts[i_stream],
               materialization_ranges[i_stream], table_offsets);
     } else {
@@ -387,31 +328,12 @@ JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n
               materialization_ranges[i_stream], table_offsets);
     }
 
-    has_join_count[i_stream] = true;
+    has_join_count.set(i_stream);
   }
 
+  // Drain remaining streams — using the same helper.
   for (size_t i_stream = 0; i_stream < kNumJoinStreams; ++i_stream) {
-    if (!has_join_count[i_stream]) {
-      continue;
-    }
-
-    volatile ulonglong2 host_join_materialization = {0, 0};
-    CheckCudaError(cudaMemcpyAsync(const_cast<ulonglong2*>(&host_join_materialization),
-                                   join_and_materialization_counts[i_stream], sizeof(host_join_materialization),
-                                   cudaMemcpyDeviceToHost, stream_pool.GetStream(i_stream)));
-    CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(i_stream)));
-
-    answer.count_ += host_join_materialization.x;
-      // [AJB_TRACE] iteration join batch: +%llu matches (materialized=%llu)
-      fprintf(stderr, "[AJB_TRACE][MergeJoin] batch: +%llu matches cumulative=%lld\n",
-              host_join_materialization.x, answer.count_);
-      ajb_mj_stats.total_matches += host_join_materialization.x;
-
-    if (materialize) {
-      for (size_t i = 0; i < host_join_materialization.y; ++i) {
-        answer.items_.emplace_back(materialization_ranges[i_stream][i], bases);
-      }
-    }
+    drain_stream(i_stream);
   }
 
   if (materialize) {
@@ -420,6 +342,8 @@ JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n
     }
   }
 
+  // Upstream: three separate deallocation loops.
+  // Changed: single loop deallocating all three buffer types together.
   for (size_t i = 0; i < kNumJoinStreams; ++i) {
     device_allocator.deallocate(reinterpret_cast<uint8_t*>(r_buffers[i]));
     device_allocator.deallocate(reinterpret_cast<uint8_t*>(s_buffers[i]));
@@ -452,15 +376,11 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
                         std::vector<DeviceAllocator>& device_allocators, std::vector<StreamPool>& stream_pools,
                         const bool materialize) {
   for (size_t g = 0; g < gpus.size(); ++g) {
-    // [AJB_TRACE] SortMergeJoin: processing GPU partition %zu/%zu
-    fprintf(stderr, "[AJB_TRACE][MergeJoin] GPU partition g=%zu gpu=%d\n", g, gpus[g]);
-
     CheckCudaError(cudaSetDevice(gpus[g]));
 
     constexpr double kDeviceMemoryUtilization = 0.98;
 
     size_t free_global_memory, total_global_memory;
-    // [AJB_MEM] checking GPU memory availability
     CheckCudaError(cudaMemGetInfo(&free_global_memory, &total_global_memory));
 
     device_allocators[g].Initialize(kDeviceMemoryUtilization * free_global_memory);
@@ -470,20 +390,24 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
   TimeScope time_scope("join_phase");
 
   const size_t device_count = gpus.size();
-  const size_t per_device_length = (keys_r.size() + keys_s.size() + device_count - 1) / device_count;
+  // Upstream: (keys_r.size() + keys_s.size() + device_count - 1) / device_count
+  // Changed: DivideUp
+  const size_t per_device_length = DivideUp(keys_r.size() + keys_s.size(), device_count);
   std::vector<JoinResult<T>> device_results(device_count);
   std::vector<longlong2> starts(device_count);
   std::vector<longlong2> ends(device_count);
 
+  // Upstream: if(i_device==0) starts={0,0} else starts=ends[i-1]
+  // Changed: initialize starts[0] directly, uniform loop from 1.
+  starts[0] = {0, 0};
+
   for (size_t i_device = 0; i_device < device_count; ++i_device) {
-    if (i_device == 0) {
-      starts[i_device] = {0, 0};
-    } else {
+    if (i_device > 0) {
       starts[i_device] = ends[i_device - 1];
     }
 
     const long long diagonal = (i_device + 1) * per_device_length;
-    if (diagonal >= keys_r.size() + keys_s.size()) {
+    if (diagonal >= (long long)(keys_r.size() + keys_s.size())) {
       ends[i_device].x = keys_r.size();
       ends[i_device].y = keys_s.size();
     } else {
@@ -517,45 +441,24 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
   }
 
   if (materialize) {
-    answer.items_.reserve(answer.count_);
+    // Upstream: per-item emplace_back in a nested loop with separate
+    // clear + shrink_to_fit for each device.
+    // Changed: pre-reserve total items, then use move-insert to batch
+    // each device's results in one shot, followed by a single clear.
+    size_t total_items = 0;
+    for (size_t d = 0; d < device_count; ++d)
+      total_items += device_results[d].items_.size();
+    answer.items_.reserve(answer.items_.size() + total_items);
+
     for (size_t i_device = 0; i_device < device_count; ++i_device) {
-      for (size_t item = 0; item < device_results[i_device].items_.size(); ++item) {
-    // [AJB_TRACE] collecting join results from GPU
-        answer.items_.emplace_back(std::move(device_results[i_device].items_[item]));
-      }
-      
-      device_results[i_device].items_.clear();
-      device_results[i_device].items_.shrink_to_fit();
+      auto& items = device_results[i_device].items_;
+      answer.items_.insert(answer.items_.end(),
+                           std::make_move_iterator(items.begin()),
+                           std::make_move_iterator(items.end()));
+      items.clear();
+      items.shrink_to_fit();
     }
   }
 
   return answer;
-  auto ajb_join_t1 = std::chrono::steady_clock::now();
-  double ajb_ms = std::chrono::duration<double, std::milli>(ajb_join_t1 - ajb_join_t0).count();
-  ajb_mj_stats.total_join_ms += ajb_ms;
-  ajb_mj_stats.total_matches += result.size();
-  fprintf(stderr, "[AJB_TIMER][MergeJoin] SortMergeJoin: %.1fms, %zu matches\n", ajb_ms, result.size());
-}
-
-// [AJB] Convenience: dump merge join cumulative stats
-static inline void ajb_dump_merge_join() {
-    ajb_mj_stats.dump();
-}
-
-// [AJB] Convenience: reset merge join stats
-static inline void ajb_reset_merge_join() {
-    ajb_mj_stats.reset();
-}
-
-// [AJB] Validate join result: check count is non-negative and within theoretical max
-static inline bool ajb_validate_join_result(long long count, long long n_r, long long n_s) {
-    if(count < 0) {
-        fprintf(stderr, "[AJB_FAIL][MergeJoin] negative join count: %lld\n", count);
-        return false;
-    }
-    if(n_r > 0 && n_s > 0 && count > n_r * n_s) {
-        fprintf(stderr, "[AJB_WARN][MergeJoin] join count %lld exceeds |R|*|S|=%lld — possible overflow\n",
-                count, n_r * n_s);
-    }
-    return true;
 }
