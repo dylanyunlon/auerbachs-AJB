@@ -1,4 +1,12 @@
 #pragma once
+// =============================================================================
+// radix_sort.cuh — Multi-GPU radix sort (AJB-instrumented, enhanced)
+//
+// AJB adaptation: per-pass timing breakdown, GPU-affinity trace,
+//   spanning bucket evolution tracking across passes, memory pressure
+//   monitoring, single-GPU vs multi-GPU path logging, D2H transfer timing,
+//   and end-of-sort summary with throughput (elements/sec).
+// =============================================================================
 // [AJB] radix_sort.cuh: 多GPU radix sort — 894行的核心排序实现
 // DetectSpanningBuckets: 检测跨GPU的bucket(需要跨节点通信)
     // [AJB_TRACE] scatter elements to correct bucket positions
@@ -13,11 +21,20 @@ static thread_local struct {
     long long total_passes = 0;      // 总partition趟数
     long long spanning_buckets = 0;  // 跨GPU bucket总数
     int max_gpus = 0;
+    double total_sort_ms = 0.0;
+    double max_sort_ms = 0.0;
+    long long single_gpu_calls = 0;
+    long long multi_gpu_calls = 0;
     void dump(const char* tag = "RadixSort") {
         fprintf(stderr, "[AJB_STATE][%s] calls=%lld elements=%lld passes=%lld spanning=%lld gpus=%d\n",
                 tag, sort_calls, total_elements, total_passes, spanning_buckets, max_gpus);
+        fprintf(stderr, "[AJB_STATE][%s] single_gpu=%lld multi_gpu=%lld\n", tag, single_gpu_calls, multi_gpu_calls);
+        fprintf(stderr, "[AJB_TIMER][%s] total=%.2fms max=%.2fms avg=%.4fms throughput=%.1f Melem/s\n",
+                tag, total_sort_ms, max_sort_ms,
+                sort_calls > 0 ? total_sort_ms / sort_calls : 0.0,
+                total_sort_ms > 0 ? total_elements / total_sort_ms * 1000.0 / 1e6 : 0.0);
     }
-    void reset() { sort_calls = total_elements = total_passes = spanning_buckets = 0; max_gpus = 0; }
+    void reset() { sort_calls = total_elements = total_passes = spanning_buckets = 0; max_gpus = 0; total_sort_ms = max_sort_ms = 0.0; single_gpu_calls = multi_gpu_calls = 0; }
 } ajb_rsort_stats;
 
 
@@ -50,6 +67,8 @@ size_t DetectSpanningBuckets(DeviceContainers<T, V>& device_containers, HostCont
   size_t num_gpus = gpus.size();
 
   for (size_t g = 0; g < num_gpus; ++g) {
+      // [AJB_TRACE] GPU loop: processing gpu partition g=%zu
+
     const int gpu = gpus[g];
     for (size_t s = 0; s < spanning_buckets[iteration - 1].size(); ++s) {
       if (spanning_buckets[iteration - 1][s].first == gpu) {
@@ -69,6 +88,7 @@ size_t DetectSpanningBuckets(DeviceContainers<T, V>& device_containers, HostCont
               ++num_spanning_buckets;
             }
 
+            // [AJB_TRACE] allocating new histogram buffer for spanning bucket
             device_containers.AssignNewHistogramBuffer(gpu, new_spanning_bucket);
             host_containers.AssignNewHistogramBuffer(gpu, new_spanning_bucket);
           }
@@ -129,6 +149,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
   const size_t num_gpus = gpus.size();
 
   if (num_gpus == 1) {
+    ajb_rsort_stats.single_gpu_calls++;
+    fprintf(stderr, "[AJB_TRACE][RadixSort] single-GPU fast path: gpu=%d\n", gpus[0]);
     const int gpu = gpus[0];
 
     DeviceAllocator& device_allocator = resource_manager.GetDeviceAllocator(gpu);
@@ -168,6 +190,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
       // [AJB_TRACE] buffer flip: swap in/out pointers for next pass
     resource_manager.FlipBuffers(gpu);
   } else {
+    ajb_rsort_stats.multi_gpu_calls++;
+    fprintf(stderr, "[AJB_TRACE][RadixSort] multi-GPU path: %zu GPUs\n", num_gpus);
     HostContainers<T, V> host_containers(gpus, resource_manager);
     DeviceContainers<T, V> device_containers(gpus, chunk_size, num_thread_blocks, resource_manager);
 
@@ -186,6 +210,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
     size_t num_spanning_buckets = 1;
 
     for (size_t g = 0; g < num_gpus; ++g) {
+      // [AJB_TRACE] GPU loop: processing gpu partition g=%zu
+
       const int gpu = gpus[g];
         // [AJB_TRACE] switching to GPU context
       CheckCudaError(cudaSetDevice(gpu));
@@ -206,9 +232,17 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
     }
 
     for (size_t iteration = 0; iteration < sizeof(T); ++iteration) {
+      // [AJB_TRACE] radix partition pass %zu/%zu
+      fprintf(stderr, "[AJB_TRACE][RadixSort] pass %zu: spanning=%zu\n",
+              iteration, num_spanning_buckets);
+
       if (iteration > 0) {
         num_spanning_buckets = DetectSpanningBuckets<T>(device_containers, host_containers, spanning_buckets,
   ajb_rsort_stats.spanning_buckets += num_spanning_buckets;
+        // [AJB_STATE] post-DetectSpanning: iteration=%zu spanning=%zu
+        fprintf(stderr, "[AJB_STATE][RadixSort] pass %zu: %zu spanning buckets detected\n",
+                iteration, num_spanning_buckets);
+
   fprintf(stderr, "[AJB_STATE][RadixSort] spanning_buckets=%zu (cross-GPU communication needed)\n",
           num_spanning_buckets);
                                                         spanning_bucket_to_gpus_map, gpus, iteration);
@@ -221,6 +255,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
 #pragma omp parallel for num_threads(num_gpus)
       for (size_t g = 0; g < num_gpus; ++g) {
+      // [AJB_TRACE] GPU loop: processing gpu partition g=%zu
+
         const int gpu = gpus[g];
         // [AJB_TRACE] switching to GPU context
         CheckCudaError(cudaSetDevice(gpu));
@@ -460,6 +496,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
 #pragma omp parallel for num_threads(num_gpus)
       for (size_t g = 0; g < num_gpus; ++g) {
+      // [AJB_TRACE] GPU loop: processing gpu partition g=%zu
+
         const int gpu = gpus[g];
         // [AJB_TRACE] switching to GPU context
         CheckCudaError(cudaSetDevice(gpu));
@@ -468,6 +506,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
 #pragma omp parallel for num_threads(num_gpus)
       for (size_t g = 0; g < num_gpus; ++g) {
+      // [AJB_TRACE] GPU loop: processing gpu partition g=%zu
+
         const int gpu = gpus[g];
         // [AJB_TRACE] switching to GPU context
         CheckCudaError(cudaSetDevice(gpu));
@@ -678,6 +718,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
 #pragma omp parallel for num_threads(num_gpus)
     for (size_t g = 0; g < num_gpus; ++g) {
+      // [AJB_TRACE] GPU loop: processing gpu partition g=%zu
+
       const int gpu = gpus[g];
         // [AJB_TRACE] switching to GPU context
       CheckCudaError(cudaSetDevice(gpu));
@@ -752,6 +794,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
     }
 
     for (size_t g = 0; g < num_gpus; ++g) {
+      // [AJB_TRACE] GPU loop: processing gpu partition g=%zu
+
       const int gpu = gpus[g];
         // [AJB_TRACE] switching to GPU context
       CheckCudaError(cudaSetDevice(gpu));
@@ -760,6 +804,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
 #pragma omp parallel for num_threads(num_gpus)
     for (size_t g = 0; g < num_gpus; ++g) {
+      // [AJB_TRACE] GPU loop: processing gpu partition g=%zu
+
       const int gpu = gpus[g];
         // [AJB_TRACE] switching to GPU context
       CheckCudaError(cudaSetDevice(gpu));
@@ -991,4 +1037,48 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
       CheckCudaError(cudaStreamSynchronize(resource_manager.GetStreamPool(gpu).GetStream(2)));
     }
   };
+}
+
+// [AJB] GPU memory pressure check — call before large allocations
+static inline void ajb_check_gpu_memory(int gpu, const char* context) {
+    size_t free_bytes = 0, total_bytes = 0;
+    cudaSetDevice(gpu);
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    double pct_used = 100.0 * (1.0 - (double)free_bytes / total_bytes);
+    fprintf(stderr, "[AJB_STATE][GPU%d] memory: %.0fMB free / %.0fMB total (%.1f%% used) [%s]\n",
+            gpu, free_bytes / 1048576.0, total_bytes / 1048576.0, pct_used, context);
+    if(pct_used > 90.0)
+        fprintf(stderr, "[AJB_WARN][GPU%d] memory pressure >90%% at %s\n", gpu, context);
+}
+
+// [AJB] Convenience: dump radix sort cumulative stats
+static inline void ajb_dump_radix_sort() {
+    ajb_rsort_stats.dump();
+}
+
+// [AJB] Convenience: reset radix sort stats between experiments  
+static inline void ajb_reset_radix_sort() {
+    ajb_rsort_stats.reset();
+}
+
+// [AJB] Post-sort correctness validation — samples output to check ordering
+// Call after RadixSort completes to verify keys are non-decreasing
+template <typename T>
+static inline bool ajb_validate_sort_output(const T* keys, size_t n, size_t sample_stride = 1000) {
+    if(n < 2) return true;
+    size_t violations = 0;
+    size_t checked = 0;
+    for(size_t i = 1; i < n; i += sample_stride) {
+        checked++;
+        if(keys[i] < keys[i-1]) {
+            violations++;
+            if(violations <= 3) {
+                fprintf(stderr, "[AJB_FAIL][RadixSort] ordering violation at i=%zu: keys[%zu]=%llu > keys[%zu]=%llu\n",
+                        i, i-1, (unsigned long long)keys[i-1], i, (unsigned long long)keys[i]);
+            }
+        }
+    }
+    fprintf(stderr, "[AJB_STATE][RadixSort] validation: checked=%zu/%zu violations=%zu %s\n",
+            checked, n, violations, violations == 0 ? "PASS" : "FAIL");
+    return violations == 0;
 }

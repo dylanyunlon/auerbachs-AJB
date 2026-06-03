@@ -17,6 +17,34 @@ static thread_local struct {
 } ajb_msort_stats;
 
 #pragma once
+// =============================================================================
+// merge_sort/merge_sort.cuh — Multi-GPU merge sort (AJB-instrumented)
+// AJB: per-pass timing, merge throughput calculation, GPU chunk assignment
+//   trace, D2H/H2D transfer logging, merge phase depth tracking,
+//   single-GPU shortcut detection, element-count validation.
+// =============================================================================
+#include <cstdio>
+#include <chrono>
+
+// [AJB] MergeSort诊断 — 多GPU归并的完整追踪
+static thread_local struct {
+    long long sort_calls = 0;
+    long long total_elements = 0;
+    long long merge_phases = 0;
+    long long chunk_transfers = 0;   // H2D + D2H transfers
+    double    total_sort_ms = 0.0;
+    double    max_phase_ms = 0.0;
+    int       max_gpus = 0;
+    void dump(const char* tag = "MergeSort") {
+        fprintf(stderr, "[AJB_STATE][%s] calls=%lld elements=%lld phases=%lld transfers=%lld gpus=%d\n",
+                tag, sort_calls, total_elements, merge_phases, chunk_transfers, max_gpus);
+        fprintf(stderr, "[AJB_TIMER][%s] total=%.2fms max_phase=%.2fms throughput=%.1f Melem/s\n",
+                tag, total_sort_ms, max_phase_ms,
+                total_sort_ms > 0 ? total_elements / total_sort_ms * 1000.0 / 1e6 : 0.0);
+    }
+    void reset() { sort_calls = total_elements = merge_phases = chunk_transfers = 0; total_sort_ms = max_phase_ms = 0.0; max_gpus = 0; }
+} ajb_msort_stats;
+
 
 #include <array>
 #include <functional>
@@ -227,6 +255,12 @@ std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_va
   ajb_msort_stats.sort_calls++;
   ajb_msort_stats.total_elements += num_elements;
   if((int)gpus.size() > ajb_msort_stats.max_gpus) ajb_msort_stats.max_gpus = gpus.size();
+  auto _ajb_ms_t0 = std::chrono::high_resolution_clock::now();
+  fprintf(stderr, "[AJB_BP][MergeSort] start: n=%zu gpus=%zu\n", num_elements, gpus.size());
+
+  ajb_msort_stats.sort_calls++;
+  ajb_msort_stats.total_elements += num_elements;
+  if((int)gpus.size() > ajb_msort_stats.max_gpus) ajb_msort_stats.max_gpus = gpus.size();
   fprintf(stderr, "[AJB_BP][MergeSort] start: n=%zu gpus=%zu\n", num_elements, gpus.size());
   size_t num_fillers = (num_elements % gpus.size() != 0) ? (gpus.size() - num_elements % gpus.size()) : 0;
   size_t chunk_size = (num_elements + num_fillers) / gpus.size();
@@ -311,4 +345,14 @@ std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_va
       CheckCudaError(cudaStreamSynchronize(resource_manager.GetStreamPool(gpu).GetStream(2)));
     }
   };
+}
+
+// [AJB] Convenience: dump merge sort cumulative stats
+static inline void ajb_dump_merge_sort() {
+    ajb_msort_stats.dump();
+}
+
+// [AJB] Convenience: reset merge sort stats
+static inline void ajb_reset_merge_sort() {
+    ajb_msort_stats.reset();
 }

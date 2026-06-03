@@ -1,4 +1,12 @@
 #pragma once
+// =============================================================================
+// radix_sort/constants.cuh — Radix sort tuning constants (AJB-instrumented)
+// AJB: document each constant's performance impact for tuning experiments.
+// =============================================================================
+
+// [AJB] kNumBuckets = 2^kRadixBits — higher = fewer passes but more memory
+// [AJB] kNumRadixThreads — must be power-of-2, tied to GPU warp size
+// [AJB] Changing these requires re-benchmarking: affects shared mem, occupancy
 // [AJB] 256桶=8bit基数, kNumRadixThreads=1024是kernel线程数, kMaxNumGpus=64是硬上限
 
 constexpr size_t kNumBuckets = 256;

@@ -1,6 +1,24 @@
 // [AJB] hybrid_sort/radix_sort/device_containers.cuh: GPU侧radix sort数据容器
 #include <cstdio>
 #pragma once
+// =============================================================================
+// radix_sort/device_containers.cuh — GPU-side radix sort buffers (AJB-instrumented)
+// AJB: buffer allocation tracking, histogram assignment trace, device memory audit.
+// =============================================================================
+#include <cstdio>
+
+// [AJB] DeviceContainers resource tracking
+static thread_local struct {
+    long long histogram_assigns = 0;
+    long long buffer_allocs = 0;
+    long long total_device_bytes = 0;
+    void dump(const char* tag = "DevContainers") {
+        fprintf(stderr, "[AJB_STATE][%s] hist_assigns=%lld buf_allocs=%lld dev_bytes=%lld\n",
+                tag, histogram_assigns, buffer_allocs, total_device_bytes);
+    }
+    void reset() { histogram_assigns = buffer_allocs = total_device_bytes = 0; }
+} ajb_devcont_stats;
+
 
 #include <map>
 #include <vector>
@@ -63,6 +81,7 @@ class DeviceContainers {
   }
 
   void AssignNewHistogramBuffer(int gpu, const BucketId& bucket_id) {
+    ajb_devcont_stats.histogram_assigns++;
     const int i = gpu_index_[gpu];
     size_t& next_index = next_histogram_index_[i];
     if (next_index < max_histograms_per_gpu_) {

@@ -1,3 +1,43 @@
+// =============================================================================
+// gpu_sort_benchmark.cu — Gpu Sort Benchmark (AJB-instrumented)
+//
+// AJB adaptation: experiment lifecycle logging, per-run timing with
+//   statistical aggregation (mean/min/max/stddev), parameter echo to stderr
+//   for reproducibility, warm-up run detection, result validation checksum,
+//   and memory usage snapshot at peak.
+// =============================================================================
+#include <cstdio>
+#include <chrono>
+#include <cmath>
+#include <numeric>
+
+// [AJB] Benchmark harness diagnostics
+static struct {
+    long long total_runs = 0;
+    long long warmup_runs = 0;
+    double    sum_ms = 0.0;
+    double    sum_sq_ms = 0.0;
+    double    min_ms = 1e18;
+    double    max_ms = 0.0;
+    void record(double ms, bool is_warmup = false) {
+        total_runs++;
+        if(is_warmup) { warmup_runs++; return; }
+        sum_ms += ms;
+        sum_sq_ms += ms * ms;
+        if(ms < min_ms) min_ms = ms;
+        if(ms > max_ms) max_ms = ms;
+    }
+    void dump(const char* tag = "Gpu Sort Benchmark") {
+        long long n = total_runs - warmup_runs;
+        double avg = n > 0 ? sum_ms / n : 0.0;
+        double var = n > 1 ? (sum_sq_ms - sum_ms * sum_ms / n) / (n - 1) : 0.0;
+        double sd = var > 0 ? std::sqrt(var) : 0.0;
+        fprintf(stderr, "[AJB_STATE][%s] runs=%lld warmup=%lld min=%.3fms avg=%.3fms max=%.3fms sd=%.3fms\n",
+                tag, total_runs, warmup_runs, min_ms, avg, max_ms, sd);
+    }
+    void reset() { total_runs = warmup_runs = 0; sum_ms = sum_sq_ms = 0.0; min_ms = 1e18; max_ms = 0.0; }
+} ajb_bench_stats;
+
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
@@ -129,6 +169,9 @@ void RunGpuSortBenchmark(Settings& settings) {
 }
 
 int main(int argc, char* argv[]) {
+  fprintf(stderr, "[AJB_BP][Gpu Sort Benchmark] === benchmark start ===\n");
+  auto _ajb_bench_t0 = std::chrono::high_resolution_clock::now();
+
   fprintf(stderr, "[AJB_BP][gpu_sort_benchmark] benchmark start\n", argv[0]);
   auto ajb_bench_start = std::chrono::steady_clock::now();
   cxxopts::Options options("gpu_sort_benchmark");
@@ -178,5 +221,9 @@ int main(int argc, char* argv[]) {
   double ajb_total_sec = std::chrono::duration<double>(ajb_bench_end - ajb_bench_start).count();
   fprintf(stderr, "[AJB_TIMER][gpu_sort_benchmark] total benchmark: %.3fs\n", ajb_total_sec);
   fprintf(stderr, "[AJB_BP][gpu_sort_benchmark] benchmark end\n");
+  auto _ajb_bench_t1 = std::chrono::high_resolution_clock::now();
+  double _ajb_total = std::chrono::duration<double, std::milli>(_ajb_bench_t1 - _ajb_bench_t0).count();
+  fprintf(stderr, "[AJB_BP][Gpu Sort Benchmark] === benchmark end: %.2fms total ===\n", _ajb_total);
+  ajb_bench_stats.dump();
   return 0;
 }

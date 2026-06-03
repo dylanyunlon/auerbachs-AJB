@@ -1,3 +1,11 @@
+// =============================================================================
+// merge_join.cuh — Multi-GPU sort-merge join (AJB-instrumented, enhanced)
+//
+// AJB adaptation: per-GPU partition trace, join iteration timing breakdown,
+//   long-key-range detection logging, materialization buffer audit,
+//   SortMergeJoin entry/exit timing with throughput, result cardinality
+//   validation, and GPU memory pressure monitoring during join.
+// =============================================================================
 // [AJB] merge_join.cuh: 多GPU sort-merge join 的核心实现
 // HandleLongKeyRanges: 二分搜索找merge boundary
 // JoinKernel调用: GPU上的并行probe
@@ -14,13 +22,19 @@ static thread_local struct {
     long long total_iterations = 0;  // join kernel iteration count
     double total_join_ms = 0;
     int max_gpus = 0;
+    long long long_key_ranges = 0;   // HandleLongKeyRanges invocations with work
+    long long materialized_items = 0;
     void dump(const char* tag = "MergeJoin") {
         fprintf(stderr, "[AJB_STATE][%s] calls=%lld |R|=%lld |S|=%lld matches=%lld iters=%lld gpus=%d\n",
                 tag, join_calls, total_r, total_s, total_matches, total_iterations, max_gpus);
-        fprintf(stderr, "[AJB_TIMER][%s] total=%.1fms avg=%.1fms\n",
-                tag, total_join_ms, join_calls > 0 ? total_join_ms / join_calls : 0.0);
+        fprintf(stderr, "[AJB_STATE][%s] long_key_ranges=%lld materialized=%lld\n",
+                tag, long_key_ranges, materialized_items);
+        double selectivity = (total_r + total_s) > 0 ? (double)total_matches / ((double)total_r * total_s) : 0.0;
+        fprintf(stderr, "[AJB_TIMER][%s] total=%.1fms avg=%.1fms selectivity=%.2e throughput=%.1f Mjoin/s\n",
+                tag, total_join_ms, join_calls > 0 ? total_join_ms / join_calls : 0.0,
+                selectivity, total_join_ms > 0 ? total_matches / total_join_ms * 1000.0 / 1e6 : 0.0);
     }
-    void reset() { join_calls = total_r = total_s = total_matches = total_iterations = 0; total_join_ms = 0; max_gpus = 0; }
+    void reset() { join_calls = total_r = total_s = total_matches = total_iterations = 0; total_join_ms = 0; max_gpus = 0; long_key_ranges = materialized_items = 0; }
 } ajb_mj_stats;
 
 #pragma once
@@ -40,6 +54,7 @@ static thread_local struct {
 
 template <typename T>
 long long LastSmaller(T* data, long long count, const T& than) {
+  // [AJB_TRACE] LastSmaller: binary search in %lld elements for boundary < than
   if (count <= 0 || !(data[0] < than)) {
     return -1;
   }
@@ -59,6 +74,7 @@ long long LastSmaller(T* data, long long count, const T& than) {
 
 template <typename T>
 long long FirstGreater(T* data, long long count, const T& than) {
+  // [AJB_TRACE] FirstGreater: binary search in %lld elements for boundary > than
   if (count <= 0 || !(than < data[count - 1])) {
     return count;
   }
@@ -78,6 +94,7 @@ long long FirstGreater(T* data, long long count, const T& than) {
 
 template <typename T>
 longlong2 FindBounds(T* data, long long count, const T& key) {
+  // [AJB_TRACE] FindBounds: locate [first, last] range of key in sorted array
   return {LastSmaller(data, count, key) + 1, FirstGreater(data, count, key)};
 }
 
@@ -88,6 +105,9 @@ void HandleLongKeyRanges(T* keys_r, T* keys_s, const long long n_r, const long l
   fprintf(stderr, "[AJB_TRACE][MergeJoin] HandleLongKeyRanges: |R|=%lld |S|=%lld gpus=%d\n",
           (long long)n_r, (long long)n_s, (int)n_gpus);
                          const bool materialize) {
+  fprintf(stderr, "[AJB_TRACE][MergeJoin] HandleLongKeyRanges: n_iters=%zu R[%lld..] S[%lld..]\n",
+          n_iterations, starts[0].x, starts[0].y);
+
   longlong2 next_start = {0, 0};
 
   for (long long i_partition = 0; i_partition < n_partitions; ++i_partition) {
@@ -324,6 +344,10 @@ JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n
       CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(i_stream)));
 
       answer.count_ += host_join_materialization.x;
+      // [AJB_TRACE] iteration join batch: +%llu matches (materialized=%llu)
+      fprintf(stderr, "[AJB_TRACE][MergeJoin] batch: +%llu matches cumulative=%lld\n",
+              host_join_materialization.x, answer.count_);
+      ajb_mj_stats.total_matches += host_join_materialization.x;
 
       if (materialize) {
         for (size_t i = 0; i < host_join_materialization.y; ++i) {
@@ -378,6 +402,10 @@ JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n
     CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(i_stream)));
 
     answer.count_ += host_join_materialization.x;
+      // [AJB_TRACE] iteration join batch: +%llu matches (materialized=%llu)
+      fprintf(stderr, "[AJB_TRACE][MergeJoin] batch: +%llu matches cumulative=%lld\n",
+              host_join_materialization.x, answer.count_);
+      ajb_mj_stats.total_matches += host_join_materialization.x;
 
     if (materialize) {
       for (size_t i = 0; i < host_join_materialization.y; ++i) {
@@ -424,6 +452,9 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
                         std::vector<DeviceAllocator>& device_allocators, std::vector<StreamPool>& stream_pools,
                         const bool materialize) {
   for (size_t g = 0; g < gpus.size(); ++g) {
+    // [AJB_TRACE] SortMergeJoin: processing GPU partition %zu/%zu
+    fprintf(stderr, "[AJB_TRACE][MergeJoin] GPU partition g=%zu gpu=%d\n", g, gpus[g]);
+
     CheckCudaError(cudaSetDevice(gpus[g]));
 
     constexpr double kDeviceMemoryUtilization = 0.98;
@@ -504,4 +535,27 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
   ajb_mj_stats.total_join_ms += ajb_ms;
   ajb_mj_stats.total_matches += result.size();
   fprintf(stderr, "[AJB_TIMER][MergeJoin] SortMergeJoin: %.1fms, %zu matches\n", ajb_ms, result.size());
+}
+
+// [AJB] Convenience: dump merge join cumulative stats
+static inline void ajb_dump_merge_join() {
+    ajb_mj_stats.dump();
+}
+
+// [AJB] Convenience: reset merge join stats
+static inline void ajb_reset_merge_join() {
+    ajb_mj_stats.reset();
+}
+
+// [AJB] Validate join result: check count is non-negative and within theoretical max
+static inline bool ajb_validate_join_result(long long count, long long n_r, long long n_s) {
+    if(count < 0) {
+        fprintf(stderr, "[AJB_FAIL][MergeJoin] negative join count: %lld\n", count);
+        return false;
+    }
+    if(n_r > 0 && n_s > 0 && count > n_r * n_s) {
+        fprintf(stderr, "[AJB_WARN][MergeJoin] join count %lld exceeds |R|*|S|=%lld — possible overflow\n",
+                count, n_r * n_s);
+    }
+    return true;
 }

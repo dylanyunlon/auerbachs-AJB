@@ -1,6 +1,24 @@
 // [AJB] hybrid_sort/radix_sort/buckets.cuh: Radix sort bucket分配
 #include <cstdio>
 #pragma once
+// =============================================================================
+// radix_sort/buckets.cuh — Bucket ID and spanning bucket (AJB-instrumented)
+// AJB: bucket creation trace, spanning detection logging, comparison counting.
+// =============================================================================
+#include <cstdio>
+
+// [AJB] Bucket lifecycle diagnostics
+static thread_local struct {
+    long long bucket_creates = 0;
+    long long comparisons = 0;
+    long long spanning_detections = 0;
+    void dump(const char* tag = "Buckets") {
+        fprintf(stderr, "[AJB_STATE][%s] creates=%lld compares=%lld spanning=%lld\n",
+                tag, bucket_creates, comparisons, spanning_detections);
+    }
+    void reset() { bucket_creates = comparisons = spanning_detections = 0; }
+} ajb_bucket_stats;
+
 
 #include <cub/cub.cuh>
 

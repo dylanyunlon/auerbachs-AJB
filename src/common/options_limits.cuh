@@ -1,4 +1,26 @@
 #pragma once
+// =============================================================================
+// options_limits.cuh — Experiment configuration limits (AJB-instrumented)
+// AJB adaptation: runtime config validation, bound-check warnings,
+//   config dump to stderr for reproducibility, parameter range assertions.
+// =============================================================================
+#include <cstdio>
+
+// [AJB] 配置参数验证 — 检查实验参数是否在合理范围内
+struct AjbConfigValidator {
+    static void validate_and_dump(size_t num_elements, size_t num_gpus, const char* dist_type,
+                                   double skew_theta, uint32_t seed) {
+        fprintf(stderr, "[AJB_STATE][Config] n=%zu gpus=%zu dist=%s theta=%.4f seed=%u\n",
+                num_elements, num_gpus, dist_type, skew_theta, seed);
+        if(num_elements > 1ULL << 34)
+            fprintf(stderr, "[AJB_WARN][Config] num_elements=%zu exceeds 16B — possible OOM\n", num_elements);
+        if(num_gpus > 16)
+            fprintf(stderr, "[AJB_WARN][Config] num_gpus=%zu > 16 — check topology\n", num_gpus);
+        if(skew_theta > 1.5)
+            fprintf(stderr, "[AJB_WARN][Config] theta=%.4f > 1.5 — extreme skew, Zipf may be slow\n", skew_theta);
+    }
+};
+
 
 #include <algorithm>
 #include <cmath>
@@ -55,6 +77,8 @@ class OptionsLimits {
 
   static std::string GetDefaultSigma() { return std::to_string(100); }
 
+  // [AJB] Limits getters — each returns a human-readable string of valid ranges
+  // [AJB_BP] Use these to debug "invalid parameter" errors at benchmark startup
   static std::string GetNumElementsLimits() { return LimitsToString(kValidNumElements); }
 
   static std::string GetNumThreadsLimits() { return LimitsToString(kValidNumThreads); }
@@ -89,12 +113,24 @@ class OptionsLimits {
 
   static std::string GetSigmaLimits() { return LimitsToString(kValidSigmas); }
 
+  // [AJB] Dump all valid options to stderr for debugging config issues
+  static void ajb_dump_valid_options() {
+    fprintf(stderr, "[AJB_STATE][Options] valid_threads=[%zu,%zu] gpus=%zu\n",
+            kValidNumThreads.first, kValidNumThreads.second, kValidGpus.size());
+    fprintf(stderr, "[AJB_STATE][Options] sort_algos=%zu join_algos=%zu distributions=%zu\n",
+            kValidSortAlgorithms.size(), kValidJoinAlgorithms.size(), kValidSortDistributions.size());
+  }
+
   static bool IsValidNumElements(size_t num_elements) {
-    return num_elements >= kValidNumElements.first && num_elements <= kValidNumElements.second;
+    bool valid = num_elements >= kValidNumElements.first && num_elements <= kValidNumElements.second;
+    if(!valid) fprintf(stderr, "[AJB_WARN][Options] num_elements=%zu out of range\n", num_elements);
+    return valid;
   }
 
   static bool IsValidNumThreads(size_t num_threads) {
-    return num_threads >= kValidNumThreads.first && num_threads <= kValidNumThreads.second;
+    bool valid = num_threads >= kValidNumThreads.first && num_threads <= kValidNumThreads.second;
+    if(!valid) fprintf(stderr, "[AJB_WARN][Options] num_threads=%zu out of range\n", num_threads);
+    return valid;
   }
 
   static bool IsValidGpus(const std::vector<int>& gpus) {

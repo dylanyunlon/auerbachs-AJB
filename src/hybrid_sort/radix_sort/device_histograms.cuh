@@ -1,6 +1,24 @@
 // [AJB] hybrid_sort/radix_sort/device_histograms.cuh: GPU侧histogram计算
 #include <cstdio>
 #pragma once
+// =============================================================================
+// radix_sort/device_histograms.cuh — GPU histogram buffers (AJB-instrumented)
+// AJB: histogram compute trace, bucket distribution quality metrics.
+// =============================================================================
+#include <cstdio>
+
+// [AJB] DeviceHistograms diagnostics
+static thread_local struct {
+    long long compute_calls = 0;
+    long long reset_calls = 0;
+    long long total_buckets_processed = 0;
+    void dump(const char* tag = "DevHistogram") {
+        fprintf(stderr, "[AJB_STATE][%s] computes=%lld resets=%lld buckets=%lld\n",
+                tag, compute_calls, reset_calls, total_buckets_processed);
+    }
+    void reset() { compute_calls = reset_calls = total_buckets_processed = 0; }
+} ajb_devhist_stats;
+
 
 #include <thrust/device_vector.h>
 

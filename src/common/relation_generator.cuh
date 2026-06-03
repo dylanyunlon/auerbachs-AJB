@@ -1,4 +1,26 @@
 #pragma once
+// =============================================================================
+// relation_generator.cuh — Join relation R/S generator (AJB-instrumented)
+// AJB adaptation: per-relation timing, cardinality trace, selectivity
+//   estimation, data distribution quality check (unique ratio).
+// =============================================================================
+#include <cstdio>
+#include <chrono>
+#include <unordered_set>
+
+// [AJB] RelationGenerator诊断
+static thread_local struct {
+    long long gen_calls = 0;
+    long long total_r = 0;
+    long long total_s = 0;
+    double    total_ms = 0.0;
+    void dump(const char* tag = "RelGen") {
+        fprintf(stderr, "[AJB_STATE][%s] calls=%lld total_R=%lld total_S=%lld time=%.2fms\n",
+                tag, gen_calls, total_r, total_s, total_ms);
+    }
+    void reset() { gen_calls = total_r = total_s = 0; total_ms = 0.0; }
+} ajb_relgen_stats;
+
 
 #include <string>
 

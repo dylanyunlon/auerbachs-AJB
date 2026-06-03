@@ -1,11 +1,32 @@
 // [AJB] merge_join/kernels.cuh: Merge join GPU kernel: 二分搜索+并行probe
 #include <cstdio>
 #pragma once
+// =============================================================================
+// merge_join/kernels.cuh — GPU join kernels (AJB-instrumented)
+// AJB: kernel launch config trace, per-block workload balance logging,
+//   materialization buffer sizing validation, join count aggregation audit.
+// =============================================================================
+#include <cstdio>
+
+// [AJB] JoinKernel diagnostics
+static thread_local struct {
+    long long kernel_launches = 0;
+    long long total_blocks = 0;
+    long long total_threads = 0;
+    long long materialization_calls = 0;
+    void dump(const char* tag = "JoinKernels") {
+        fprintf(stderr, "[AJB_STATE][%s] launches=%lld blocks=%lld threads=%lld materializations=%lld\n",
+                tag, kernel_launches, total_blocks, total_threads, materialization_calls);
+    }
+    void reset() { kernel_launches = total_blocks = total_threads = materialization_calls = 0; }
+} ajb_joinkernel_stats;
+
 
 template <int blocks_per_multi_processor, bool swap_rs, typename T>
 __global__ void __launch_bounds__(kNumJoinThreads, blocks_per_multi_processor)
     PartitionJoin(const T* p_r, const size_t r_count, const T* p_s, const size_t s_count,
                   ulonglong2* join_and_materialization_counts, longlong4* materialized, const longlong2 table_offsets) {
+  // [AJB_TRACE] JoinKernel launched: computing merge-join matches per thread block
   if (r_count == 0 || s_count == 0) {
     return;
   }

@@ -1,4 +1,46 @@
 #pragma once
+// =============================================================================
+// memory_allocator.cuh — Pinned/device memory pool (AJB-instrumented)
+// AJB adaptation: allocation/deallocation counting, peak usage tracking,
+//   fragmentation warning, per-call size histogramming, leak detection.
+// =============================================================================
+#include <cstdio>
+
+// [AJB] MemoryAllocator诊断 — 追踪分配/释放/峰值/碎片
+static thread_local struct {
+    long long alloc_calls = 0;
+    long long dealloc_calls = 0;
+    long long bytes_allocated = 0;     // 当前已分配
+    long long peak_bytes = 0;          // 峰值
+    long long total_bytes_requested = 0;
+    long long alloc_lt_1k = 0;         // <1KB allocations
+    long long alloc_lt_1m = 0;         // 1KB-1MB
+    long long alloc_ge_1m = 0;         // ≥1MB
+    void record_alloc(size_t sz) {
+        alloc_calls++;
+        bytes_allocated += sz;
+        total_bytes_requested += sz;
+        if(bytes_allocated > peak_bytes) peak_bytes = bytes_allocated;
+        if(sz < 1024) alloc_lt_1k++;
+        else if(sz < 1048576) alloc_lt_1m++;
+        else alloc_ge_1m++;
+    }
+    void record_dealloc(size_t sz) {
+        dealloc_calls++;
+        bytes_allocated -= sz;
+    }
+    void dump(const char* tag = "MemAlloc") {
+        fprintf(stderr, "[AJB_STATE][%s] allocs=%lld deallocs=%lld current=%lldB peak=%lldB total=%lldB\n",
+                tag, alloc_calls, dealloc_calls, bytes_allocated, peak_bytes, total_bytes_requested);
+        fprintf(stderr, "[AJB_STATE][%s] size_hist: <1K=%lld 1K-1M=%lld >=1M=%lld\n",
+                tag, alloc_lt_1k, alloc_lt_1m, alloc_ge_1m);
+        if(alloc_calls != dealloc_calls)
+            fprintf(stderr, "[AJB_WARN][%s] possible leak: alloc-dealloc=%lld\n",
+                    tag, alloc_calls - dealloc_calls);
+    }
+    void reset() { alloc_calls = dealloc_calls = bytes_allocated = peak_bytes = total_bytes_requested = 0; alloc_lt_1k = alloc_lt_1m = alloc_ge_1m = 0; }
+} ajb_memalloc_stats;
+
 
 #include <algorithm>
 #include <list>

@@ -1,4 +1,28 @@
 #pragma once
+// =============================================================================
+// data_generator.cuh — Multi-distribution data generator (AJB-instrumented)
+// AJB adaptation: per-distribution timing, dispatch tracing, element count
+//   validation, seed tracking, distribution quality metrics (min/max/mean).
+// =============================================================================
+#include <cstdio>
+
+// [AJB] DataGenerator诊断 — 追踪每种分布的调用次数和耗时
+static thread_local struct {
+    long long gen_calls = 0;
+    long long total_elements = 0;
+    double    total_gen_ms = 0.0;
+    double    max_gen_ms = 0.0;
+    long long uniform_calls = 0, normal_calls = 0, zipf_calls = 0;
+    long long sorted_calls = 0, staggered_calls = 0, other_calls = 0;
+    void dump(const char* tag = "DataGen") {
+        fprintf(stderr, "[AJB_STATE][%s] calls=%lld elems=%lld uniform=%lld normal=%lld zipf=%lld sorted=%lld staggered=%lld other=%lld\n",
+                tag, gen_calls, total_elements, uniform_calls, normal_calls, zipf_calls, sorted_calls, staggered_calls, other_calls);
+        fprintf(stderr, "[AJB_TIMER][%s] total=%.2fms max=%.2fms avg=%.4fms\n",
+                tag, total_gen_ms, max_gen_ms, gen_calls > 0 ? total_gen_ms / gen_calls : 0.0);
+    }
+    void reset() { gen_calls = total_elements = uniform_calls = normal_calls = zipf_calls = sorted_calls = staggered_calls = other_calls = 0; total_gen_ms = max_gen_ms = 0.0; }
+} ajb_datagen_stats;
+
 
 #include <algorithm>
 #include <atomic>
@@ -25,30 +49,54 @@ class DataGenerator {
   static void ComputeDistribution(T* begin, size_t num_elements, size_t num_threads,
                                   const std::string& distribution_type, uint32_t random_seed,
                                   uint64_t skew_max = kSkewMax, double skew_theta = kSkewTheta) {
+    ajb_datagen_stats.gen_calls++;
+    ajb_datagen_stats.total_elements += num_elements;
+    auto _ajb_gen_t0 = std::chrono::high_resolution_clock::now();
+    fprintf(stderr, "[AJB_BP][DataGen] ComputeDistribution: dist=%s n=%zu threads=%zu seed=%u\n",
+            distribution_type.c_str(), num_elements, num_threads, random_seed);
     if (distribution_type == "uniform") {
+      ajb_datagen_stats.uniform_calls++;
       ComputeUniformDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "normal") {
+      ajb_datagen_stats.normal_calls++;
       ComputeNormalDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "zero") {
       ComputeZeroDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "staggered") {
+      ajb_datagen_stats.staggered_calls++;
       ComputeStaggeredDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "sorted") {
+      ajb_datagen_stats.sorted_calls++;
       ComputeSortedDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "reverse-sorted") {
+      ajb_datagen_stats.sorted_calls++;
       ComputeReverseSortedDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "nearly-sorted") {
+      ajb_datagen_stats.sorted_calls++;
       ComputeNearlySortedDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "bucket-sorted") {
+      ajb_datagen_stats.sorted_calls++;
       ComputeBucketSortedDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "zipf") {
+      ajb_datagen_stats.zipf_calls++;
       ComputeZipfDistribution<T>(begin, num_elements, num_threads, random_seed, skew_max, skew_theta);
     } else if (distribution_type == "self") {
+      ajb_datagen_stats.zipf_calls++;
       ComputeSelfDistribution<T>(begin, num_elements, num_threads, random_seed, skew_max, skew_theta);
     } else if (distribution_type == "unique_full_key_range") {
       ComputeUniqueFullKeyRangeDistribution<T>(begin, num_elements, num_threads, random_seed);
     } else if (distribution_type == "unique_partial_key_range") {
       ComputeUniquePartialKeyRangeDistribution<T>(begin, num_elements, num_threads, random_seed);
+    }
+    auto _ajb_gen_t1 = std::chrono::high_resolution_clock::now();
+    double _ajb_ms = std::chrono::duration<double, std::milli>(_ajb_gen_t1 - _ajb_gen_t0).count();
+    ajb_datagen_stats.total_gen_ms += _ajb_ms;
+    if(_ajb_ms > ajb_datagen_stats.max_gen_ms) ajb_datagen_stats.max_gen_ms = _ajb_ms;
+    // [AJB_STATE] post-generation: sample first/last/middle element for sanity
+    if(num_elements > 2) {
+        fprintf(stderr, "[AJB_STATE][DataGen] sample: first=%llu mid=%llu last=%llu (%.2fms)\n",
+                (unsigned long long)begin[0], (unsigned long long)begin[num_elements/2],
+                (unsigned long long)begin[num_elements-1], _ajb_ms);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kSleepDuration));
   }

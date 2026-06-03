@@ -1,6 +1,23 @@
 // [AJB] hybrid_sort/radix_sort/host_containers.cuh: CPU侧radix sort容器
 #include <cstdio>
 #pragma once
+// =============================================================================
+// radix_sort/host_containers.cuh — CPU-side radix sort containers (AJB-instrumented)
+// AJB: host buffer lifecycle trace, pinned memory tracking, capacity audit.
+// =============================================================================
+#include <cstdio>
+
+// [AJB] HostContainers diagnostics
+static thread_local struct {
+    long long container_creates = 0;
+    long long hist_lookups = 0;
+    void dump(const char* tag = "HostContainers") {
+        fprintf(stderr, "[AJB_STATE][%s] creates=%lld hist_lookups=%lld\n",
+                tag, container_creates, hist_lookups);
+    }
+    void reset() { container_creates = hist_lookups = 0; }
+} ajb_hostcont_stats;
+
 
 #include <map>
 #include <vector>

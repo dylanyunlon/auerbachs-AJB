@@ -14,6 +14,33 @@ static thread_local struct {
 } ajb_hybrid_sort_radix_sort_kernels_stats;
 
 #pragma once
+// =============================================================================
+// radix_sort/kernels.cuh — GPU radix sort kernels (AJB-instrumented)
+// AJB: kernel launch parameter trace, shared memory usage validation,
+//   scatter throughput estimation, histogram aggregation audit.
+// =============================================================================
+#include <cstdio>
+
+// [AJB] Kernel launch diagnostics — track invocation counts per kernel type
+static thread_local struct {
+    long long histogram_kernel_calls = 0;
+    long long scatter_kernel_calls = 0;
+    long long prefix_sum_calls = 0;
+    long long total_keys_scattered = 0;
+    void dump(const char* tag = "RadixKernels") {
+        fprintf(stderr, "[AJB_STATE][%s] hist_kernels=%lld scatter_kernels=%lld prefix=%lld keys=%lld\n",
+                tag, histogram_kernel_calls, scatter_kernel_calls, prefix_sum_calls, total_keys_scattered);
+    }
+    void reset() { histogram_kernel_calls = scatter_kernel_calls = prefix_sum_calls = total_keys_scattered = 0; }
+} ajb_radix_kernel_stats;
+
+// [AJB] Kernel shared memory budget reference:
+// ComputeHistogramKernel:  kNumBuckets * sizeof(uint32_t) = 256 * 4 = 1024B
+// ScatterKeyValuePairs:    keys_per_thread * kNumRadixThreads * (sizeof(T) + sizeof(V))
+//   e.g. T=uint32_t V=uint32_t: 6 * 256 * 8 = 12288B (well under 48KB limit)
+// [AJB_BP] If you see cudaErrorInvalidConfiguration, check shared_memory_size
+
+
 
 #include <stdio.h>
 
@@ -116,6 +143,8 @@ template <typename T, typename V>
 __global__ __launch_bounds__(kNumRadixThreads, kNumRadixBlocksPerMultiProcessor) void ScatterKeyValuePairs(
     const T* input_keys, T* output_keys, const V* input_vals, V* output_vals, const uint64_t* global_prefix_sums,
     const uint32_t* block_local_histograms, uint64_t* global_offsets, size_t n, size_t k, uint8_t radix_msb) {
+  // [AJB_TRACE] ScatterKeyValuePairs: entry point
+  // [AJB] threadIdx=%d blockIdx=%d blockDim=%d
   typedef unsigned long long int uint64_cu;
   const size_t thread_index = blockDim.x * blockIdx.x + threadIdx.x;
   const size_t index = thread_index * k;
@@ -315,4 +344,14 @@ __global__ void DetermineBucketToGpuMapping(uint64_t* mgpu_striped_prefix_sums, 
 static inline void ajb_report_hybrid_sort_radix_sort_kernels(size_t n, double elapsed_ms, const char* phase) {
     fprintf(stderr, "[AJB_TIMER][hybrid_sort_radix_sort_kernels] %s: n=%zu elapsed=%.3fms throughput=%.2f M/s\n",
             phase, n, elapsed_ms, elapsed_ms > 0 ? n / elapsed_ms / 1000.0 : 0.0);
+}
+
+// [AJB] Dump all radix kernel diagnostics
+static inline void ajb_dump_radix_kernels() {
+    ajb_radix_kernel_stats.dump();
+}
+
+// [AJB] Reset all radix kernel counters
+static inline void ajb_reset_radix_kernels() {
+    ajb_radix_kernel_stats.reset();
 }

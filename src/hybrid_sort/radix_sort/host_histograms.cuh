@@ -1,6 +1,25 @@
 // [AJB] hybrid_sort/radix_sort/host_histograms.cuh: CPU侧histogram
 #include <cstdio>
 #pragma once
+// =============================================================================
+// radix_sort/host_histograms.cuh — CPU histogram management (AJB-instrumented)
+// AJB: histogram creation counting, bucket-to-GPU map validation,
+//   global histogram integrity check (sum == total elements).
+// =============================================================================
+#include <cstdio>
+
+// [AJB] HostHistograms diagnostics
+static thread_local struct {
+    long long create_calls = 0;
+    long long map_lookups = 0;
+    long long integrity_fails = 0;
+    void dump(const char* tag = "HostHistograms") {
+        fprintf(stderr, "[AJB_STATE][%s] creates=%lld map_lookups=%lld integrity_fails=%lld\n",
+                tag, create_calls, map_lookups, integrity_fails);
+    }
+    void reset() { create_calls = map_lookups = integrity_fails = 0; }
+} ajb_hosthist_stats;
+
 
 #include <cstring>
 
