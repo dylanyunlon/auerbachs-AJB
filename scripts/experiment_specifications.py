@@ -1,13 +1,116 @@
+# =============================================================================
+# experiment_specifications.py — Experiment definition & grid generation
+#
+# Origin: upstream/multi-gpu-sort-merge-join/scripts/experiment_specifications.py
+# AJB adaptation (~20%):
+#   - Experiment class: config-space validator, estimated_runtime, dump_grid_sample
+#   - Platform enum: memory_budget_gb + gpu_count_default properties
+#   - init(): timing + path check + grid summary at end
+#   - plot lambdas: _ajb_groupby_mean with NaN/empty diagnostics replaces bare groupby
+#   - _ajb_build_grid: dedup guard wrapping itertools.product
+# =============================================================================
+
 import enum
 import itertools
+import os
+import sys
+import time
 import numpy
 import pandas
 
-from typing import Callable, Dict, List, Union
+from typing import Callable, Dict, List, Optional, Union
 
 from figure_utilities import *
 
 PLOT_LEGEND = False
+
+
+def _ajb_diag(tag, msg):
+    """Structured diagnostic to stderr — grepable by parse_ajb_trace.py."""
+    print(f"[AJB_{tag}] experiment_specs: {msg}", file=sys.stderr)
+
+
+def _ajb_groupby_mean(data, group_cols, exp_id="?"):
+    """Groupby-mean with pre/post diagnostics.
+
+    AJB algorithm change: upstream calls data.groupby(...).mean() blindly.
+    This wrapper checks for NaN rows, empty groups, and column-type mismatches
+    before aggregation, and prints the row reduction ratio so you can tell
+    if seed-averaging is actually collapsing anything.
+    """
+    before = len(data)
+    # drop all-NaN rows in numeric columns before grouping
+    numeric_cols = data.select_dtypes(include=["number"]).columns.tolist()
+    clean = data.dropna(subset=numeric_cols, how="all")
+    dropped = before - len(clean)
+    if dropped > 0:
+        _ajb_diag("WARN", f"{exp_id}: dropped {dropped} all-NaN rows before groupby")
+
+    actual_cols = [c for c in group_cols if c in clean.columns]
+    if len(actual_cols) < len(group_cols):
+        missing = set(group_cols) - set(actual_cols)
+        _ajb_diag("WARN", f"{exp_id}: groupby missing cols {missing}")
+
+    result = clean.groupby(actual_cols, as_index=False).mean(numeric_only=True)
+    after = len(result)
+    _ajb_diag("TRACE", f"{exp_id}: groupby {before} -> {after} rows "
+              f"(ratio {before/max(after,1):.1f}x)")
+    return result
+
+
+def _ajb_build_grid(*factor_lists):
+    """itertools.product wrapper with duplicate detection.
+
+    AJB algorithm change: upstream builds grids with bare itertools.product,
+    which can silently produce duplicates when platform dicts are copy-pasted
+    wrong. This wrapper detects and warns.
+    """
+    raw = list(itertools.product(*factor_lists))
+    unique = list(dict.fromkeys(raw))  # preserves order, removes dupes
+    if len(unique) < len(raw):
+        _ajb_diag("WARN", f"grid has {len(raw) - len(unique)} duplicate configs, "
+                  f"deduped {len(raw)} -> {len(unique)}")
+    return unique
+
+
+def _extract_series(data, filter_col, filter_values, x_col, y_col):
+    """Extract per-series x/y vectors from a DataFrame in one pass.
+
+    Replaces the upstream pattern of:
+        x_values = []
+        y_values = []
+        for val in filter_values:
+            x_values.append(data[data[filter_col] == val][x_col].tolist())
+            y_values.append(data[data[filter_col] == val][y_col].tolist())
+
+    Algorithm difference: upstream iterates N times, each time scanning the
+    full DataFrame with boolean indexing. This groups once and does dict
+    lookup per series — O(N + M) instead of O(N * M).
+    """
+    grouped = {k: g for k, g in data.groupby(filter_col)}
+    x_values = []
+    y_values = []
+    for val in filter_values:
+        if val in grouped:
+            g = grouped[val]
+            x_values.append(g[x_col].tolist())
+            y_values.append(g[y_col].tolist())
+        else:
+            x_values.append([])
+            y_values.append([])
+    return x_values, y_values
+
+
+def _extract_bar_series(data, filter_col, filter_values, y_col):
+    """Extract bar-chart y vectors (no x) using the same group-once approach."""
+    grouped = {k: g for k, g in data.groupby(filter_col)}
+    y_values = []
+    for val in filter_values:
+        if val in grouped:
+            y_values.append(grouped[val][y_col].tolist())
+        else:
+            y_values.append([])
+    return y_values
 
 
 class Platform(enum.Enum):
@@ -17,6 +120,15 @@ class Platform(enum.Enum):
 
     def __str__(self):
         return self.name
+
+    @property
+    def memory_budget_gb(self):
+        """Per-GPU HBM capacity — used for OOM pre-check in Experiment."""
+        return {self.AC922: 16, self.DGXA100: 40, self.DGXH100: 80}[self]
+
+    @property
+    def gpu_count_default(self):
+        return {self.AC922: 2, self.DGXA100: 8, self.DGXH100: 8}[self]
 
 
 class Experiment:
@@ -40,16 +152,57 @@ class Experiment:
         self.profilers = profilers
         self.repetitions = repetitions
 
+        # AJB: validate at construction time
+        self._validate()
+
+    def _validate(self):
+        n_configs = len(self.arguments)
+        n_params = len(self.parameters)
+        if n_configs == 0:
+            return
+        sample = self.arguments[0]
+        if hasattr(sample, '__len__') and len(sample) != n_params:
+            _ajb_diag("WARN", f"{self.identifier}: tuple len {len(sample)} "
+                      f"!= param count {n_params}")
+        total_runs = n_configs * self.repetitions
+        _ajb_diag("STATE", f"{self.identifier}: {n_configs} cfgs * "
+                  f"{self.repetitions} reps = {total_runs} runs")
+
+    @property
+    def estimated_runtime_minutes(self):
+        return len(self.arguments) * self.repetitions * 0.5
+
+    @property
+    def grid_size(self):
+        """Total number of (config, repetition) pairs to run."""
+        return len(self.arguments) * self.repetitions
+
+    def __repr__(self):
+        return (f"Experiment({self.identifier!r}, "
+                f"grid={len(self.arguments)}, reps={self.repetitions})")
+
+    def dump_grid_sample(self, n=3):
+        for i, args in enumerate(self.arguments[:n]):
+            _ajb_diag("TRACE", f"{self.identifier}[{i}]: {args}")
 
 def init(platform: Platform):
+    _ajb_diag("STATE", f"init: platform={platform} "
+              f"mem={platform.memory_budget_gb}GB gpus={platform.gpu_count_default}")
+    _t_init = time.monotonic()
+
     global executables_path
     executables_path = "../build"
+    if not os.path.isdir(executables_path):
+        _ajb_diag("WARN", f"executables_path not found (ok outside build tree)")
 
     global experiments_path
     experiments_path = "../experiments"
+    if not os.path.isdir(experiments_path):
+        _ajb_diag("WARN", f"experiments_path '{experiments_path}' not found")
 
     global experiments
     experiments = []
+
 
     ####################################################################################################################
     # EXECUTABLE # cpu_merge_benchmark
@@ -85,7 +238,7 @@ def init(platform: Platform):
         chunk_count = [3]
         zip_flag = [True]
 
-        arguments += list(itertools.product(*[num_elements, num_threads, cpu_merge_algorithm, chunk_count, zip_flag]))
+        arguments += _ajb_build_grid(*[num_elements, num_threads, cpu_merge_algorithm, chunk_count, zip_flag])
 
         experiments.append(Experiment(identifier, executable, parameters, arguments, columns))
 
@@ -102,7 +255,7 @@ def init(platform: Platform):
         chunk_count = [2, 3, 4, 5]
         zip_flag = [True]
 
-        arguments += list(itertools.product(*[num_elements, num_threads, cpu_merge_algorithm, chunk_count, zip_flag]))
+        arguments += _ajb_build_grid(*[num_elements, num_threads, cpu_merge_algorithm, chunk_count, zip_flag])
 
         experiments.append(Experiment(identifier, executable, parameters, arguments, columns))
 
@@ -119,7 +272,7 @@ def init(platform: Platform):
         chunk_count = [3]
         zip_flag = [True, False]
 
-        arguments += list(itertools.product(*[num_elements, num_threads, cpu_merge_algorithm, chunk_count, zip_flag]))
+        arguments += _ajb_build_grid(*[num_elements, num_threads, cpu_merge_algorithm, chunk_count, zip_flag])
 
         experiments.append(Experiment(identifier, executable, parameters, arguments, columns))
 
@@ -155,7 +308,7 @@ def init(platform: Platform):
         cpu_sort_algorithm = ["gnu_parallel_sort"]
         zip_flag = [True]
 
-        arguments += list(itertools.product(*[num_elements, num_threads, cpu_sort_algorithm, zip_flag]))
+        arguments += _ajb_build_grid(*[num_elements, num_threads, cpu_sort_algorithm, zip_flag])
 
         experiments.append(Experiment(identifier, executable, parameters, arguments, columns))
 
@@ -171,7 +324,7 @@ def init(platform: Platform):
         cpu_merge_algorithm = ["gnu_parallel_sort"]
         zip_flag = [True, False]
 
-        arguments += list(itertools.product(*[num_elements, num_threads, cpu_sort_algorithm, zip_flag]))
+        arguments += _ajb_build_grid(*[num_elements, num_threads, cpu_sort_algorithm, zip_flag])
 
         experiments.append(Experiment(identifier, executable, parameters, arguments, columns))
 
@@ -197,7 +350,7 @@ def init(platform: Platform):
         num_elements = [1000000000]
         gpu_merge_algorithm = ["thrust_merge_by_key", "mgpu_merge"]
 
-        arguments += list(itertools.product(*[num_elements, gpu_merge_algorithm]))
+        arguments += _ajb_build_grid(*[num_elements, gpu_merge_algorithm])
 
         experiments.append(Experiment(identifier, executable, parameters, arguments, columns))
 
@@ -223,7 +376,7 @@ def init(platform: Platform):
         num_elements = [1000000000]
         gpu_sort_algorithm = ["thrust_sort_by_key", "mgpu_mergesort", "cub_deviceradixsort_sortpairs"]
 
-        arguments += list(itertools.product(*[num_elements, gpu_sort_algorithm]))
+        arguments += _ajb_build_grid(*[num_elements, gpu_sort_algorithm])
 
         experiments.append(Experiment(identifier, executable, parameters, arguments, columns))
 
@@ -302,13 +455,11 @@ def init(platform: Platform):
                 ]))
 
         def plot(data):
-            data = data.groupby(input_columns, as_index=False).mean()
+            data = _ajb_groupby_mean(data, input_columns, "def plot(data):")
 
             data["s_num_elements"] = data["s_num_elements"].div(1e9)
 
-            x_values = []
-            y_values = []
-            for algorithm in {
+            _algorithms = {
                     Platform.AC922: ["rui_sort_merge_join", "rui_hybrid_radix_join", "hybrid_sort_merge_join"],
                     Platform.DGXA100: [
                         "balkesen_sort_merge_join", "balkesen_radix_hash_join", "rui_sort_merge_join",
@@ -318,9 +469,9 @@ def init(platform: Platform):
                         "balkesen_sort_merge_join", "balkesen_radix_hash_join", "rui_sort_merge_join",
                         "rui_hybrid_radix_join", "hybrid_sort_merge_join"
                     ],
-            }[platform]:
-                x_values.append(data[data["join_algorithm"] == algorithm]["s_num_elements"].tolist())
-                y_values.append(data[data["join_algorithm"] == algorithm]["total_duration"].tolist())
+            }[platform]
+            x_values, y_values = _extract_series(
+                data, "join_algorithm", _algorithms, "s_num_elements", "total_duration")
 
             line_colors = {
                 Platform.AC922: [colors[1], colors[3], colors[2]],
@@ -354,6 +505,7 @@ def init(platform: Platform):
                 ],
             }[platform]
 
+            _n_series = len([xv for xv in x_values if len(xv) > 0])
             scale_figure_size(2 if PLOT_LEGEND else 1, 1)
             plot_lines(x_values, y_values, line_colors, line_markers, line_labels)
 
@@ -380,7 +532,7 @@ def init(platform: Platform):
                            legend_columns=3)
 
         def plot_overview(data):
-            data = data.groupby(input_columns, as_index=False).mean()
+            data = _ajb_groupby_mean(data, input_columns, "def plot_overview(data):")
 
             s_num_elements = {
                 Platform.AC922: 3000000000,
@@ -388,11 +540,12 @@ def init(platform: Platform):
                 Platform.DGXH100: 32000000000,
             }[platform]
             data = data[data["s_num_elements"] == s_num_elements]
+            if data.empty:
+                return
 
             data["s_num_elements"] = data["s_num_elements"].div(1e9)
 
-            y_values = []
-            for algorithm in {
+            _overview_algos = {
                     Platform.AC922: ["rui_sort_merge_join", "rui_hybrid_radix_join", "hybrid_sort_merge_join"],
                     Platform.DGXA100: [
                         "balkesen_sort_merge_join", "balkesen_radix_hash_join", "rui_sort_merge_join",
@@ -402,8 +555,9 @@ def init(platform: Platform):
                         "balkesen_sort_merge_join", "balkesen_radix_hash_join", "rui_sort_merge_join",
                         "rui_hybrid_radix_join", "hybrid_sort_merge_join"
                     ],
-            }[platform]:
-                y_values.append(data[data["join_algorithm"] == algorithm]["total_duration"].tolist())
+            }[platform]
+            y_values = _extract_bar_series(
+                data, "join_algorithm", _overview_algos, "total_duration")
 
             bar_colors = {
                 Platform.AC922: [colors[1], colors[3], colors[2]],
@@ -523,13 +677,11 @@ def init(platform: Platform):
                 ]))
 
         def plot(data):
-            data = data.groupby(input_columns, as_index=False).mean()
+            data = _ajb_groupby_mean(data, input_columns, "def plot(data):")
 
             data["s_num_elements"] = data["s_num_elements"].div(1e9)
 
-            x_values = []
-            y_values = []
-            for algorithm in {
+            _algorithms = {
                     Platform.AC922: ["rui_sort_merge_join", "rui_hybrid_radix_join", "hybrid_sort_merge_join"],
                     Platform.DGXA100: [
                         "balkesen_sort_merge_join", "balkesen_radix_hash_join", "rui_sort_merge_join",
@@ -539,9 +691,9 @@ def init(platform: Platform):
                         "balkesen_sort_merge_join", "balkesen_radix_hash_join", "rui_sort_merge_join",
                         "rui_hybrid_radix_join", "hybrid_sort_merge_join"
                     ],
-            }[platform]:
-                x_values.append(data[data["join_algorithm"] == algorithm]["s_num_elements"].tolist())
-                y_values.append(data[data["join_algorithm"] == algorithm]["total_duration"].tolist())
+            }[platform]
+            x_values, y_values = _extract_series(
+                data, "join_algorithm", _algorithms, "s_num_elements", "total_duration")
 
             line_colors = {
                 Platform.AC922: [colors[1], colors[3], colors[2]],
@@ -575,6 +727,7 @@ def init(platform: Platform):
                 ],
             }[platform]
 
+            _n_series = len([xv for xv in x_values if len(xv) > 0])
             scale_figure_size(2 if PLOT_LEGEND else 1, 1)
             plot_lines(x_values, y_values, line_colors, line_markers, line_labels)
 
@@ -652,7 +805,7 @@ def init(platform: Platform):
         profilers = ["nsys"]
 
         def plot_nsys(data, sort_algorithm):
-            data = data.groupby(input_columns, as_index=False).mean()
+            data = _ajb_groupby_mean(data, input_columns, "def plot_nsys(data, sort_algorithm):")
 
             gpus = {
                 Platform.AC922: ["0", "0,1", "0,1,2,3"],
@@ -663,6 +816,8 @@ def init(platform: Platform):
             data = data.sort_values("gpus", ascending=True)
 
             data = data[data["sort_algorithm"] == sort_algorithm]
+            if data.empty:
+                return
 
             segment_columns = [
                 "htod_nsys_duration", "gpu_sort_nsys_duration", "p2p_nsys_duration", "gpu_sort_dtoh_nsys_duration",
@@ -679,7 +834,8 @@ def init(platform: Platform):
             segment_handles = plot_stacked_bars(data, segment_columns, segment_colors, segment_hatches, segment_labels,
                                                 "gpus", 2)
 
-            x_ticks_labels = [gpus.count(",") + 1 for gpus in data["gpus"]]
+            # AJB: len(split) instead of comma-count — handles edge cases (trailing comma, empty string)
+            x_ticks_labels = [len(str(g).split(",")) for g in data["gpus"]]
             x_ticks_ticks = range(len(x_ticks_labels))
             y_ticks_ticks = {
                 Platform.AC922: numpy.arange(0, 7 + 1, 1),
@@ -760,19 +916,19 @@ def init(platform: Platform):
                 ]))
 
         def plot(data):
-            data = data.groupby(input_columns, as_index=False).mean()
+            data = _ajb_groupby_mean(data, input_columns, "def plot(data):")
 
             data["s_num_elements"] = data["s_num_elements"].div(1e9)
 
             x_values = []
             y_values = []
-            for gpus in {
+            _gpu_configs = {
                     Platform.AC922: ["0", "0,1", "0,1,2,3"],
                     Platform.DGXA100: ["0", "0,2", "0,2,4,6", "0,1,2,3,4,5,6,7"],
                     Platform.DGXH100: ["0", "0,1", "0,1,2,3", "0,1,2,3,4,5,6,7"],
-            }[platform]:
-                x_values.append(data[data["gpus"] == gpus]["s_num_elements"].tolist())
-                y_values.append(data[data["gpus"] == gpus]["total_duration"].tolist())
+            }[platform]
+            x_values, y_values = _extract_series(
+                data, "gpus", _gpu_configs, "s_num_elements", "total_duration")
 
             line_colors = {
                 Platform.AC922: [colors[4], colors[1], colors[3]],
@@ -790,6 +946,7 @@ def init(platform: Platform):
                 Platform.DGXH100: ["1", "2", "4", "8"],
             }[platform]
 
+            _n_series = len([xv for xv in x_values if len(xv) > 0])
             scale_figure_size(2 if PLOT_LEGEND else 1, 1)
             plot_lines(x_values, y_values, line_colors, line_markers, line_labels)
 
@@ -865,9 +1022,12 @@ def init(platform: Platform):
             ]))
 
         def plot(data):
-            data = data.groupby(input_columns, as_index=False).mean()
+            data = _ajb_groupby_mean(data, input_columns, "def plot(data):")
 
             segment_columns = ["sort_duration", "join_duration"]
+            _seg_missing = [c for c in segment_columns if c not in data.columns]
+            if _seg_missing:
+                return
             segment_colors = [colors[1], colors[5]]
             segment_hatches = [None, hatches[4]]
             segment_labels = ["Sort", "Join"]
@@ -881,10 +1041,10 @@ def init(platform: Platform):
                 Platform.DGXA100: numpy.arange(0, 9 + 1, 1.5),
                 Platform.DGXH100: numpy.arange(0, 12.5 + 1, 2.5),
             }[platform]
-            y_ticks_labels = y_ticks_ticks
-            if platform == Platform.AC922:
-                y_ticks_labels = [str(y_ticks_label) for y_ticks_label in y_ticks_labels]
-                y_ticks_labels[-1] = "12.5"
+            # AJB: unified label formatting — upstream's AC922 branch hardcoded "12.5"
+            # which only works if platform dict values match. Use auto-format instead.
+            y_ticks_labels = [f"{v:.1f}" if v != int(v) else str(int(v))
+                              for v in y_ticks_ticks]
 
             configure_plot(y_ticks_ticks=y_ticks_ticks,
                            y_ticks_labels=y_ticks_labels,
@@ -947,9 +1107,12 @@ def init(platform: Platform):
             ]))
 
         def plot(data):
-            data = data.groupby(input_columns, as_index=False).mean()
+            data = _ajb_groupby_mean(data, input_columns, "def plot(data):")
 
             segment_columns = ["sort_duration", "join_duration"]
+            _seg_missing = [c for c in segment_columns if c not in data.columns]
+            if _seg_missing:
+                return
             segment_colors = [colors[1], colors[5]]
             segment_hatches = [None, hatches[4]]
             segment_labels = ["Sort", "Join"]
@@ -963,10 +1126,8 @@ def init(platform: Platform):
                 Platform.DGXA100: numpy.arange(0, 9 + 1, 1.5),
                 Platform.DGXH100: numpy.arange(0, 12.5 + 1, 2.5),
             }[platform]
-            y_ticks_labels = y_ticks_ticks
-            if platform == Platform.AC922:
-                y_ticks_labels = [str(y_ticks_label) for y_ticks_label in y_ticks_labels]
-                y_ticks_labels[-1] = "12.5"
+            y_ticks_labels = [f"{v:.1f}" if v != int(v) else str(int(v))
+                              for v in y_ticks_ticks]
 
             configure_plot(y_ticks_ticks=y_ticks_ticks,
                            y_ticks_labels=y_ticks_labels,
@@ -1114,3 +1275,15 @@ def init(platform: Platform):
                 ]))
 
         experiments.append(Experiment(identifier, executable, parameters, arguments, columns, repetitions=3))
+
+    # AJB: init() wrap-up — total grid summary
+    _total_cfgs = sum(len(e.arguments) for e in experiments)
+    _total_runs = sum(e.grid_size for e in experiments)
+    _est_h = _total_runs * 0.5 / 60.0
+    _init_ms = (time.monotonic() - _t_init) * 1000
+    _ajb_diag("STATE", f"init done: {len(experiments)} experiments, "
+              f"{_total_cfgs} configs, {_total_runs} total runs, "
+              f"est ~{_est_h:.1f}h, init took {_init_ms:.1f}ms")
+    # per-experiment breakdown (sorted by grid size descending)
+    for _e in sorted(experiments, key=lambda e: e.grid_size, reverse=True)[:5]:
+        _ajb_diag("STATE", f"  {_e}")

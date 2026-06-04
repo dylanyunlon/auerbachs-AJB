@@ -2,14 +2,17 @@
 # figure_utilities.py — Matplotlib plotting utilities (AJB-instrumented)
 #
 # Origin: upstream/multi-gpu-sort-merge-join/scripts/figure_utilities.py (229 lines)
-# AJB adaptation (~20%): AJB-specific color palette for tier comparison plots,
-#   data validation helper (NaN/Inf/negative detection before plotting),
-#   [AJB_STATE] print for each plot call showing shape/range/series,
-#   auto-fallback when LaTeX is unavailable (CI/headless environments).
+# AJB adaptation (~20%):
+#   - configure_plot: dict-dispatch replaces the 7-branch if/elif chain
+#   - plot_lines: per-series range dump + early-exit on empty data
+#   - plot_bars: overflow-safe annotation (clamps absurd bar heights)
+#   - ajb_validate_plot_data: column-wise diagnostics with percentile snapshot
+#   - LaTeX fallback + tier-palette for NVLink/PCIe comparison figures
 # =============================================================================
 
 import os
 import sys
+import traceback
 import matplotlib as plotlib
 import matplotlib.container as container
 import matplotlib.pyplot as pyplot
@@ -18,17 +21,26 @@ import pandas
 
 from typing import Any, List, Tuple
 
-# AJB: graceful LaTeX fallback for headless/CI environments
-_use_latex = True
-try:
-    plotlib.rcParams.update({
-        "text.usetex": True,
-        "text.latex.preamble": "\\usepackage{amsmath}\\usepackage{lmodern}",
-    })
-except Exception:
-    _use_latex = False
-    print("[AJB_WARN] LaTeX not available, falling back to default renderer",
-          file=sys.stderr)
+# AJB: graceful LaTeX fallback — detect once, cache result
+_latex_available = None
+
+def _check_latex():
+    global _latex_available
+    if _latex_available is not None:
+        return _latex_available
+    try:
+        plotlib.rcParams.update({
+            "text.usetex": True,
+            "text.latex.preamble": "\\usepackage{amsmath}\\usepackage{lmodern}",
+        })
+        _latex_available = True
+    except Exception:
+        _latex_available = False
+        print("[AJB_WARN] LaTeX unavailable, using default text renderer",
+              file=sys.stderr)
+    return _latex_available
+
+_check_latex()
 
 plotlib.rcParams.update({
     "font.family": "serif",
@@ -47,35 +59,65 @@ colors = ["#3193C6", "#05AD97", "#AAC56C", "#F7AB13", "#CD4E38", "#7D52A5"]
 hatches = ["///", "\\\\\\", "xxx", "...", "oo"]
 markers = ["o", "v", "s", "d", "h"]
 
-# AJB: dedicated palette for bandwidth-tier comparison (NVLink vs PCIe vs Host)
+# AJB: bandwidth-tier palette — one dict instead of ad-hoc per-plot color picks
 ajb_tier_colors = {
-    "nvlink":  "#05AD97",   # teal — fast P2P
-    "pcie":    "#F7AB13",   # amber — slow PCIe
-    "host":    "#CD4E38",   # red — host DRAM
-    "ajb":     "#3193C6",   # blue — AJB adaptive
-    "baseline":"#7D52A5",   # purple — upstream baseline
+    "nvlink":   "#05AD97",
+    "pcie":     "#F7AB13",
+    "host":     "#CD4E38",
+    "ajb":      "#3193C6",
+    "baseline": "#7D52A5",
 }
 
-# AJB: data validation — catch NaN/Inf/negative before they silently break plots
 def ajb_validate_plot_data(data, label="plot_data"):
-    """Check for NaN, Inf, or unexpected negatives; print [AJB_WARN] to stderr."""
+    """Column-wise data validation with percentile snapshot.
+
+    Unlike upstream (which silently plots NaN as gaps), this catches bad
+    data before matplotlib sees it and prints a structured diagnostic.
+    Returns True if data is clean.
+
+    AJB algorithm change: instead of a single NaN/Inf flag, we walk numeric
+    columns and emit per-column p5/p50/p95 so you can spot outliers or
+    unit-conversion bugs (e.g. nanoseconds mixed with seconds) in the log.
+    """
     issues = []
+    snapshots = []
+
     if isinstance(data, pandas.DataFrame):
-        for col in data.select_dtypes(include=[numpy.number]).columns:
-            nan_count = data[col].isna().sum()
-            inf_count = numpy.isinf(data[col].values).sum() if data[col].dtype != object else 0
-            neg_count = (data[col] < 0).sum()
-            if nan_count: issues.append(f"{col}: {nan_count} NaN")
-            if inf_count: issues.append(f"{col}: {inf_count} Inf")
-            if neg_count: issues.append(f"{col}: {neg_count} negative")
+        numeric_cols = data.select_dtypes(include=[numpy.number]).columns
+        for col in numeric_cols:
+            vals = data[col].dropna().values
+            nan_ct = int(data[col].isna().sum())
+            inf_ct = int(numpy.isinf(vals).sum()) if len(vals) > 0 else 0
+            neg_ct = int((vals < 0).sum()) if len(vals) > 0 else 0
+            if nan_ct:
+                issues.append(f"{col}: {nan_ct} NaN")
+            if inf_ct:
+                issues.append(f"{col}: {inf_ct} Inf")
+            if neg_ct:
+                issues.append(f"{col}: {neg_ct} negative")
+            # percentile snapshot for non-trivial columns
+            if len(vals) >= 3:
+                p5, p50, p95 = numpy.percentile(vals, [5, 50, 95])
+                snapshots.append(f"{col}[p5={p5:.4g} p50={p50:.4g} p95={p95:.4g}]")
     elif isinstance(data, (list, numpy.ndarray)):
-        arr = numpy.array(data, dtype=float)
-        if numpy.any(numpy.isnan(arr)): issues.append("NaN detected")
-        if numpy.any(numpy.isinf(arr)): issues.append("Inf detected")
+        arr = numpy.asarray(data, dtype=float)
+        finite = arr[numpy.isfinite(arr)]
+        if numpy.any(numpy.isnan(arr)):
+            issues.append("NaN detected")
+        if numpy.any(numpy.isinf(arr)):
+            issues.append("Inf detected")
+        if len(finite) >= 3:
+            p5, p50, p95 = numpy.percentile(finite, [5, 50, 95])
+            snapshots.append(f"array[p5={p5:.4g} p50={p50:.4g} p95={p95:.4g}]")
+
     if issues:
         print(f"[AJB_WARN] {label}: {'; '.join(issues)}", file=sys.stderr)
-    else:
-        print(f"[AJB_STATE] {label}: data valid (no NaN/Inf)", file=sys.stderr)
+    if snapshots:
+        print(f"[AJB_TRACE] {label} snapshot: {', '.join(snapshots[:6])}",
+              file=sys.stderr)
+    if not issues:
+        print(f"[AJB_STATE] {label}: valid ({len(snapshots)} numeric cols)",
+              file=sys.stderr)
     return len(issues) == 0
 
 
@@ -91,10 +133,16 @@ def annotate_bars(bars: container.BarContainer, precision: int, height: float = 
     bar = bars[0]
     bar_height = height or bar.get_height()
 
+    # AJB: clamp annotation for absurdly tall bars so text stays on-canvas
+    max_display = bar_height
+    canvas_ylim = pyplot.gca().get_ylim()
+    if canvas_ylim[1] > 0 and bar_height > canvas_ylim[1] * 2:
+        max_display = canvas_ylim[1] * 0.95
+
     value = str(int(bar_height)) if precision == 0 else ("{:.%sf}" % (precision)).format(bar_height)
 
     pyplot.annotate(value,
-                    xy=(bar.get_x() + bar.get_width() / 2, bar_height),
+                    xy=(bar.get_x() + bar.get_width() / 2, min(bar_height, max_display)),
                     xytext=(0, 5 if rotation is not None else 3),
                     textcoords="offset points",
                     ha="center",
@@ -114,6 +162,11 @@ def plot_bars(y_values: List[float],
     handles = []
 
     num_bars = len(y_values)
+    if num_bars == 0:
+        print("[AJB_WARN] plot_bars: empty y_values, nothing to draw",
+              file=sys.stderr)
+        return handles
+
     bar_width = total_width / num_bars
 
     for index, values in enumerate(y_values):
@@ -124,7 +177,7 @@ def plot_bars(y_values: List[float],
                              y,
                              width=bar_width * single_width,
                              color=colors[index % len(colors)],
-                             hatch=hatches[index % len(hatches)],
+                             hatch=hatches[index % len(hatches)] if hatches else None,
                              alpha=0.99 if hatches is not None else 1,
                              zorder=2)
 
@@ -137,10 +190,24 @@ def plot_bars(y_values: List[float],
 
 
 def plot_lines(x_values: List[int], y_values: List[float], colors: List[str], markers: List[str], labels: List[str]):
+    if not x_values:
+        print("[AJB_WARN] plot_lines: no series to plot", file=sys.stderr)
+        return
+
     zorder = 2 + len(x_values)
     for index in range(len(x_values)):
-        pyplot.plot(x_values[index],
-                    y_values[index],
+        xv, yv = x_values[index], y_values[index]
+        # AJB: per-series range diagnostic — catch empty or mismatched data early
+        if len(xv) == 0 or len(yv) == 0:
+            print(f"[AJB_WARN] plot_lines: series '{labels[index]}' is empty, skipping",
+                  file=sys.stderr)
+            continue
+        if len(xv) != len(yv):
+            print(f"[AJB_WARN] plot_lines: series '{labels[index]}' "
+                  f"len(x)={len(xv)} != len(y)={len(yv)}", file=sys.stderr)
+
+        pyplot.plot(xv,
+                    yv,
                     linestyle="-",
                     color=colors[index],
                     marker=markers[index],
@@ -155,13 +222,15 @@ def plot_stacked_bars(data: pandas.DataFrame, segment_columns: List[str], segmen
                       segment_hatches: List[str], segment_labels: List[str], column: str, precision: int):
     handles = []
 
-    for column_index, column_value in enumerate(data[column].tolist()):
+    col_values = data[column].tolist()
+    for column_index, column_value in enumerate(col_values):
         column_data = data[data[column] == column_value]
 
         bottom = 0
         for segment_index, segment_column in enumerate(segment_columns):
+            seg_val = column_data[segment_column].tolist()[0]
             bar = pyplot.bar(column_value,
-                             column_data[segment_column].tolist()[0],
+                             seg_val,
                              bottom=bottom,
                              color=segment_colors[segment_index % len(segment_colors)],
                              hatch=segment_hatches[segment_index %
@@ -173,7 +242,7 @@ def plot_stacked_bars(data: pandas.DataFrame, segment_columns: List[str], segmen
             if column_index == 0:
                 handles.append(bar)
 
-            bottom += column_data[segment_column].tolist()[0]
+            bottom += seg_val
 
             if segment_index == len(segment_columns) - 1:
                 annotate_bars(bar, precision, bottom)
@@ -244,39 +313,24 @@ def configure_plot(x_ticks_color: str = None,
     if y_label is not None:
         pyplot.ylabel(y_label, fontsize=large_font_size)
 
-    if legend and legend_anchor and legend_mode and legend_location is not None and legend_handles is not None and legend_labels is not None and legend_columns is not None:
-        pyplot.legend(fontsize=legend_font_size,
-                      bbox_to_anchor=legend_anchor,
-                      mode=legend_mode,
-                      loc=legend_location,
-                      handles=legend_handles,
-                      labels=legend_labels,
-                      ncol=legend_columns,
-                      labelspacing=0.4)
-    elif legend and legend_anchor and legend_mode and legend_location is not None and legend_handles is not None and legend_columns is not None:
-        pyplot.legend(fontsize=legend_font_size,
-                      bbox_to_anchor=legend_anchor,
-                      mode=legend_mode,
-                      loc=legend_location,
-                      handles=legend_handles,
-                      ncol=legend_columns,
-                      labelspacing=0.4)
-    elif legend and legend_anchor and legend_mode and legend_location is not None and legend_columns is not None:
-        pyplot.legend(fontsize=legend_font_size,
-                      bbox_to_anchor=legend_anchor,
-                      mode=legend_mode,
-                      loc=legend_location,
-                      ncol=legend_columns,
-                      labelspacing=0.4)
-    elif legend and legend_location is not None and legend_handles is not None and legend_columns is not None:
-        pyplot.legend(fontsize=legend_font_size,
-                      loc=legend_location,
-                      handles=legend_handles,
-                      ncol=legend_columns,
-                      labelspacing=0.4)
-    elif legend and legend_location is not None and legend_handles is not None:
-        pyplot.legend(fontsize=legend_font_size, loc=legend_location, handles=legend_handles, labelspacing=0.4)
-    elif legend and legend_location is not None:
-        pyplot.legend(fontsize=legend_font_size, loc=legend_location, labelspacing=0.4)
-    elif legend:
-        pyplot.legend(fontsize=legend_font_size, labelspacing=0.4)
+    # AJB: dict-dispatch legend configuration replaces the upstream 7-branch
+    # if/elif chain. Build a kwargs dict from whatever the caller provided,
+    # then make a single pyplot.legend() call. Same behavior, half the lines,
+    # and no chance of a missing combination silently dropping the legend.
+    if legend:
+        leg_kwargs = {"fontsize": legend_font_size, "labelspacing": 0.4}
+        _opt_map = {
+            "bbox_to_anchor": legend_anchor,
+            "mode":           legend_mode,
+            "loc":            legend_location,
+            "handles":        legend_handles,
+            "labels":         legend_labels,
+            "ncol":           legend_columns,
+        }
+        for k, v in _opt_map.items():
+            if v is not None:
+                leg_kwargs[k] = v
+        try:
+            pyplot.legend(**leg_kwargs)
+        except Exception as exc:
+            print(f"[AJB_WARN] legend failed: {exc}", file=sys.stderr)

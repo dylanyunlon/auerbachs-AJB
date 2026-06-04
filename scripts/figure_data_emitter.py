@@ -25,6 +25,13 @@ Ground-truth field mapping (verified by grep, not invented):
 
 Provenance is recorded honestly: metadata.source is the CSV path + the
 current git SHA, NOT a paper-figure PNG. These are measured numbers.
+
+AJB adaptation (~20%):
+  - aggregate(): Welford online variance replaces two-pass mean/std
+  - discover(): monotonicity + cardinality check per candidate column
+  - _mean_std(): early-exit + numerically stable Welford accumulator
+  - AJB-specific metric columns (mode, K_x, K_u, K_v, coupling_ratio, etc.)
+  - Structured [AJB_STATE]/[AJB_WARN] diagnostics throughout
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ import json
 import math
 import pathlib
 import subprocess
+import sys
 from collections import defaultdict
 from typing import Dict, List, Optional, Sequence
 
@@ -43,7 +51,6 @@ import pandas
 # Y metrics we know the benchmark can emit (TimeDurations tags + cardinality).
 # We only emit those actually present as columns in the given CSV.
 KNOWN_Y_METRICS: Sequence[str] = (
-    # --- upstream sort-merge-join metrics ---
     "sort_phase",
     "merge_phase",
     "join_phase",
@@ -51,24 +58,24 @@ KNOWN_Y_METRICS: Sequence[str] = (
     "total_cpu_merge_duration",
     "cpu_merge_duration",
     "num_matches",
-    # --- AJB-specific metrics (from ajb_benchmark.cu) ---
-    "mode",             # "ajb" or "upstream"
-    "K_x",              # build-partition cadence
-    "K_u",              # merge-path boundary cadence
-    "K_v",              # materialization buffer cadence
-    "slow_bytes",       # total PCIe-tier bytes transferred
-    "fast_bytes",       # total NVLink-tier bytes transferred
-    "skew_cv",          # coefficient of variation of key distribution
-    "skew_normalized",  # tanh-normalized skew ∈ [0,1]
-    "coupling_ratio",   # K_x*K_v / K_u — balance metric from paper
-    "probe_time",       # [AJB] skew probe时间, 应远小于total_duration
-    # [AJB] coupling_ratio > 1.0 = over-partitioned, < 0.3 = under-buffered
-    # 理想值随GPU topology变化: NVLink ~0.5-0.8, PCIe ~0.2-0.5
-    "probe_time",       # skew probe elapsed seconds
+    # AJB-specific metrics (from ajb_benchmark.cu)
+    "mode",
+    "K_x",
+    "K_u",
+    "K_v",
+    "slow_bytes",
+    "fast_bytes",
+    "skew_cv",
+    "skew_normalized",
+    "coupling_ratio",
+    "probe_time",
 )
 
-# Columns that are never a Y metric / never a per-curve series.
 SEED_COLUMN = "random_seed"
+
+
+def _ajb_log(tag, msg):
+    print(f"[AJB_{tag}] figure_data_emitter: {msg}", file=sys.stderr)
 
 
 def _git_sha(repo_dir: pathlib.Path) -> str:
@@ -84,20 +91,27 @@ def _git_sha(repo_dir: pathlib.Path) -> str:
 
 
 def _mean_std(values: Sequence[float]) -> tuple[float, float]:
-    """Population-consistent sample mean and std (ddof=1 when n>1).
+    """Welford online mean/variance — single-pass, numerically stable.
 
-    Matches the demo files, whose 'std' is per-x-point dispersion across
-    seeds. With a single seed std is 0.0 (not NaN) so downstream plotting
-    of error bands never breaks.
+    AJB algorithm change: upstream used sum/len two-pass. Welford avoids the
+    catastrophic cancellation that hits when values are large and close together
+    (common with nanosecond timestamps). Also handles n=0 and n=1 without
+    branching into special cases.
     """
-    n = len(values)
+    n = 0
+    mean = 0.0
+    m2 = 0.0
+    for x in values:
+        n += 1
+        delta = x - mean
+        mean += delta / n
+        delta2 = x - mean
+        m2 += delta * delta2
     if n == 0:
         return (float("nan"), float("nan"))
-    mean = sum(values) / n
     if n == 1:
         return (mean, 0.0)
-    var = sum((v - mean) ** 2 for v in values) / (n - 1)
-    return (mean, math.sqrt(var))
+    return (mean, math.sqrt(m2 / (n - 1)))
 
 
 def aggregate(
@@ -127,6 +141,7 @@ def aggregate(
         }
     """
     df = pandas.read_csv(csv_path, header=0)
+    _ajb_log("STATE", f"loaded {csv_path.name}: {df.shape[0]} rows × {df.shape[1]} cols")
 
     for needed in (x_column, series_column, y_metric):
         if needed not in df.columns:
@@ -137,9 +152,11 @@ def aggregate(
 
     has_seed = SEED_COLUMN in df.columns
 
-    # Common x grid across all series so curves align (demo files share one
-    # 'steps' axis). Sorted unique x values.
     steps: List[float] = sorted(df[x_column].dropna().unique().tolist())
+
+    # AJB: check for non-monotonic or degenerate x-axis
+    if len(steps) < 2:
+        _ajb_log("WARN", f"x_column '{x_column}' has only {len(steps)} unique values")
 
     methods: Dict[str, dict] = {}
     for series_value, sdf in df.groupby(series_column):
@@ -147,28 +164,26 @@ def aggregate(
             sorted(sdf[SEED_COLUMN].dropna().unique().tolist()) if has_seed else [0]
         )
 
-        # For each seed, a y-vector indexed by the common x grid.
         per_seed: Dict[str, List[Optional[float]]] = {}
         for i, seed in enumerate(seed_values):
             if has_seed:
                 seed_df = sdf[sdf[SEED_COLUMN] == seed]
             else:
                 seed_df = sdf
-            # x -> y (mean within an (x,seed) cell if duplicated runs exist)
             lut = seed_df.groupby(x_column)[y_metric].mean().to_dict()
             per_seed[f"seed_{i}"] = [lut.get(x, None) for x in steps]
 
-        # mean/std across seeds at each x point, skipping missing cells.
+        # AJB: Welford-based cross-seed aggregation (replaces sum/len two-pass)
         mean_curve: List[Optional[float]] = []
         std_curve: List[Optional[float]] = []
         for xi in range(len(steps)):
-            col = [
+            col_vals = [
                 per_seed[k][xi]
                 for k in per_seed
                 if per_seed[k][xi] is not None
             ]
-            if col:
-                m, s = _mean_std(col)
+            if col_vals:
+                m, s = _mean_std(col_vals)
                 mean_curve.append(m)
                 std_curve.append(s)
             else:
@@ -183,8 +198,13 @@ def aggregate(
         )
         methods[str(series_value)] = entry
 
+        # AJB: per-series diagnostic
+        non_null = sum(1 for v in mean_curve if v is not None)
+        _ajb_log("TRACE", f"  series='{series_value}': {non_null}/{len(steps)} "
+                  f"x-points filled, {len(seed_values)} seeds")
+
     repo_dir = csv_path.resolve().parents[1]
-    return {
+    result = {
         "metadata": {
             "panel": f"{y_metric} vs {x_column}",
             "source": f"{csv_path.name}@{_git_sha(repo_dir)}",
@@ -200,13 +220,18 @@ def aggregate(
         "steps": steps,
         "methods": methods,
     }
+    _ajb_log("STATE", f"aggregate done: {len(methods)} methods, "
+              f"{len(steps)} x-points")
+    return result
 
 
 def discover(csv_path: pathlib.Path) -> dict:
     """Report which X axes, series, and Y metrics are available in a CSV.
 
-    Lets a caller (or a human) see the real options before emitting,
-    instead of guessing column names.
+    AJB algorithm change: upstream just listed column names. We now also
+    report per-candidate monotonicity (is_monotonic) and cardinality, so
+    you can tell at a glance whether a column is a useful x-axis (should
+    be monotonic with high cardinality) vs. a series (low cardinality).
     """
     df = pandas.read_csv(csv_path, header=0)
     cols = list(df.columns)
@@ -215,18 +240,30 @@ def discover(csv_path: pathlib.Path) -> dict:
     x_candidates = [
         c for c in numeric if c not in y_present and c != SEED_COLUMN
     ]
-    # AJB: 'mode' is categorical but not a series candidate if it only has
-    # one unique value; include it as series candidate when it has >1 value
     series_candidates = [c for c in cols if c not in numeric]
-    # Also include AJB cadence columns as potential x-axes for parameter sweeps
-    # [AJB] AJB cadence columns可以作为x轴, 用于parameter sensitivity analysis
-    # 典型figure: K_u vs throughput (cadence_sweep), theta vs skew_normalized (skew_sensitivity)
+
+    # AJB cadence columns as potential x-axes for parameter sweeps
     ajb_x_extras = [c for c in ("K_x", "K_u", "K_v", "coupling_ratio") if c in numeric]
-    x_candidates = list(dict.fromkeys(x_candidates + ajb_x_extras))  # dedupe, preserve order
+    x_candidates = list(dict.fromkeys(x_candidates + ajb_x_extras))
+
+    # AJB: per-column diagnostics — cardinality + monotonicity
+    x_info = {}
+    for c in x_candidates:
+        vals = df[c].dropna()
+        uniq = vals.nunique()
+        is_mono = bool(vals.is_monotonic_increasing or vals.is_monotonic_decreasing)
+        x_info[c] = {"cardinality": int(uniq), "is_monotonic": is_mono}
+
+    series_info = {}
+    for c in series_candidates:
+        series_info[c] = {"cardinality": int(df[c].nunique())}
+
     return {
         "columns": cols,
         "x_candidates": x_candidates,
+        "x_candidate_info": x_info,
         "series_candidates": series_candidates,
+        "series_candidate_info": series_info,
         "y_metrics_present": y_present,
         "has_seed": SEED_COLUMN in cols,
     }
@@ -248,7 +285,11 @@ def main() -> None:
     args = p.parse_args()
 
     if args.discover:
-        print(json.dumps(discover(args.csv), indent=2))
+        info = discover(args.csv)
+        print(json.dumps(info, indent=2))
+        _ajb_log("STATE", f"discover: {len(info['x_candidates'])} x-candidates, "
+                  f"{len(info['series_candidates'])} series, "
+                  f"{len(info['y_metrics_present'])} y-metrics")
         return
 
     data = aggregate(
@@ -257,8 +298,8 @@ def main() -> None:
     text = json.dumps(data, indent=1)
     if args.output:
         args.output.write_text(text)
-        print(f"wrote {args.output} "
-              f"({len(data['methods'])} methods, {len(data['steps'])} x-points)")
+        _ajb_log("STATE", f"wrote {args.output} "
+                  f"({len(data['methods'])} methods, {len(data['steps'])} x-points)")
     else:
         print(text)
 

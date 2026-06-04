@@ -63,11 +63,18 @@ class DeviceContainers {
 
   DeviceHistograms* GetHistograms(int gpu, const BucketId& bucket_id) {
     const int i = GpuIdx(gpu);
+    hist_lookups_++;
     auto bucket_id_iter = histogram_maps_[i].find(bucket_id);
     if (bucket_id_iter != histogram_maps_[i].end()) {
+      hist_hits_++;
       return &histogram_buffers_[i][bucket_id_iter->second];
     }
     return nullptr;
+  }
+
+  // AJB: histogram cache hit rate — high reuse means partition boundaries are stable
+  double histogram_hit_rate() const {
+    return hist_lookups_ > 0 ? static_cast<double>(hist_hits_) / hist_lookups_ : 0.0;
   }
 
   void AssignNewHistogramBuffer(int gpu, const BucketId& bucket_id) {
@@ -93,6 +100,9 @@ class DeviceContainers {
 
  private:
   int GpuIdx(int gpu) const { return gpu_index_flat_[gpu]; }
+
+  mutable size_t hist_lookups_ = 0;
+  mutable size_t hist_hits_ = 0;
 
   static constexpr double kEpsilon = 0.005;
   static constexpr double kGamma = 0.01;

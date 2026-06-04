@@ -105,6 +105,10 @@ struct MemoryAllocator {
     }
     value_type* begin_pointer = pointer_ + offset_;
     const size_t aligned_num_bytes = RoundUp(num_bytes, GetAlignment());
+    // AJB: track alignment overhead — the ratio of wasted bytes to requested
+    const size_t alignment_waste = aligned_num_bytes - num_bytes;
+    total_alignment_waste_ += alignment_waste;
+    total_requested_ += num_bytes;
 #ifdef DEBUG_BUILD
     printf("[%s] allocate num_bytes = %lu bytes.\n", GetType(), aligned_num_bytes);
 #endif
@@ -116,6 +120,7 @@ struct MemoryAllocator {
     }
     offset_ += aligned_num_bytes;
     allocations_.push_back({begin_pointer, aligned_num_bytes});
+    alloc_count_++;
     return begin_pointer;
   }
 
@@ -153,6 +158,25 @@ struct MemoryAllocator {
   virtual void InitializeMemory(value_type** pointer, size_t max_bytes) = 0;
 
   virtual void FreeMemory(value_type* pointer) = 0;
+
+  // AJB: allocation statistics — alignment overhead + fragmentation tracking
+  size_t total_alignment_waste_ = 0;
+  size_t total_requested_ = 0;
+  size_t alloc_count_ = 0;
+
+ public:
+  // AJB: utilization ratio — how much of capacity is actually holding user data
+  double GetUtilization() const {
+    return capacity_ > 0 ? static_cast<double>(offset_) / capacity_ : 0.0;
+  }
+  double GetAlignmentOverhead() const {
+    return total_requested_ > 0
+        ? static_cast<double>(total_alignment_waste_) / total_requested_
+        : 0.0;
+  }
+  size_t GetAllocCount() const { return alloc_count_; }
+
+ private:
 
   struct Allocation {
     value_type* begin_pointer = nullptr;
