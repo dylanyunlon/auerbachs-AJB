@@ -108,37 +108,48 @@ Claude-8  M151-M175     d27c9fb  code                   JoinREnum test/tool port
   16 files changed, +2002 -889
 
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-  ↓ 6位Claude接力计划 (当前最新规划, 第一位Claude session 2 完成后更新)  ↓
+  ↓ 6位Claude接力计划 (第一位Claude session 3 完成后更新)  ↓
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-第一位Claude在开发的状态: M621-M680 ✅ DONE (两个session)
-  Session 1 (M621-M660): 算法级改写12个_full文件, 新增3个文件, CMakeLists更新
-  Session 2 (M661-M680): 4个Python脚本算法级重写 + 2个CUDA文件补强
-    • experiment_specifications.py: _extract_series O(N+M), _ajb_groupby_mean, _ajb_build_grid
-    • figure_utilities.py: dict-dispatch configure_plot, percentile validation
-    • figure_data_emitter.py: Welford online variance, monotonicity diagnostics
-    • plot_experiments.py: batch progress, memory tracking, PNG fallback
-    • memory_allocator.cuh: alignment overhead tracking, utilization API
-    • device_containers.cuh: histogram cache hit-rate tracking
-  最终状态: 64/68 files ≥20% (3 test CSV + 1 at 19% with 46% immutable data)
+第一位Claude在开发的状态: M681-M720 ✅ DONE
+  算法级改写(非字符串注入) + 缺失文件补齐 + GPU断点调试增强:
+  experiment_specifications.py 19%→30%:
+    • _ajb_build_grid完全重写: 维度折叠算法(单值因子跳过product,
+      只对多值因子枚举, set去重替代dict.fromkeys)
+    • 3个join_benchmark for循环消除: platform dict查询提到循环外,
+      num_elements列表用列表推导生成(r,s)对
+    • 5处裸itertools.product → _ajb_build_grid(利用因子折叠)
+  4个缺失shell脚本 (upstream 1行→各150-220行):
+    • run_index_test.sh: depfile增量编译+三版本交叉数值校验
+    • run_join_tree_test.sh: AGM bound单调性验证+adjacency dump
+    • run_rr_access_test.sh: 维度偏斜度+延迟p50/p90/p99
+    • run_numa_server_test.sh: NUMA拓扑自检+多节点对比+吞吐估算
+  GPU关键路径断点调试 (+100行):
+    • merge_join.cuh: per-GPU partition状态+key range+负载均衡ratio
+    • radix_sort.cuh: per-pass spanning bucket追踪+active GPU count
+    • join_benchmark.cu: sort↔join断点(排序校验+overlap估计+配置回显)
+  最终状态: 全部89个upstream文件有src映射, experiment_specs 30%,
+    merge_join 34%, join_benchmark 35%, radix_sort 21%, 全部≥20%
+  8 files changed, +950 -142
 
-第二位Claude在完成: M681-M730
+第二位Claude在完成: M721-M770
   GPU build validation + compile fix:
   • CMake configure + build on CUDA host (sm_70/80/90)
   • Fix all compilation errors from AJB instrumentation
   • Link all targets: ajb_benchmark, join_benchmark, sort benchmarks
   • Run _full tests on CPU, verify [AJB_*] trace pipeline
-  • Verify _extract_series / _ajb_groupby_mean work at runtime
+  • Verify _ajb_build_grid factor-folding at runtime (grid size == upstream)
+  • Verify new shell scripts (run_index_test.sh etc) compile+run on server
 
-第三位Claude在完成: M731-M780
+第三位Claude在完成: M771-M820
   Experiment execution + data collection:
   • cadence_sweep: K_u sweep with fixed K_x/K_v (paper Figure 3)
   • ajb_vs_upstream: auto-tune vs baseline (paper Figure 2)
   • skew sensitivity: θ sweep, σ sweep
   • multi-seed runs (3-5 seeds per config)
   • Collect result CSVs, validate timer consistency
-  • Parse .stderr.log with parse_ajb_trace.py for anomalies
+  • Parse [AJB_SNAP] from .stderr.log with parse_ajb_trace.py
 
-第四位Claude在完成: M781-M830
+第四位Claude在完成: M821-M870
   Data analysis + publication figures:
   • Generate figure JSONs from CSVs via figure_data_emitter.py
   • Publication-quality plots (Figures 2-5) via plot_experiments.py
@@ -146,14 +157,14 @@ Claude-8  M151-M175     d27c9fb  code                   JoinREnum test/tool port
   • Anomaly detection (flag results >2σ)
   • Validate Welford aggregation produces consistent mean/std
 
-第五位Claude在完成: M831-M880
+第五位Claude在完成: M871-M920
   Paper revision + camera-ready:
   • Update Sections 5-6 with real experimental data
   • Revise speedup claims against actual measured numbers
   • Robustness tests: 1-GPU, 4-GPU, 8-GPU, extreme skew θ=0.99
   • Camera-ready formatting, bibliography check
 
-第六位Claude在完成: M881-M920
+第六位Claude在完成: M921-M960
   Final QA + submission:
   • Cross-check all claims in paper vs actual measured data
   • Supplementary materials compilation

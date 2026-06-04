@@ -258,6 +258,31 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                                                         spanning_bucket_to_gpus_map, gpus, iteration);
       }
 
+      // ---- AJB: per-pass partition state dump (breakpoint-equivalent) ----
+      // After DetectSpanningBuckets returns, print the pass state so you
+      // can see how the radix partitioning is converging across GPUs.
+      // This is what you'd inspect if you had a breakpoint at the top of
+      // each partition pass in a debugger — but it works on a headless
+      // multi-GPU cluster where GDB is impractical.
+      {
+        // count how many GPUs are involved in spanning buckets this pass
+        size_t gpus_with_spanning = 0;
+        if (iteration > 0 && iteration < spanning_buckets.size()) {
+          std::vector<bool> gpu_active(num_gpus, false);
+          for (auto& [gid, bucket] : spanning_buckets[iteration]) {
+            for (size_t gi = 0; gi < num_gpus; ++gi) {
+              if (gpus[gi] == gid) { gpu_active[gi] = true; break; }
+            }
+          }
+          for (bool a : gpu_active) if (a) gpus_with_spanning++;
+        }
+        fprintf(stderr, "[AJB_SNAP][radix_sort][pass] iter=%zu/%zu "
+                "spanning=%zu gpus_active=%zu/%zu\n",
+                iteration, (size_t)sizeof(T), num_spanning_buckets,
+                gpus_with_spanning, num_gpus);
+      }
+      // ---- end AJB pass dump ----
+
       // Upstream: 只在 num_spanning_buckets==0 时break.
       // AJB: 加早退条件 — 如果连续两趟spanning bucket数不减少,
       // 说明数据分布极端(某个byte全相同), 后续pass也不会改善, 提前终止.

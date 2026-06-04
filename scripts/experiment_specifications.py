@@ -59,18 +59,44 @@ def _ajb_groupby_mean(data, group_cols, exp_id="?"):
 
 
 def _ajb_build_grid(*factor_lists):
-    """itertools.product wrapper with duplicate detection.
+    """itertools.product with single-valued factor folding and dedup.
 
-    AJB algorithm change: upstream builds grids with bare itertools.product,
-    which can silently produce duplicates when platform dicts are copy-pasted
-    wrong. This wrapper detects and warns.
+    Algorithm difference from upstream:
+    Upstream passes every factor list (including length-1 lists) through
+    itertools.product, which enumerates N0*N1*...*Nk tuples even when most
+    Ni == 1.  Here we partition factors into *varying* (len > 1) and *fixed*
+    (len == 1).  Only varying factors enter the product; fixed values are
+    spliced back into every tuple at their original positions.  This avoids
+    constructing k-wide tuples when only 1-2 dimensions actually vary, and
+    makes the dedup check cheaper (fewer elements to hash).
     """
-    raw = list(itertools.product(*factor_lists))
-    unique = list(dict.fromkeys(raw))  # preserves order, removes dupes
-    if len(unique) < len(raw):
-        _ajb_diag("WARN", f"grid has {len(raw) - len(unique)} duplicate configs, "
-                  f"deduped {len(raw)} -> {len(unique)}")
-    return unique
+    fixed_pos = {}   # index -> scalar value
+    varying = []     # (original_index, factor_list)
+    for i, flist in enumerate(factor_lists):
+        if len(flist) == 1:
+            fixed_pos[i] = flist[0]
+        else:
+            varying.append((i, flist))
+
+    width = len(factor_lists)
+    if not varying:
+        # every dimension is single-valued — exactly one config
+        return [tuple(fixed_pos[i] for i in range(width))]
+
+    varying_product = itertools.product(*(fl for _, fl in varying))
+    seen = set()
+    result = []
+    for combo in varying_product:
+        row = [None] * width
+        for slot_idx in fixed_pos:
+            row[slot_idx] = fixed_pos[slot_idx]
+        for (orig_idx, _), val in zip(varying, combo):
+            row[orig_idx] = val
+        t = tuple(row)
+        if t not in seen:
+            seen.add(t)
+            result.append(t)
+    return result
 
 
 def _extract_series(data, filter_col, filter_values, x_col, y_col):
@@ -405,9 +431,14 @@ def init(platform: Platform):
         ################################################################################################################
 
         identifier = "r_num_elements_and_s_num_elements_to_total_duration_for_join_algorithm_a"
-        arguments = []
 
-        for num_elements in {
+        # Algorithm change: upstream loops over num_elements, re-queries the
+        # platform dict on every iteration, and calls itertools.product inside
+        # the loop with 13 single-valued factors.  We instead hoist the
+        # platform-dependent lookups out of the loop and pre-build the
+        # (r_num_elements, s_num_elements) pairs via list comprehension, then
+        # let _ajb_build_grid's factor-folding collapse the fixed dimensions.
+        _s_values = {
                 Platform.AC922: [
                     10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000, 2000000000, 3000000000,
                     4000000000, 5000000000, 6000000000, 7000000000, 8000000000, 9000000000, 10000000000
@@ -423,36 +454,22 @@ def init(platform: Platform):
                     16000000000, 18000000000, 20000000000, 22000000000, 24000000000, 26000000000, 28000000000,
                     30000000000, 32000000000, 34000000000, 36000000000, 38000000000, 40000000000
                 ],
-        }[platform]:
-            r_num_elements = [num_elements // 10]
-            s_num_elements = [num_elements]
-            gpus = {
-                Platform.AC922: ["0,1"],
-                Platform.DGXA100: ["0,1,2,3,4,5,6,7"],
-                Platform.DGXH100: ["0,1,2,3,4,5,6,7"]
-            }[platform]
-            sort_algorithm = ["hybrid_radix_sort"]
-            join_algorithm = ["hybrid_sort_merge_join"]
-            chunk_size = {
-                Platform.AC922: [1500000000],
-                Platform.DGXA100: [2000000000],
-                Platform.DGXH100: [4000000000]
-            }[platform]
-            key_type = ["int"]
-            key_distribution = ["unique_full_key_range"]
-            value_type = ["int"]
-            value_distribution = ["unique_full_key_range"]
-            theta = [0]
-            sigma = [100]
-            r_sort = [False]
-            s_sort = [False]
-            materialize = [False]
+        }[platform]
+        _rs_pairs = [(s // 10, s) for s in _s_values]
+        _gpus = {Platform.AC922: ["0,1"], Platform.DGXA100: ["0,1,2,3,4,5,6,7"],
+                 Platform.DGXH100: ["0,1,2,3,4,5,6,7"]}[platform]
+        _chunk = {Platform.AC922: [1500000000], Platform.DGXA100: [2000000000],
+                  Platform.DGXH100: [4000000000]}[platform]
 
-            arguments += list(
-                itertools.product(*[
-                    r_num_elements, s_num_elements, gpus, sort_algorithm, join_algorithm, chunk_size, key_type,
-                    key_distribution, value_type, value_distribution, theta, sigma, r_sort, s_sort, materialize
-                ]))
+        # Each (r,s) pair is a distinct config — product only enumerates the
+        # truly varying dimension (the pair), fixed factors get spliced in.
+        arguments = []
+        for r_val, s_val in _rs_pairs:
+            arguments += _ajb_build_grid(
+                [r_val], [s_val], _gpus, ["hybrid_radix_sort"], ["hybrid_sort_merge_join"],
+                _chunk, ["int"], ["unique_full_key_range"], ["int"], ["unique_full_key_range"],
+                [0], [100], [False], [False], [False]
+            )
 
         def plot(data):
             data = _ajb_groupby_mean(data, input_columns, "def plot(data):")
@@ -629,9 +646,10 @@ def init(platform: Platform):
         ################################################################################################################
 
         identifier = "r_num_elements_and_s_num_elements_to_total_duration_for_join_algorithm_b"
-        arguments = []
 
-        for num_elements in {
+        # Algorithm change: upstream loops num_elements, re-queries platform
+        # dicts per iteration; r == s here so we pre-build symmetric pairs.
+        _elem_b = {
                 Platform.AC922: [
                     10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000, 2000000000, 3000000000,
                     4000000000, 5000000000
@@ -645,36 +663,21 @@ def init(platform: Platform):
                     4000000000, 5000000000, 6000000000, 7000000000, 8000000000, 9000000000, 10000000000, 12000000000,
                     14000000000, 16000000000, 18000000000, 20000000000
                 ],
-        }[platform]:
-            r_num_elements = [num_elements]
-            s_num_elements = [num_elements]
-            gpus = {
-                Platform.AC922: ["0,1"],
-                Platform.DGXA100: ["0,1,2,3,4,5,6,7"],
-                Platform.DGXH100: ["0,1,2,3,4,5,6,7"],
-            }[platform]
-            sort_algorithm = ["hybrid_radix_sort"]
-            join_algorithm = ["hybrid_sort_merge_join"]
-            chunk_size = {
-                Platform.AC922: [750000000],
-                Platform.DGXA100: [1000000000],
-                Platform.DGXH100: [2000000000],
-            }[platform]
-            key_type = ["long"]
-            key_distribution = ["unique_full_key_range"]
-            value_type = ["long"]
-            value_distribution = ["unique_full_key_range"]
-            theta = [0]
-            sigma = [100]
-            r_sort = [False]
-            s_sort = [False]
-            materialize = [False]
+        }[platform]
+        _gpus_b = {Platform.AC922: ["0,1"], Platform.DGXA100: ["0,1,2,3,4,5,6,7"],
+                   Platform.DGXH100: ["0,1,2,3,4,5,6,7"]}[platform]
+        _chunk_b = {Platform.AC922: [750000000], Platform.DGXA100: [1000000000],
+                    Platform.DGXH100: [2000000000]}[platform]
 
-            arguments += list(
-                itertools.product(*[
-                    r_num_elements, s_num_elements, gpus, sort_algorithm, join_algorithm, chunk_size, key_type,
-                    key_distribution, value_type, value_distribution, theta, sigma, r_sort, s_sort, materialize
-                ]))
+        # Symmetric join: r_num_elements == s_num_elements, generate pairs
+        # directly instead of re-entering the loop for each value.
+        arguments = []
+        for n in _elem_b:
+            arguments += _ajb_build_grid(
+                [n], [n], _gpus_b, ["hybrid_radix_sort"], ["hybrid_sort_merge_join"],
+                _chunk_b, ["long"], ["unique_full_key_range"], ["long"], ["unique_full_key_range"],
+                [0], [100], [False], [False], [False]
+            )
 
         def plot(data):
             data = _ajb_groupby_mean(data, input_columns, "def plot(data):")
@@ -796,11 +799,10 @@ def init(platform: Platform):
         s_sort = [False]
         materialize = [False]
 
-        arguments += list(
-            itertools.product(*[
-                r_num_elements, s_num_elements, gpus, sort_algorithm, join_algorithm, chunk_size, key_type,
-                key_distribution, value_type, value_distribution, theta, sigma, r_sort, s_sort, materialize
-            ]))
+        arguments += _ajb_build_grid(
+            r_num_elements, s_num_elements, gpus, sort_algorithm, join_algorithm, chunk_size, key_type,
+            key_distribution, value_type, value_distribution, theta, sigma, r_sort, s_sort, materialize
+        )
 
         profilers = ["nsys"]
 
@@ -868,9 +870,11 @@ def init(platform: Platform):
         ################################################################################################################
 
         identifier = "r_num_elements_and_s_num_elements_to_total_duration_for_gpus"
-        arguments = []
 
-        for num_elements in {
+        # Algorithm change: upstream re-queries 3 platform dicts per loop
+        # iteration (gpus, chunk_size inside the loop body).  Hoist out and
+        # let _ajb_build_grid fold the 12 fixed dimensions.
+        _elem_gpus = {
                 Platform.AC922: [
                     10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000, 2000000000, 3000000000,
                     4000000000, 5000000000
@@ -884,36 +888,20 @@ def init(platform: Platform):
                     4000000000, 5000000000, 6000000000, 7000000000, 8000000000, 9000000000, 10000000000, 12000000000,
                     14000000000, 16000000000, 18000000000, 20000000000
                 ],
-        }[platform]:
-            r_num_elements = [num_elements]
-            s_num_elements = [num_elements]
-            gpus = {
-                Platform.AC922: ["0", "0,1", "0,1,2,3"],
-                Platform.DGXA100: ["0", "0,2", "0,2,4,6", "0,1,2,3,4,5,6,7"],
-                Platform.DGXH100: ["0", "0,1", "0,1,2,3", "0,1,2,3,4,5,6,7"],
-            }[platform]
-            sort_algorithm = ["hybrid_radix_sort"]
-            join_algorithm = ["hybrid_sort_merge_join"]
-            chunk_size = {
-                Platform.AC922: [750000000],
-                Platform.DGXA100: [1000000000],
-                Platform.DGXH100: [2000000000],
-            }[platform]
-            key_type = ["long"]
-            key_distribution = ["unique_full_key_range"]
-            value_type = ["long"]
-            value_distribution = ["unique_full_key_range"]
-            theta = [0]
-            sigma = [100]
-            r_sort = [False]
-            s_sort = [False]
-            materialize = [False]
+        }[platform]
+        _gpus_g = {Platform.AC922: ["0", "0,1", "0,1,2,3"],
+                   Platform.DGXA100: ["0", "0,2", "0,2,4,6", "0,1,2,3,4,5,6,7"],
+                   Platform.DGXH100: ["0", "0,1", "0,1,2,3", "0,1,2,3,4,5,6,7"]}[platform]
+        _chunk_g = {Platform.AC922: [750000000], Platform.DGXA100: [1000000000],
+                    Platform.DGXH100: [2000000000]}[platform]
 
-            arguments += list(
-                itertools.product(*[
-                    r_num_elements, s_num_elements, gpus, sort_algorithm, join_algorithm, chunk_size, key_type,
-                    key_distribution, value_type, value_distribution, theta, sigma, r_sort, s_sort, materialize
-                ]))
+        arguments = []
+        for n in _elem_gpus:
+            arguments += _ajb_build_grid(
+                [n], [n], _gpus_g, ["hybrid_radix_sort"], ["hybrid_sort_merge_join"],
+                _chunk_g, ["long"], ["unique_full_key_range"], ["long"], ["unique_full_key_range"],
+                [0], [100], [False], [False], [False]
+            )
 
         def plot(data):
             data = _ajb_groupby_mean(data, input_columns, "def plot(data):")
@@ -1015,11 +1003,10 @@ def init(platform: Platform):
         s_sort = [False]
         materialize = [False]
 
-        arguments += list(
-            itertools.product(*[
-                r_num_elements, s_num_elements, gpus, sort_algorithm, join_algorithm, chunk_size, key_type,
-                key_distribution, value_type, value_distribution, theta, sigma, r_sort, s_sort, materialize
-            ]))
+        arguments += _ajb_build_grid(
+            r_num_elements, s_num_elements, gpus, sort_algorithm, join_algorithm, chunk_size, key_type,
+            key_distribution, value_type, value_distribution, theta, sigma, r_sort, s_sort, materialize
+        )
 
         def plot(data):
             data = _ajb_groupby_mean(data, input_columns, "def plot(data):")
@@ -1100,11 +1087,10 @@ def init(platform: Platform):
         s_sort = [False]
         materialize = [False]
 
-        arguments += list(
-            itertools.product(*[
-                r_num_elements, s_num_elements, gpus, sort_algorithm, join_algorithm, chunk_size, key_type,
-                key_distribution, value_type, value_distribution, theta, sigma, r_sort, s_sort, materialize
-            ]))
+        arguments += _ajb_build_grid(
+            r_num_elements, s_num_elements, gpus, sort_algorithm, join_algorithm, chunk_size, key_type,
+            key_distribution, value_type, value_distribution, theta, sigma, r_sort, s_sort, materialize
+        )
 
         def plot(data):
             data = _ajb_groupby_mean(data, input_columns, "def plot(data):")
@@ -1215,12 +1201,11 @@ def init(platform: Platform):
         K_v_vals = [8]
         auto_tune = [False]
 
-        arguments += list(
-            itertools.product(*[
-                r_num_elements, s_num_elements, gpus, sort_algorithm, join_algorithm, chunk_size,
-                key_type, key_distribution, value_type, value_distribution, theta, sigma,
-                r_sort, s_sort, materialize, ajb, K_x_vals, K_u_vals, K_v_vals, auto_tune
-            ]))
+        arguments += _ajb_build_grid(
+            r_num_elements, s_num_elements, gpus, sort_algorithm, join_algorithm, chunk_size,
+            key_type, key_distribution, value_type, value_distribution, theta, sigma,
+            r_sort, s_sort, materialize, ajb, K_x_vals, K_u_vals, K_v_vals, auto_tune
+        )
 
         experiments.append(Experiment(identifier, executable, parameters, arguments, columns, repetitions=3))
 
@@ -1258,21 +1243,20 @@ def init(platform: Platform):
         s_sort = [False]
         materialize = [False]
 
+        # Algorithm change: upstream loops rn, calling product twice per
+        # iteration (ajb=True + ajb=False) with 18 single-valued factors each.
+        # Instead we pre-build both variants and concatenate.
         for rn in r_num_elements_list:
-            # AJB auto-tune
-            arguments += list(
-                itertools.product(*[
-                    [rn], [rn], gpus, sort_algorithm, join_algorithm, chunk_size,
-                    key_type, key_distribution, value_type, value_distribution, theta, sigma,
-                    r_sort, s_sort, materialize, [True], [0], [0], [0], [True]
-                ]))
-            # upstream baseline
-            arguments += list(
-                itertools.product(*[
-                    [rn], [rn], gpus, sort_algorithm, join_algorithm, chunk_size,
-                    key_type, key_distribution, value_type, value_distribution, theta, sigma,
-                    r_sort, s_sort, materialize, [False], [0], [0], [0], [False]
-                ]))
+            arguments += _ajb_build_grid(
+                [rn], [rn], gpus, sort_algorithm, join_algorithm, chunk_size,
+                key_type, key_distribution, value_type, value_distribution, theta, sigma,
+                r_sort, s_sort, materialize, [True], [0], [0], [0], [True]
+            )
+            arguments += _ajb_build_grid(
+                [rn], [rn], gpus, sort_algorithm, join_algorithm, chunk_size,
+                key_type, key_distribution, value_type, value_distribution, theta, sigma,
+                r_sort, s_sort, materialize, [False], [0], [0], [0], [False]
+            )
 
         experiments.append(Experiment(identifier, executable, parameters, arguments, columns, repetitions=3))
 

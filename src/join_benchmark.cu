@@ -111,6 +111,58 @@ void RunJoinBenchmark(Settings& settings) {
       sort_relation(s_relation.GetKeys(), s_relation.GetValues(), settings.s_num_elements, settings.s_sort);
     }
 
+    // ---- AJB: post-sort state dump (breakpoint between sort and join) ----
+    // This is the critical inspection point: sort is done, join hasn't started.
+    // Print the state of both relations so you can verify sort correctness,
+    // check data skew, and predict join workload — same as setting a
+    // breakpoint in GDB after HybridSort returns.
+    {
+      auto* rk = r_relation.GetKeys().data();
+      auto* sk = s_relation.GetKeys().data();
+      size_t rn = settings.r_num_elements;
+      size_t sn = settings.s_num_elements;
+
+      // sortedness spot-check: sample 1000 strided positions
+      size_t r_violations = 0, s_violations = 0;
+      size_t stride = std::max<size_t>(1, rn / 1000);
+      for (size_t i = stride; i < rn; i += stride)
+        if (rk[i] < rk[i-1]) r_violations++;
+      stride = std::max<size_t>(1, sn / 1000);
+      for (size_t i = stride; i < sn; i += stride)
+        if (sk[i] < sk[i-1]) s_violations++;
+
+      fprintf(stderr, "[AJB_SNAP][join_benchmark][post_sort] "
+              "R: n=%zu sorted=%s (violations=%zu/1000) "
+              "key_range=[%llu..%llu]\n",
+              rn, r_violations == 0 ? "yes" : "NO", r_violations,
+              (unsigned long long)(rn > 0 ? rk[0] : 0),
+              (unsigned long long)(rn > 0 ? rk[rn-1] : 0));
+      fprintf(stderr, "[AJB_SNAP][join_benchmark][post_sort] "
+              "S: n=%zu sorted=%s (violations=%zu/1000) "
+              "key_range=[%llu..%llu]\n",
+              sn, s_violations == 0 ? "yes" : "NO", s_violations,
+              (unsigned long long)(sn > 0 ? sk[0] : 0),
+              (unsigned long long)(sn > 0 ? sk[sn-1] : 0));
+
+      // key overlap estimate: compare R's last key vs S's first key
+      if (rn > 0 && sn > 0) {
+        bool overlap = !(rk[rn-1] < sk[0] || sk[sn-1] < rk[0]);
+        fprintf(stderr, "[AJB_SNAP][join_benchmark][overlap] %s "
+                "R_max=%llu S_min=%llu\n",
+                overlap ? "OVERLAP" : "DISJOINT",
+                (unsigned long long)rk[rn-1],
+                (unsigned long long)sk[0]);
+      }
+
+      // GPU count + memory hint
+      fprintf(stderr, "[AJB_SNAP][join_benchmark][config] "
+              "gpus=%zu sort=%s join=%s chunk=%zu theta=%u sigma=%u\n",
+              settings.gpus.size(), settings.sort_algorithm.c_str(),
+              settings.join_algorithm.c_str(), settings.chunk_size,
+              settings.theta, settings.sigma);
+    }
+    // ---- end AJB post-sort dump ----
+
     JoinResult<T> join_result =
         MergeJoin(r_relation.GetKeys(), r_relation.GetValues(), s_relation.GetKeys(), s_relation.GetValues(),
                   settings.gpus, device_allocators, stream_pools, settings.materialize);

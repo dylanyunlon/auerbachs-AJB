@@ -215,6 +215,16 @@ JoinResult<T> GlobalJoinWithLaunchBounds(T* keys_r, T* keys_s, const long long n
   const size_t n_iterations = std::max<size_t>(kNumJoinStreams, DivideUp(n_r + n_s, free_memory));
   const size_t n_per_iteration = DivideUp(n_r + n_s, n_iterations);
 
+  // ---- AJB: GPU memory + iteration plan state dump ----
+  // Print the decisions that determine GPU memory usage and kernel launch
+  // grid.  Equivalent to breaking in GDB after the allocation plan is
+  // computed but before any cudaMalloc fires.
+  fprintf(stderr, "[AJB_SNAP][global_join][plan] gpu=%d n_R=%lld n_S=%lld "
+          "free_mem=%zu per_elem=%zu n_iters=%zu per_iter=%zu streams=%d\n",
+          i_gpu, n_r, n_s, free_memory, per_element_bytes,
+          n_iterations, n_per_iteration, kNumJoinStreams);
+  // ---- end AJB plan dump ----
+
   std::vector<longlong4*> materialization_ranges(kNumJoinStreams);
   if (materialize) {
     for (size_t i = 0; i < kNumJoinStreams; ++i) {
@@ -421,6 +431,46 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
   JoinResult<T> answer;
   HandleLongKeyRanges(keys_r.data(), keys_s.data(), keys_r.size(), keys_s.size(), {0, 0}, starts.data(), ends.data(),
                       device_count, answer, materialize);
+
+  // ---- AJB: partition state dump (print current data structure state) ----
+  // This gives you the same visibility as setting a breakpoint after
+  // merge_path partitioning — without needing GDB on a GPU cluster.
+  // Shows per-device workload so you can spot load imbalance immediately.
+  {
+    long long total_work = 0;
+    long long max_work = 0, min_work = (long long)keys_r.size() + keys_s.size();
+    for (size_t d = 0; d < device_count; ++d) {
+      long long w_r = ends[d].x - starts[d].x;
+      long long w_s = ends[d].y - starts[d].y;
+      long long work = w_r + w_s;
+      total_work += work;
+      if (work > max_work) max_work = work;
+      if (work < min_work) min_work = work;
+      fprintf(stderr, "[AJB_SNAP][merge_join][partition] gpu=%zu "
+              "R=[%lld,%lld) S=[%lld,%lld) work_R=%lld work_S=%lld\n",
+              d, starts[d].x, ends[d].x, starts[d].y, ends[d].y, w_r, w_s);
+    }
+    double balance_ratio = min_work > 0 ? (double)max_work / min_work : 0.0;
+    fprintf(stderr, "[AJB_SNAP][merge_join][balance] devices=%zu "
+            "total=%lld max=%lld min=%lld ratio=%.2f\n",
+            device_count, total_work, max_work, min_work, balance_ratio);
+
+    // key range per device — shows how merge_path split the keyspace
+    for (size_t d = 0; d < device_count; ++d) {
+      long long r_first = starts[d].x < (long long)keys_r.size()
+                          ? (long long)keys_r[starts[d].x] : -1;
+      long long r_last = ends[d].x > 0 && ends[d].x <= (long long)keys_r.size()
+                         ? (long long)keys_r[ends[d].x - 1] : -1;
+      long long s_first = starts[d].y < (long long)keys_s.size()
+                          ? (long long)keys_s[starts[d].y] : -1;
+      long long s_last = ends[d].y > 0 && ends[d].y <= (long long)keys_s.size()
+                         ? (long long)keys_s[ends[d].y - 1] : -1;
+      fprintf(stderr, "[AJB_SNAP][merge_join][keys] gpu=%zu "
+              "R_keys=[%lld..%lld] S_keys=[%lld..%lld]\n",
+              d, r_first, r_last, s_first, s_last);
+    }
+  }
+  // ---- end AJB partition dump ----
 
 #pragma omp parallel for num_threads(device_count)
   for (size_t i_device = 0; i_device < device_count; ++i_device) {
