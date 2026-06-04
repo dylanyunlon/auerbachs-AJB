@@ -108,43 +108,58 @@ Claude-8  M151-M175     d27c9fb  code                   JoinREnum test/tool port
   16 files changed, +2002 -889
 
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-  ↓ 6位Claude接力计划 (当前最新规划)  ↓
+  ↓ 6位Claude接力计划 (当前最新规划, 第一位Claude session 2 完成后更新)  ↓
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-第一位Claude在完成: M621-M660 ✅ (已完成,就是上面这个session)
-  算法级改写12个_full文件, 新增3个文件, CMakeLists更新
+第一位Claude在开发的状态: M621-M680 ✅ DONE (两个session)
+  Session 1 (M621-M660): 算法级改写12个_full文件, 新增3个文件, CMakeLists更新
+  Session 2 (M661-M680): 4个Python脚本算法级重写 + 2个CUDA文件补强
+    • experiment_specifications.py: _extract_series O(N+M), _ajb_groupby_mean, _ajb_build_grid
+    • figure_utilities.py: dict-dispatch configure_plot, percentile validation
+    • figure_data_emitter.py: Welford online variance, monotonicity diagnostics
+    • plot_experiments.py: batch progress, memory tracking, PNG fallback
+    • memory_allocator.cuh: alignment overhead tracking, utilization API
+    • device_containers.cuh: histogram cache hit-rate tracking
+  最终状态: 64/68 files ≥20% (3 test CSV + 1 at 19% with 46% immutable data)
 
-第二位Claude在完成: M661-M710
+第二位Claude在完成: M681-M730
   GPU build validation + compile fix:
   • CMake configure + build on CUDA host (sm_70/80/90)
-  • Fix all compilation errors, link all targets
+  • Fix all compilation errors from AJB instrumentation
+  • Link all targets: ajb_benchmark, join_benchmark, sort benchmarks
   • Run _full tests on CPU, verify [AJB_*] trace pipeline
-  • Verify ajb_benchmark links cleanly
+  • Verify _extract_series / _ajb_groupby_mean work at runtime
 
-第三位Claude在完成: M711-M760
+第三位Claude在完成: M731-M780
   Experiment execution + data collection:
-  • cadence_sweep, vs_upstream, skew_sensitivity experiments
+  • cadence_sweep: K_u sweep with fixed K_x/K_v (paper Figure 3)
+  • ajb_vs_upstream: auto-tune vs baseline (paper Figure 2)
+  • skew sensitivity: θ sweep, σ sweep
   • multi-seed runs (3-5 seeds per config)
   • Collect result CSVs, validate timer consistency
-  • Parse .stderr.log for anomalies
+  • Parse .stderr.log with parse_ajb_trace.py for anomalies
 
-第四位Claude在完成: M761-M810
+第四位Claude在完成: M781-M830
   Data analysis + publication figures:
-  • Generate figure JSONs from CSVs
-  • Publication-quality plots (Figures 2-5)
+  • Generate figure JSONs from CSVs via figure_data_emitter.py
+  • Publication-quality plots (Figures 2-5) via plot_experiments.py
   • Fill paper Tables 1-2 with measured data
-  • Anomaly detection (flag >2σ)
+  • Anomaly detection (flag results >2σ)
+  • Validate Welford aggregation produces consistent mean/std
 
-第五位Claude在完成: M811-M860
+第五位Claude在完成: M831-M880
   Paper revision + camera-ready:
   • Update Sections 5-6 with real experimental data
-  • Revise speedup claims, robustness tests (1/4/8-GPU, θ=0.99)
-  • Camera-ready format, bib check
+  • Revise speedup claims against actual measured numbers
+  • Robustness tests: 1-GPU, 4-GPU, 8-GPU, extreme skew θ=0.99
+  • Camera-ready formatting, bibliography check
 
-第六位Claude在完成: M861-M900
+第六位Claude在完成: M881-M920
   Final QA + submission:
-  • Cross-check claims vs data, supplementary materials
-  • Docker/Singularity container, reproducibility artifacts
-  • Zenodo/GitHub release, NeurIPS 2026 OpenReview submission
+  • Cross-check all claims in paper vs actual measured data
+  • Supplementary materials compilation
+  • Docker/Singularity container for reproducible builds
+  • Zenodo/GitHub release with DOI
+  • NeurIPS 2026 OpenReview submission
 ─────────────────────────────────────────────────────────────────────────────
 ```
 

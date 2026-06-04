@@ -37,24 +37,39 @@ M = Milestone, 每个文件一个M编号
 - constants.cuh: static_assert, JoinStreamOverheadBytes
 - **Total: 69 insertions, 114 deletions, fprintf=0**
 
-## 第三位 Claude 待完成: M720-M750 (预估)
-- [ ] 全项目 compile validation (nvcc dry-run where possible)
-- [ ] 删除 src/common/debug_utilities.cuh (纯fprintf文件, 无upstream对应)
-- [ ] 清理剩余6个文件中的低密度fprintf (noise<30%, 各5-8行)
-- [ ] CMakeLists.txt 适配、build fix
+## 第一位 Claude Session 2 完成: M661-M680 ✅
+4个Python脚本算法级重写 + 2个CUDA文件补强:
+- [x] experiment_specifications.py: _extract_series O(N+M), _ajb_groupby_mean, _ajb_build_grid
+- [x] figure_utilities.py: dict-dispatch configure_plot, percentile validation
+- [x] figure_data_emitter.py: Welford online variance, monotonicity diagnostics
+- [x] plot_experiments.py: batch progress, memory tracking, PNG fallback
+- [x] memory_allocator.cuh: alignment overhead tracking, utilization API
+- [x] device_containers.cuh: histogram cache hit-rate tracking
+- **最终: 64/68 files ≥20% (3 test CSV identical by design, 1 at 19%)**
 
-## 第四位 Claude 待完成: M751-M800 (预估)
-- [ ] GPU build validation (需要CUDA环境)
-- [ ] Runtime测试 + correctness verification
-- [ ] 实验执行 + 数据收集
+## 第二位 Claude 待完成: M681-M730
+- [ ] CMake configure + build on CUDA host (sm_70/80/90)
+- [ ] Fix all compilation errors, link all targets
+- [ ] Run _full tests on CPU, verify [AJB_*] trace pipeline
+- [ ] Verify ajb_benchmark links cleanly
 
-## 第五位 Claude 待完成: M801-M850 (预估)
-- [ ] 数据分析 + 论文图表生成
-- [ ] 实验结果解读
+## 第三位 Claude 待完成: M731-M780
+- [ ] cadence_sweep, vs_upstream, skew_sensitivity experiments
+- [ ] multi-seed runs (3-5 seeds per config)
+- [ ] Collect result CSVs, validate timer consistency
 
-## 第六位 Claude 待完成: M851-M900 (预估)
-- [ ] 论文修订 + camera-ready
-- [ ] 可复现性容器 + 提交材料准备
+## 第四位 Claude 待完成: M781-M830
+- [ ] Generate figure JSONs, publication-quality plots
+- [ ] Fill paper Tables 1-2 with measured data
+- [ ] Anomaly detection (flag >2σ)
+
+## 第五位 Claude 待完成: M831-M880
+- [ ] Update paper Sections 5-6 with real data
+- [ ] Robustness tests, camera-ready format
+
+## 第六位 Claude 待完成: M881-M920
+- [ ] Final QA, Docker container, Zenodo release
+- [ ] NeurIPS 2026 OpenReview submission
 
 ---
 
