@@ -193,7 +193,15 @@ int main(int argc, char* argv[]) {
   }
 
   if (s.key_type == "int" && s.value_type == "int") {
+    // [AJB_BP] 完整配置回显: 让日志自描述
+    fprintf(stderr, "[AJB_BP][gpu_merge] config: elements=%zu threads=%zu algo=%s seed=%u\n",
+            s.num_elements, s.num_threads, s.gpu_merge_algorithm.c_str(), s.random_seed);
+    auto t0 = std::chrono::steady_clock::now();
     RunGpuMergeBenchmark<int, int>(s);
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    fprintf(stderr, "[AJB_BP][gpu_merge] done: wall=%.1fms throughput=%.1f Melems/s\n",
+            ms, s.num_elements / (ms / 1000.0) / 1e6);
   }
 
   return 0;

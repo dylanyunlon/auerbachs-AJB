@@ -153,15 +153,24 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  const std::string type_key = s.key_type + ":" + s.value_type;
-  if (type_key == "int:int") {
-    RunCpuSortBenchmark<uint32_t, uint32_t>(s);
-  } else if (type_key == "long:long") {
-    RunCpuSortBenchmark<uint64_t, uint64_t>(s);
-  } else if (type_key == "float:float") {
-    RunCpuSortBenchmark<float, float>(s);
-  } else if (type_key == "double:double") {
-    RunCpuSortBenchmark<double, double>(s);
+  // AJB: 类型分发用函数表代替if-else链
+  using BenchFn = std::function<void(const Settings&)>;
+  static const std::unordered_map<std::string, BenchFn> dispatchers = {
+    {"int:int",       [](const Settings& s){ RunCpuSortBenchmark<uint32_t, uint32_t>(s); }},
+    {"long:long",     [](const Settings& s){ RunCpuSortBenchmark<uint64_t, uint64_t>(s); }},
+    {"float:float",   [](const Settings& s){ RunCpuSortBenchmark<float, float>(s); }},
+    {"double:double", [](const Settings& s){ RunCpuSortBenchmark<double, double>(s); }},
+  };
+  auto it = dispatchers.find(type_key);
+  if (it != dispatchers.end()) {
+    auto wall_t0 = std::chrono::steady_clock::now();
+    it->second(s);
+    auto wall_t1 = std::chrono::steady_clock::now();
+    double wall_ms = std::chrono::duration<double, std::milli>(wall_t1 - wall_t0).count();
+    double throughput = s.num_elements / (wall_ms / 1000.0) / 1e6;
+    fprintf(stderr, "[AJB_BP][cpu_sort] wall=%.1fms throughput=%.1f Melems/s\n", wall_ms, throughput);
+  } else {
+    fprintf(stderr, "[AJB_WARN][cpu_sort] unknown type pair: %s\n", type_key.c_str());
   }
 
   return 0;

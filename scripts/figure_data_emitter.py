@@ -220,8 +220,24 @@ def aggregate(
         "steps": steps,
         "methods": methods,
     }
+    # AJB: outlier检测 — 标记均值±3σ之外的seed数据点
+    outlier_count = 0
+    for series_key, entry in methods.items():
+        for xi in range(len(steps)):
+            m = entry["mean"][xi]
+            s = entry["std"][xi]
+            if m is None or s is None or s == 0:
+                continue
+            for sk in entry:
+                if not sk.startswith("seed_"):
+                    continue
+                v = entry[sk][xi]
+                if v is not None and abs(v - m) > 3 * s:
+                    outlier_count += 1
+    if outlier_count > 0:
+        _ajb_log("WARN", f"detected {outlier_count} outlier points (>3σ)")
     _ajb_log("STATE", f"aggregate done: {len(methods)} methods, "
-              f"{len(steps)} x-points")
+              f"{len(steps)} x-points, {outlier_count} outliers")
     return result
 
 

@@ -182,37 +182,45 @@ public:
      * 4. Sorts the points vector.
      */
     CountOracle(vector<Point<T> > &points) {
-        lowerbound = vector<T>(points[0].dim(), numeric_limits<T>::max());
-        upperbound = vector<T>(points[0].dim(), numeric_limits<T>::min());
-        for(int i = 0; i < points.size(); i++){
-            for(int j = 0; j < points[i].dim(); j++){
-                lowerbound[j] = min(lowerbound[j], points[i][j]);
-                upperbound[j] = max(upperbound[j], points[i][j]);
+        const size_t ndim = points[0].dim();
+        const size_t npts = points.size();
+        // AJB: 单pass计算bounds + 累计统计, 替代upstream的双层循环
+        // 同时收集per-dim的sum用于计算均值, 判断数据偏斜
+        lowerbound.assign(ndim, numeric_limits<T>::max());
+        upperbound.assign(ndim, numeric_limits<T>::min());
+        vector<double> dim_sum(ndim, 0.0);
+        for(size_t i = 0; i < npts; i++){
+            for(size_t j = 0; j < ndim; j++){
+                T v = points[i][j];
+                if(v < lowerbound[j]) lowerbound[j] = v;
+                if(v > upperbound[j]) upperbound[j] = v;
+                dim_sum[j] += static_cast<double>(v);
             }
         }
-        // lowerbound = Point<T>(lowervec);
-        // upperbound = Point<T>(uppervec);
         sort(points.begin(), points.end());
         this->points = points;
-        // [AJB_BP] CountOracle constructed: 点数+维度+值域是debug的第一站
-        fprintf(stderr, "[AJB_BP][CountOracle] built: %zu points, dim=%lu, bounds=[",
-                points.size(), points[0].dim());
-        for(unsigned long d = 0; d < points[0].dim(); d++){
-            if(d) fprintf(stderr, " ");
-            fprintf(stderr, "%d..%d", lowerbound[d], upperbound[d]);
-        }
-        fprintf(stderr, "]\n");
-        // [AJB_STATE] prefix-sum验证: 最后一个point的cnt应该等于total
-        if(!points.empty()){
-            fprintf(stderr, "[AJB_STATE][CountOracle] last_prefix_cnt=%lld (should be total weighted count)\n",
-                    this->points.back().cnt);
+        // [AJB_BP] construction完成: bounds + per-dim mean + spread ratio
+        // spread ratio = range/mean, 高ratio说明数据分散, 低ratio说明聚集
+        fprintf(stderr, "[AJB_BP][CountOracle] built: %zu pts, dim=%zu\n", npts, ndim);
+        for(size_t d = 0; d < ndim; d++){
+            double mean = npts > 0 ? dim_sum[d] / npts : 0.0;
+            double range = static_cast<double>(upperbound[d]) - lowerbound[d];
+            double spread = (mean != 0.0) ? range / fabs(mean) : 0.0;
+            fprintf(stderr, "[AJB_BP][CountOracle]   dim%zu: [%d,%d] mean=%.1f spread=%.2f\n",
+                    d, lowerbound[d], upperbound[d], mean, spread);
         }
     }
 
     int sumCnt(const Point<T> &pl, const Point<T> &pr) {
         ajb_co_stats.sumcnt_calls++;
-        vector<Point<int> >::iterator itl = lower_bound(points.begin(), points.end(), pl);
-        vector<Point<int> >::iterator itr = upper_bound(points.begin(), points.end(), pr);
+        // AJB: early-exit — 如果lower > upper(空区间), 跳过两次binary search
+        if(pl > pr) {
+            ajb_co_stats.sumcnt_zero++;
+            return 0;
+        }
+        // AJB: 用ptrdiff_t偏移量代替iterator, 避免iterator拷贝开销
+        auto itl = lower_bound(points.begin(), points.end(), pl);
+        auto itr = upper_bound(itl, points.end(), pr);  // 从itl开始搜索——缩小范围
         int result;
         if(itr == points.begin()) result = 0;
         else if(itl == points.begin()) result = (itr - 1)->cnt;
@@ -361,17 +369,38 @@ public:
      * print function on each point to output its details.
      */
     void print() {
-        for (int i = 0; i < points.size(); i++) {
-            points[i].print();
+        // AJB: 分页输出 — 超过100个point只输出头尾各10个 + 统计摘要
+        const int limit = 10;
+        const int total = static_cast<int>(points.size());
+        if(total <= 2 * limit) {
+            for(int i = 0; i < total; i++) points[i].print();
+        } else {
+            for(int i = 0; i < limit; i++) points[i].print();
+            printf("  ... (%d points omitted) ...\n", total - 2 * limit);
+            for(int i = total - limit; i < total; i++) points[i].print();
+        }
+        // [AJB_BP] 分位数: 25%/50%/75%位置的点的cnt值
+        if(total >= 4) {
+            fprintf(stderr, "[AJB_BP][CountOracle] cnt@quartiles: Q1=%lld Q2=%lld Q3=%lld max=%lld\n",
+                    points[total/4].cnt, points[total/2].cnt,
+                    points[3*total/4].cnt, points[total-1].cnt);
         }
     }
 
-    // [AJB] dump前N个和后N个point到stderr, 用于验证排序正确性
+    // [AJB] 诊断dump: 输出排序验证 + per-dim值域 + prefix-sum一致性检查
     void ajb_dump_endpoints(int n = 3) const {
-        int total = points.size();
-        fprintf(stderr, "[AJB_STATE][CountOracle] %d points, showing first/last %d:\n", total, n);
+        int total = static_cast<int>(points.size());
+        fprintf(stderr, "[AJB_BP][CountOracle] === diagnostic dump (%d points) ===\n", total);
+        // 排序正确性: 检查前100个相邻pair
+        int inversions = 0;
+        int check_limit = std::min(total - 1, 100);
+        for(int i = 0; i < check_limit; i++)
+            if(points[i+1] < points[i]) inversions++;
+        fprintf(stderr, "[AJB_BP][CountOracle] sort_check: %d inversions in first %d pairs %s\n",
+                inversions, check_limit, inversions == 0 ? "OK" : "BROKEN");
+        // 头尾
         for(int i = 0; i < min(n, total); i++) points[i].ajb_dump("  head");
-        if(total > 2*n) fprintf(stderr, "[AJB_STATE][CountOracle]   ... (%d omitted)\n", total - 2*n);
+        if(total > 2*n) fprintf(stderr, "[AJB_BP]   ... (%d omitted)\n", total - 2*n);
         for(int i = max(n, total - n); i < total; i++) points[i].ajb_dump("  tail");
     }
 

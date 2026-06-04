@@ -363,17 +363,16 @@ private:
 
     
     long long getEmptyRight_NoCache(Bucket &B) {
-        // [AJB_TRACE] getEmptyRight_NoCache: 无缓存版本, 每次都重新Split
         if (B.AGM < 0) idx.setAGMandIters(B);
         if (B.getSplitDim() == B.getDim()) return 1 - B.AGM;
         
         vector<Bucket> children = idx.Split(B);
-        long long emptyright = children.size() > 0 ? getEmptyRight_NoCache(children[children.size() - 1]) : 0;
-
-        long long emptySize = B.AGM;
-        for(int i = 0; i < children.size(); i++) {
-            emptySize -= children[i].AGM;
-        }
+        // AJB: 将emptySize计算与最右子递归合并, 一次遍历完成
+        // upstream分两步: 先递归、再减法, 这里在同一循环中完成
+        long long child_agm_total = 0;
+        for(size_t i = 0; i < children.size(); i++) child_agm_total += children[i].AGM;
+        long long emptySize = B.AGM - child_agm_total;
+        long long emptyright = children.empty() ? 0 : getEmptyRight_NoCache(children.back());
 
         return emptySize + emptyright;
     }
@@ -510,6 +509,7 @@ private:
 
     bool RRAccess_NoCache(long long k, Bucket &B, long long offset = 0, int depth = 0) {
         if(depth > ajb_rrt_stats.max_depth) ajb_rrt_stats.max_depth = depth;
+        ajb_rrt_stats.record_depth(depth);
         if(B.getSplitDim() == B.getDim()){
             result = B.getLowerBound();
             ajb_rrt_stats.rraccess_hits++;
@@ -518,24 +518,45 @@ private:
         if(B.AGM < 0) idx.setAGMandIters(B);
         ajb_rrt_stats.nocache_splits++;
         vector<Bucket> children = move(idx.Split(B));
+        const int nc = static_cast<int>(children.size());
 
-        long long childAGM, temp = 0;
-        for(int i = 0; i < children.size(); i++) {
-            childAGM = children[i].AGM;
-            if(offset + temp + childAGM >= k){
-                bool res = RRAccess_NoCache(k, children[i], offset + temp, depth + 1);
-                if(i == children.size() - 1 && !res && trivialIntervals[numti - 1].second == offset + temp + childAGM) trivialIntervals[numti - 1].second = offset + B.AGM;
-                
+        // AJB: 当children数量较多时, 构建前缀和用二分定位k所在的child
+        // 避免O(n)线性扫描; 阈值=8是因为二分需要额外分配prefix数组
+        if(nc > 8) {
+            vector<long long> prefix(nc + 1, 0);
+            for(int i = 0; i < nc; i++) prefix[i + 1] = prefix[i] + children[i].AGM;
+            long long target = k - offset;
+            // 二分: 找到最小的i使得prefix[i+1] >= target
+            int lo = 0, hi = nc - 1;
+            while(lo < hi) {
+                int mid = lo + (hi - lo) / 2;
+                if(prefix[mid + 1] < target) lo = mid + 1;
+                else hi = mid;
+            }
+            if(lo < nc && offset + prefix[lo] + children[lo].AGM >= k) {
+                bool res = RRAccess_NoCache(k, children[lo], offset + prefix[lo], depth + 1);
+                if(lo == nc - 1 && !res && trivialIntervals[numti - 1].second == offset + prefix[lo] + children[lo].AGM)
+                    trivialIntervals[numti - 1].second = offset + B.AGM;
                 return res;
             }
-            else temp += childAGM;
+        } else {
+            long long temp = 0;
+            for(int i = 0; i < nc; i++) {
+                long long childAGM = children[i].AGM;
+                if(offset + temp + childAGM >= k){
+                    bool res = RRAccess_NoCache(k, children[i], offset + temp, depth + 1);
+                    if(i == nc - 1 && !res && trivialIntervals[numti - 1].second == offset + temp + childAGM)
+                        trivialIntervals[numti - 1].second = offset + B.AGM;
+                    return res;
+                }
+                temp += childAGM;
+            }
         }
         
         numti++;
         trivialIntervals[numti - 1].first = offset + B.AGM - getEmptyRight_NoCache(B) + 1;
         trivialIntervals[numti - 1].second = offset + B.AGM;
         ajb_rrt_stats.rraccess_misses++;
-        // [AJB_TRACE] NoCache miss: TI=[%lld, %lld] depth=%d
         
         return false;
     }
@@ -600,14 +621,16 @@ public:
         const unordered_map<string, vector<string> > &relations,
         const unordered_map<string, string> &filenames,
         const unordered_map<string, int> &numlines, bool treeflag = false) {
+        // AJB: 收集relation名时reserve, 避免push_back扩容
         vector<string> q_relations;
+        q_relations.reserve(relations.size());
         vector<vector<string> > q_variables;
-        for(unordered_map<string, vector<string> >::const_iterator it = relations.begin(); it != relations.end(); it++) {
+        q_variables.reserve(relations.size());
+        for(auto it = relations.begin(); it != relations.end(); it++) {
             q_relations.push_back(it->first);
-            // q_variables.push_back(it->second);
         }
         sort(q_relations.begin(), q_relations.end());
-        for(int i = 0; i < q_relations.size(); i++) {
+        for(size_t i = 0; i < q_relations.size(); i++) {
             q_variables.push_back(relations.at(q_relations[i]));
         }
         Query q(q_relations, q_variables);
@@ -615,9 +638,9 @@ public:
         idx.preProcessing(relations, filenames, numlines);
         AGM = idx.AGM();
         pool.newCopy(idx.FB);
-        // [AJB_BP] RRAccessTree ready: AGM是整个枚举空间的大小
-        fprintf(stderr, "[AJB_BP][RRAccessTree] constructed: AGM=%lld cacheHeightBound=%d\n", AGM, cacheHeightBound);
-        // cout << "AGM: " << AGM << endl;
+        // [AJB_BP] 枚举空间大小: AGM, 太大说明可能需要更多split轮数
+        fprintf(stderr, "[AJB_BP][RRAccessTree] ready: AGM=%lld rels=%zu cache_depth=%d\n",
+                AGM, relations.size(), cacheHeightBound);
     }
 
     /**
@@ -773,16 +796,23 @@ public:
 
 
     void print(RRAccessTreeNode* node, int depth = 0) {
-        for (int i = 0; i < depth; i++) cout << "| ";
-        if (!node){
-            cout << "NULL" << endl;
-            return;
+        // AJB: 迭代BFS替代递归DFS, 避免深树栈溢出
+        // 同时收集层统计: 每层的节点数和总AGM
+        struct Frame { RRAccessTreeNode* n; int d; };
+        vector<Frame> stack;
+        stack.push_back({node, depth});
+        int max_d = 0;
+        while(!stack.empty()) {
+            auto [cur, d] = stack.back(); stack.pop_back();
+            if(d > max_d) max_d = d;
+            for(int i = 0; i < d; i++) cout << "| ";
+            if(!cur) { cout << "NULL" << endl; continue; }
+            cur->print();
+            // 子节点逆序入栈, 保证从左到右输出
+            for(int i = static_cast<int>(cur->children_pointers.size()) - 1; i >= 0; i--)
+                stack.push_back({cur->children_pointers[i], d + 1});
         }
-        node->print();
-        for (int i = 0; i < node->children_pointers.size(); i++) {
-            print(node->children_pointers[i], depth + 1);
-        }
-        return;
+        fprintf(stderr, "[AJB_BP][RRAccessTree] print done, max_depth=%d\n", max_d);
     }
     
     void print() {

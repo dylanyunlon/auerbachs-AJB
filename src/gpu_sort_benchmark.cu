@@ -147,7 +147,23 @@ void RunGpuSortBenchmark(Settings& settings) {
   auto inv = std::adjacent_find(keys.begin(), keys.end(), [](const T& a, const T& b) { return b < a; });
   if (inv != keys.end()) {
     size_t pos = std::distance(keys.begin(), inv);
-    fprintf(stderr, "[ERROR] Run  // AJB: stderr代替stdoutGpuSortBenchmark: Invalid order at index %zu.\n", pos);
+    fprintf(stderr, "[AJB_FAIL][gpu_sort] inversion at %zu: keys[%zu]=%llu > keys[%zu]=%llu\n",
+            pos, pos, (unsigned long long)*inv, pos+1, (unsigned long long)*(inv+1));
+    // 上下文窗口: 前后各5个元素帮助定位pattern
+    size_t lo = pos > 5 ? pos - 5 : 0;
+    size_t hi = std::min(pos + 6, keys.size());
+    fprintf(stderr, "[AJB_FAIL][gpu_sort] context [%zu..%zu]:", lo, hi - 1);
+    for (size_t ci = lo; ci < hi; ci++)
+      fprintf(stderr, " %llu%s", (unsigned long long)keys[ci], (ci == pos) ? "<<" : "");
+    fprintf(stderr, "\n");
+  } else {
+    // [AJB_BP] sort验证通过: 输出首/中/尾key做sanity check
+    if (keys.size() >= 3) {
+      fprintf(stderr, "[AJB_BP][gpu_sort] PASSED: first=%llu mid=%llu last=%llu n=%zu\n",
+              (unsigned long long)keys.front(),
+              (unsigned long long)keys[keys.size()/2],
+              (unsigned long long)keys.back(), keys.size());
+    }
   }
 }
 
@@ -199,7 +215,14 @@ int main(int argc, char* argv[]) {
   }
 
   if (s.key_type == "int" && s.value_type == "int") {
+    fprintf(stderr, "[AJB_BP][gpu_sort] config: elements=%zu threads=%zu algo=%s seed=%u\n",
+            s.num_elements, s.num_threads, s.gpu_sort_algorithm.c_str(), s.random_seed);
+    auto t0 = std::chrono::steady_clock::now();
     RunGpuSortBenchmark<int, int>(s);
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    fprintf(stderr, "[AJB_BP][gpu_sort] done: wall=%.1fms throughput=%.1f Melems/s\n",
+            ms, s.num_elements / (ms / 1000.0) / 1e6);
   }
 
   return 0;

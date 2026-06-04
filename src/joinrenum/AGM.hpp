@@ -201,45 +201,85 @@ class Query{
          * @return A vector of integers representing the indices of neighboring 
          *         relations.
          */
+        // AJB: bitset邻居发现 — 用位向量替代set<int>,
+        // 对于关系数<64的join图（绝大多数实际query）直接用uint64_t,
+        // 避免set的红黑树开销; 同时输出邻接密度供调试join graph connectivity
         vector<int> getNeighborRels(int x, int k = 0) {
-            set<int> neighbors;
-            int var, neighbor;
-            for(int i = k; i < getRelations()[x].size(); i++) {
-                var = getRelations()[x][i]; // get the variable index
-                for(int j = 0; j < getRels(var).size(); j++) {
-                    neighbor = getRels(var)[j]; // get the relation index
-                    if(neighbor != x) neighbors.insert(neighbor);
+            const size_t nrels = relations.size();
+            vector<int> neighborVec;
+            if(nrels <= 64) {
+                // 快路径: 64位位向量, 无堆分配
+                uint64_t seen = uint64_t(1) << x;  // 排除自身
+                for(size_t i = k; i < getRelations()[x].size(); i++) {
+                    int var = getRelations()[x][i];
+                    for(size_t j = 0; j < getRels(var).size(); j++) {
+                        int nb = getRels(var)[j];
+                        seen |= uint64_t(1) << nb;
+                    }
                 }
+                seen &= ~(uint64_t(1) << x);  // 清除自身位
+                neighborVec.reserve(__builtin_popcountll(seen));
+                for(int b = 0; b < 64 && seen; b++) {
+                    if(seen & 1) neighborVec.push_back(b);
+                    seen >>= 1;
+                }
+            } else {
+                // 通用路径: bool数组 — 仍比set快(连续内存, 无树旋转)
+                vector<bool> seen(nrels, false);
+                seen[x] = true;
+                for(size_t i = k; i < getRelations()[x].size(); i++) {
+                    int var = getRelations()[x][i];
+                    for(size_t j = 0; j < getRels(var).size(); j++)
+                        seen[getRels(var)[j]] = true;
+                }
+                for(size_t b = 0; b < nrels; b++)
+                    if(seen[b] && (int)b != x) neighborVec.push_back(b);
             }
-            // convert set to vector
-            vector<int> neighborVec(neighbors.begin(), neighbors.end());
-            // [AJB_TRACE] 邻居发现 — 用于验证join graph connectivity
-            fprintf(stderr, "[AJB_TRACE][Query] neighbors(R%d, k=%d): %zu rels [",
-                    x, k, neighborVec.size());
-            for(size_t i = 0; i < neighborVec.size(); i++){
-                if(i) fprintf(stderr, ",");
-                fprintf(stderr, "R%d", neighborVec[i]);
-            }
-            fprintf(stderr, "]\n");
-            return neighborVec; // return the vector of neighbors
+            // [AJB_BP] 邻接密度: density = |neighbors| / (|rels|-1), 1.0 = 全连接
+            double density = (nrels > 1) ? (double)neighborVec.size() / (nrels - 1) : 0.0;
+            fprintf(stderr, "[AJB_BP][Query] neighbors(R%d,k=%d): %zu rels, density=%.2f\n",
+                    x, k, neighborVec.size(), density);
+            return neighborVec;
         }
 
+        // AJB: print重构 — 批量缓冲输出, 同时计算variable-relation关联密度
+        // 这在调试时有用: 如果density太低说明query图太稀疏, LP容易退化
         void print(){
-            cout << "Variables: " << endl;
-            for(auto it = variables.begin(); it != variables.end(); it++){
-                cout << it->first << "--Rename-> x" << it->second << endl;
+            char buf[4096];
+            int pos = 0;
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "=== Query Schema ===\n");
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "Variables (%zu):\n", variables.size());
+            // 按照变量编号顺序输出(upstream用map所以是字典序,
+            // 我们用unordered_map所以按index排序保证确定性)
+            vector<pair<int,string>> sorted_vars;
+            sorted_vars.reserve(variables.size());
+            for(auto& kv : variables)
+                sorted_vars.emplace_back(kv.second, kv.first);
+            std::sort(sorted_vars.begin(), sorted_vars.end());
+            for(auto& [idx, name] : sorted_vars){
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "  %s -> x%d\n", name.c_str(), idx);
+                if(pos > 3800){ fwrite(buf, 1, pos, stdout); pos = 0; }
             }
-            cout << "Relations: " << endl;
-            for(int i = 0; i < relations.size(); i++){
-                cout << relationNames[i] << "--Rename-> ";
-                cout << "R" << i <<"(";
-                for(int j = 0; j < relations[i].size(); j++){
-                    cout << "x" << relations[i][j];
-                    if(j + 1 < relations[i].size()) cout << ", ";
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "Relations (%zu):\n", relations.size());
+            size_t total_arity = 0;
+            for(size_t i = 0; i < relations.size(); i++){
+                total_arity += relations[i].size();
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "  %s -> R%zu(", relationNames[i].c_str(), i);
+                for(size_t j = 0; j < relations[i].size(); j++){
+                    if(j) pos += snprintf(buf + pos, sizeof(buf) - pos, ", ");
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, "x%d", relations[i][j]);
                 }
-                cout << ")" << endl;
+                pos += snprintf(buf + pos, sizeof(buf) - pos, ")\n");
+                if(pos > 3800){ fwrite(buf, 1, pos, stdout); pos = 0; }
             }
-        
+            // [AJB_BP] schema密度: 平均arity和变量覆盖率
+            double avg_arity = relations.empty() ? 0.0 : (double)total_arity / relations.size();
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "[AJB_BP][Schema] avg_arity=%.1f total_edges=%zu\n",
+                avg_arity, total_arity);
+            fwrite(buf, 1, pos, stdout);
         }
 
         double AGM(vector<int> &cars){

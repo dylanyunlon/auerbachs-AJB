@@ -220,18 +220,21 @@ int main() {
     
     end = std::chrono::high_resolution_clock::now();
     elapsed = end - start;
-    cout << cntsuccess << ", " << cnt << ", " << bp.remaining() << ", " << bp.getPercentage() << ", " << elapsed.count() << endl;
+    // AJB: 最终统计用fprintf一次写出, 避免cout链的多次刷新
+    double throughput = elapsed.count() > 0.0 ? cntsuccess / elapsed.count() : 0.0;
+    double success_rate = cnt > 0 ? 100.0 * cntsuccess / cnt : 0.0;
+    fprintf(stdout, "%d, %d, %lld, %f, %f\n",
+            cntsuccess, cnt, (long long)bp.remaining(), bp.getPercentage(), elapsed.count());
 
     printInfo(idx);
 
-    // upstream: additional output (preserved comments)
-    // idx.printBucketTree(idx.getFullBucket());
-    // cout << cntsuccess + 1 << ", " << cnt << ", " << elapsed.count() << endl;
-    // cout << "Success: " << cntsuccess << " Total: " << cnt << endl;
-    // cout << "Total: " << bp.getTotal() << endl;
-
-    fprintf(stderr, "[AJB_TIMER] REnum-BMITU total: %.3fs, %d successes / %d probes\n",
-            elapsed.count(), cntsuccess, cnt);
+    // [AJB_BP] 最终性能摘要: throughput + success_rate是调参的主要指标
+    fprintf(stderr, "[AJB_BP] === FINAL SUMMARY ===\n");
+    fprintf(stderr, "[AJB_BP] successes=%d probes=%d success_rate=%.1f%%\n",
+            cntsuccess, cnt, success_rate);
+    fprintf(stderr, "[AJB_BP] wall=%.3fs throughput=%.1f results/s\n",
+            elapsed.count(), throughput);
+    fprintf(stderr, "[AJB_TIMER] REnum-BMITU total: %.3fs\n", elapsed.count());
     fprintf(stderr, "[AJB] test.cpp COMPLETE\n");
     return 0;
 }

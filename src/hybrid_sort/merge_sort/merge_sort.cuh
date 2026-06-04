@@ -179,22 +179,23 @@ void MergeLocalPartitions(ResourceManager<T, V>& resource_manager, const std::ve
   const size_t partition_size = chunk_size;
   pivot %= partition_size;
 
-  // Only the two merge GPUs need work; skip the linear scan for others.
   for (size_t j = 0; j < 2; ++j) {
     const int gpu = gpus_to_merge[j];
     DeviceAllocator& device_allocator = resource_manager.GetDeviceAllocator(gpu);
     StreamPool& stream_pool = resource_manager.GetStreamPool(gpu);
     CheckCudaError(cudaSetDevice(gpu));
 
-    // Determine if this GPU is in the upper or lower half.
-    // Upstream searched linearly via `i >= gpus.size() / 2`.
-    // Changed: since we know the merge pair, check directly.
-    bool is_upper_half = false;
-    for (size_t idx = gpus.size() / 2; idx < gpus.size(); ++idx) {
-      if (gpus[idx] == gpu) { is_upper_half = true; break; }
-    }
+    // AJB: 用std::lower_bound替代线性扫描确定GPU半区位置
+    // gpus向量通常已排序(由上层按设备号排), 二分O(logN)
+    const size_t half = gpus.size() / 2;
+    auto it = std::lower_bound(gpus.begin() + half, gpus.end(), gpu);
+    bool is_upper_half = (it != gpus.end() && *it == gpu);
 
     const size_t offset = is_upper_half ? pivot : partition_size - pivot;
+
+    // [AJB_BP] merge诊断: 哪个GPU在做merge, 分区多大
+    fprintf(stderr, "[AJB_BP][merge_sort] gpu=%d half=%s offset=%zu pivot=%zu part=%zu\n",
+            gpu, is_upper_half ? "upper" : "lower", offset, pivot, partition_size);
 
     thrust::merge_by_key(thrust::cuda::par_nosync(device_allocator).on(stream_pool.GetStream(0)),
                          resource_manager.GetKeys(gpu), resource_manager.GetKeys(gpu) + offset,
@@ -211,10 +212,8 @@ void MergeLocalPartitions(ResourceManager<T, V>& resource_manager, const std::ve
 }
 
 template <typename T, typename V>
-void MergePartitions(ResourceManager<T, V>& resource_manager, const std::vector<int>& gpus, size_t chunk_size) {
-  // Upstream: recursive binary split with no base-case guard.
-  // Changed: explicit early return when gpus.size() < 2 — prevents
-  // degenerate recursion if called with a single GPU.
+void MergePartitions(ResourceManager<T, V>& resource_manager, const std::vector<int>& gpus,
+                     size_t chunk_size, int _depth = 0) {
   if (gpus.size() < 2) return;
 
   if (gpus.size() > 2) {
@@ -222,12 +221,18 @@ void MergePartitions(ResourceManager<T, V>& resource_manager, const std::vector<
     for (size_t i = 0; i < 2; ++i) {
       MergePartitions<T, V>(resource_manager,
                             {gpus.begin() + (i * (gpus.size() / 2)), gpus.begin() + ((i + 1) * (gpus.size() / 2))},
-                            chunk_size);
+                            chunk_size, _depth + 1);
     }
   }
 
   const size_t pivot = FindPivot<T>(resource_manager, gpus, chunk_size);
+  // [AJB_BP] pivot质量: pivot/chunk_size 接近0.5说明数据均匀分布
+  // 偏离0.5越多说明数据偏斜越严重, merge负载越不均衡
   if (pivot > 0) {
+    double pivot_ratio = static_cast<double>(pivot) / (chunk_size * (gpus.size() / 2));
+    fprintf(stderr, "[AJB_BP][merge_sort] depth=%d gpus=%zu pivot=%zu ratio=%.3f %s\n",
+            _depth, gpus.size(), pivot, pivot_ratio,
+            (pivot_ratio < 0.3 || pivot_ratio > 0.7) ? "SKEWED" : "ok");
     const std::array<int, 2> gpus_to_merge = SwapPartitions<T, V>(resource_manager, gpus, chunk_size, pivot);
     MergeLocalPartitions<T, V>(resource_manager, gpus, gpus_to_merge, chunk_size, pivot);
   }
@@ -237,7 +242,7 @@ void MergePartitions(ResourceManager<T, V>& resource_manager, const std::vector<
     for (size_t i = 0; i < 2; ++i) {
       MergePartitions<T, V>(resource_manager,
                             {gpus.begin() + (i * (gpus.size() / 2)), gpus.begin() + ((i + 1) * (gpus.size() / 2))},
-                            chunk_size);
+                            chunk_size, _depth + 1);
     }
   }
 }

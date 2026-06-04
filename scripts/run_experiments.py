@@ -86,19 +86,32 @@ if __name__ == "__main__":
             output_file.write(f"{','.join(quoted_columns)}\n")
 
         for index, arguments in enumerate(experiment.arguments):
-            command = f"numactl -m 0 {executable_path / experiment.executable}"
+            # AJB: 用列表构建命令代替字符串拼接——更安全, 无shell injection
+            cmd_parts = ["numactl", "-m", "0",
+                         str(executable_path / experiment.executable)]
 
             for (parameter, argument) in zip(experiment.parameters, arguments):
                 if isinstance(argument, bool):
-                    command += f" {parameter}" if argument else f""
+                    if argument:
+                        cmd_parts.append(parameter)
                 else:
-                    command += f" {parameter} {argument}"
+                    cmd_parts.extend([parameter, str(argument)])
+
+            command = " ".join(cmd_parts)
 
             for repetition in range(experiment.repetitions):
-                # AJB: per-repetition progress
+                # AJB: per-repetition进度 + ETA估算
+                done_reps = index * experiment.repetitions + repetition
+                total_reps = len(experiment.arguments) * experiment.repetitions
+                if elapsed_times and done_reps > 0:
+                    avg_per_rep = sum(elapsed_times) / max(len(elapsed_times), 1) / max(experiment.repetitions, 1)
+                    remaining = (total_reps - done_reps) * avg_per_rep
+                    eta_str = f" ETA={remaining:.0f}s"
+                else:
+                    eta_str = ""
                 print_info(InfoType.AJB_TRACE,
                            f"  config {index+1}/{len(experiment.arguments)} "
-                           f"rep {repetition+1}/{experiment.repetitions}")
+                           f"rep {repetition+1}/{experiment.repetitions}{eta_str}")
 
                 output = subprocess.run(command,
                                         stdout=subprocess.PIPE,

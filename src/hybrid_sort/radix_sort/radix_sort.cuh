@@ -1041,9 +1041,29 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 }
 
 
-// Sort validation: uses ajb_validate_sorted from ajb_debug_infra.cuh
-// Wraps the template for backward compatibility with existing call sites.
+// Sort validation with context-window dump on failure
+// 当发现inversion时, 输出前后各5个元素帮助定位bug
 template <typename T>
 static inline bool validate_sort_output(const T* keys, size_t n, size_t sample_stride = 1000) {
-    return ajb_validate_sorted("radix_sort", keys, n, sample_stride);
+    if (n < 2) return true;
+    for (size_t i = 0; i < n - 1; i += sample_stride) {
+        if (keys[i] > keys[i + 1]) {
+            fprintf(stderr, "[AJB_FAIL][radix_sort] inversion at i=%zu: keys[i]=%llu > keys[i+1]=%llu\n",
+                    i, (unsigned long long)keys[i], (unsigned long long)keys[i+1]);
+            // 上下文窗口: [i-5, i+5]
+            size_t lo = i > 5 ? i - 5 : 0;
+            size_t hi = std::min(i + 6, n);
+            fprintf(stderr, "[AJB_FAIL][radix_sort] context [%zu..%zu]:", lo, hi - 1);
+            for (size_t j = lo; j < hi; j++) {
+                fprintf(stderr, " %llu%s", (unsigned long long)keys[j], (j == i) ? "<<INV" : "");
+            }
+            fprintf(stderr, "\n");
+            return false;
+        }
+    }
+    // 全量检查最后segment(stride采样可能跳过尾部inversion)
+    for (size_t i = (n > sample_stride ? n - sample_stride : 0); i < n - 1; i++) {
+        if (keys[i] > keys[i + 1]) return false;
+    }
+    return true;
 }

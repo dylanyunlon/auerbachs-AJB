@@ -434,20 +434,34 @@ class Index {
             }
         }
 
+        // AJB: treeUpp with overflow-safe乘法 — 提前检测乘积溢出
+        // upstream的连乘如果中间结果>2^63会静默溢出给出错误的AGM bound
         long long treeUpp(const vector<pair<int, int> > &bound, const vector<int> &pos, const vector<int> &countRels) {
             long long res = 1;
-            for(size_t i : countRels) res *= treeBound[i][bound[i].first + pos[i]] - treeBound[i][bound[i].first];
+            for(size_t i : countRels) {
+                long long factor = treeBound[i][bound[i].first + pos[i]] - treeBound[i][bound[i].first];
+                if(factor == 0) return 0;  // early-exit: 任一因子为0则乘积为0
+                // overflow guard: 如果res * factor会溢出, 截断到LLONG_MAX
+                if(res > 0 && factor > LLONG_MAX / res) return LLONG_MAX;
+                res *= factor;
+            }
             return res;
         }
 
         long long treeUpp(const vector<pair<int, int> > &bound, const vector<int> &countRels) {
             long long res = 1;
-            for(size_t i : countRels) res *= treeBound[i][bound[i].second] - treeBound[i][bound[i].first];
+            for(size_t i : countRels) {
+                long long factor = treeBound[i][bound[i].second] - treeBound[i][bound[i].first];
+                if(factor == 0) return 0;
+                if(res > 0 && factor > LLONG_MAX / res) return LLONG_MAX;
+                res *= factor;
+            }
             return res;
         }
 
         vector<CountOracle<int>* > getCountOracles() {
             vector<CountOracle<int>* > CO;
+            CO.reserve(tables.size());  // AJB: 预分配, 避免push_back扩容
             for(size_t i = 0; i < tables.size(); i++) {
                 CO.push_back(&tables[i].rt);
             }
@@ -484,16 +498,22 @@ class Index {
         void setAGMandIters(Bucket &B, const vector<pair<vector<Point<int> >::iterator, vector<Point<int> >::iterator> >& iters = {}) {
             int relnum = R.size();
             auto ajb_agm_t0 = std::chrono::steady_clock::now();
-            if(B.iters.size() != relnum) B.iters = vector<pair<int, int> >(relnum);
+            if((int)B.iters.size() != relnum) B.iters.resize(relnum);
             vector<int> cardinalities(relnum, 0);
-            vector<int> lower_bound = {};
-            vector<int> upper_bound = {};
-            for(size_t i = 0; i < relnum; i++) {
-                
-                lower_bound = vector<int>(R[i].size(), 0);
-                upper_bound = vector<int>(R[i].size(), 0);
-                
-                for(size_t j = 0; j < R[i].size(); j++) {
+            // AJB: 预分配bound向量, 在循环中resize+填充, 避免每次new
+            vector<int> lower_bound, upper_bound;
+            size_t max_arity = 0;
+            for(int i = 0; i < relnum; i++) max_arity = std::max(max_arity, R[i].size());
+            lower_bound.reserve(max_arity);
+            upper_bound.reserve(max_arity);
+
+            long long card_sum = 0;
+            int card_max = 0, card_min = INT_MAX;
+            for(int i = 0; i < relnum; i++) {
+                size_t arity = R[i].size();
+                lower_bound.resize(arity);
+                upper_bound.resize(arity);
+                for(size_t j = 0; j < arity; j++) {
                     lower_bound[j] = B.lowerBound[R[i][j]];
                     upper_bound[j] = B.upperBound[R[i][j]];
                 }
@@ -501,22 +521,24 @@ class Index {
                 if(iters.size() > 0) B.iters[i] = tables[i].rt.getRange(lower_bound, upper_bound, iters[i].first, iters[i].second);
                 else B.iters[i] = tables[i].rt.getRange(lower_bound, upper_bound);
                 cardinalities[i] = B.iters[i].second - B.iters[i].first;
+                card_sum += cardinalities[i];
+                card_max = std::max(card_max, cardinalities[i]);
+                if(cardinalities[i] < card_min) card_min = cardinalities[i];
             }
             double ans = q.AGM(cardinalities);
             B.AGM = agm_upper(ans);
-            if(treeflag && B.splitDim < jt.countRels.size())B.AGM = min(B.AGM, treeUpp(B.iters, jt.countRels[B.splitDim]));
-            // B.AGM = min(B.AGM, jt.treeUpp(B.splitDim, B.iters));
+            if(treeflag && B.splitDim < (int)jt.countRels.size())
+                B.AGM = min(B.AGM, treeUpp(B.iters, jt.countRels[B.splitDim]));
             auto ajb_agm_t1 = std::chrono::steady_clock::now();
             ajb_idx_stats.agm_total_ms += std::chrono::duration<double, std::milli>(ajb_agm_t1 - ajb_agm_t0).count();
-            // [AJB_TRACE] setAGMandIters: periodic cardinality vector dump
+            // [AJB_BP] cardinality偏斜检测: 如果max/min > 100x, 说明数据高度不均衡
+            // 这通常导致split效率低下, 是性能瓶颈的信号
+            ajb_idx_stats.set_agm_calls++;
             if(ajb_idx_stats.set_agm_calls % 5000 == 0 && ajb_idx_stats.set_agm_calls > 0) {
-                fprintf(stderr, "[AJB_TRACE][Index] setAGMandIters[%lld]: AGM=%lld cards=[",
-                        ajb_idx_stats.set_agm_calls, B.AGM);
-                for(int i = 0; i < relnum; i++) {
-                    if(i) fprintf(stderr, ",");
-                    fprintf(stderr, "%d", cardinalities[i]);
-                }
-                fprintf(stderr, "] splitDim=%d\n", B.splitDim);
+                double skew = (card_min > 0) ? (double)card_max / card_min : -1.0;
+                double avg = (relnum > 0) ? (double)card_sum / relnum : 0.0;
+                fprintf(stderr, "[AJB_BP][Index] setAGM[%lld]: AGM=%lld avg_card=%.0f skew=%.1f splitDim=%d\n",
+                        ajb_idx_stats.set_agm_calls, B.AGM, avg, skew, B.splitDim);
             }
             return;
         }

@@ -61,6 +61,19 @@ class HostContainers {
     if (next_index < max_histograms_per_gpu_) {
       histogram_maps_[i].emplace(bucket_id, next_index);
       ++next_index;
+    } else {
+      // [AJB_BP] histogram缓冲区耗尽: gpu需要更大的pre-alloc
+      fprintf(stderr, "[AJB_WARN][HostContainers] gpu=%d histogram overflow: used=%zu max=%zu\n",
+              gpu, next_index, max_histograms_per_gpu_);
+    }
+  }
+
+  // [AJB_BP] 每个GPU的histogram分配总结
+  void DumpAllocation() const {
+    for (size_t g = 0; g < gpus_.size(); ++g) {
+      fprintf(stderr, "[AJB_BP][HostContainers] gpu=%d assigned=%zu/%zu util=%.1f%%\n",
+              gpus_[g], next_histogram_index_[g], max_histograms_per_gpu_,
+              100.0 * histogram_utilization(gpus_[g]));
     }
   }
 
