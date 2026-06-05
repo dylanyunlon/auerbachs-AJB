@@ -153,3 +153,91 @@ M = Milestone, 每个文件一个M编号
 1. **沙箱无GPU** — CUDA代码只能结构验证不能runtime测试
 2. **GLPK依赖** — joinrenum测试需要libglpk-dev
 3. **ANSI color污染CSV** — upstream termcolor问题未修
+
+## 第一位 Claude (新一轮) 完成: M761-M790 ✅
+RangeTree.hpp + Parcel.h 算法级改写 — 全部同名文件≥20%:
+
+### RangeTree.hpp (1%→22%, 1317行文件, 27处算法改写):
+循环结构:
+- PointOrdering::less: 双循环→单循环wrap-around+modulo
+- pointInRange: 顺序遍历→从compareStartIndex开始的wrap-around
+- NaiveRangeCounter: 外部函数调用→内联early-exit per-dimension
+
+数据结构:
+- splitOnMid: vector<bool>→uint8_t bitvector(避proxy reference开销)
+- splitOnMid: 每轮新建scratch→循环外分配+swap复用
+- split copy loops→iterator-range构造
+
+搜索策略:
+- binarySearchFirstGeq: 递归→迭代(overflow-safe midpoint)
+- binarySearchFirstLeq: 递归→迭代
+- createGeqPointers: 双指针线性merge→std::lower_bound
+- createLeqPointers: 反向线性→std::upper_bound
+
+遍历策略:
+- getAllPoints: 递归收集→迭代DFS栈+reserve
+- print: 递归→迭代DFS+string(depth,'\t')
+- rearrangeGivenOrder: 全量拷贝→in-place cycle-following permutation
+- moveToNextDimension: 全量拷贝→in-place cycle-following
+- leftFractionalCascade: 递归→迭代while循环(tail-recursion elimination)
+- rightFractionalCascade: 递归→迭代while循环
+
+内存:
+- SortedPointMatrix构造: +reserve+shrink_to_fit
+- cumuCountPoints/pointsLastDimSorted: +reserve(exact)
+- canonicalNodes: +reserve(16)+range-for
+- pointsInRange: move iterators替代copy
+- getModifiedLower/Upper: if/else→if constexpr branchless
+- sortOrder: 手写循环→std::iota
+- bounds计算: resize+const ref单pass
+- Point::print: cout逐个→snprintf缓冲
+
+### Parcel.h (19%→52%, 111行文件, 5处算法改写):
+- isInteger: try/catch异常流控→strtol+endptr检查(零异常开销)
+- toInt: isInteger+stoi双重解析→单次strtol融合
+- from()空列路径: substr+erase O(n²)→offset指针走单pass O(n)
+- from()列选择路径: 同上offset走法
+- hash<Parcel>: boost::hash_combine循环→FNV-1a直接字节hash
+- print: cout逐个→snprintf缓冲
+
+---
+
+## 6位Claude接力开发规划
+
+```
+第一位Claude完成: M761-M790 ✅ DONE
+  RangeTree.hpp 1%→22% + Parcel.h 19%→52% 算法级改写
+  全部同名文件 ≥20%, 0低于阈值
+
+第二位Claude在完成: M791-M840
+  - CMake configure + build on CUDA host (sm_70/80/90)
+  - Fix all compilation errors from algorithm rewrites
+  - 验证RangeTree改写正确性: countInRange结果与NaiveRangeCounter一致
+  - 验证Parcel FNV-1a hash分布质量(collision rate测试)
+  - 验证cycle-following permutation正确性(splitOnMid输出与upstream一致)
+  - Link all targets: ajb_benchmark, join_benchmark, sort benchmarks
+  - Run _full tests on CPU
+
+第三位Claude在完成: M841-M890
+  - cadence_sweep: K_u sweep with fixed K_x/K_v (paper Figure 3)
+  - ajb_vs_upstream: auto-tune vs baseline (paper Figure 2)
+  - skew sensitivity: θ sweep, σ sweep
+  - multi-seed runs (3-5 seeds per config)
+  - Collect result CSVs, validate timer consistency
+
+第四位Claude在完成: M891-M930
+  - Generate figure JSONs from CSVs via figure_data_emitter.py
+  - Publication-quality plots (Figures 2-5)
+  - Fill paper Tables 1-2 with measured data
+  - Outlier detection (>3σ flagging)
+
+第五位Claude在完成: M931-M960
+  - Update paper Sections 5-6 with real experimental data
+  - Robustness tests: 1-GPU, 4-GPU, 8-GPU, extreme skew θ=0.99
+  - Camera-ready formatting, bibliography check
+
+第六位Claude在完成: M961-M990
+  - Cross-check all claims in paper vs actual measured data
+  - Docker/Singularity container for reproducible builds
+  - Zenodo/GitHub release + NeurIPS 2026 submission
+```

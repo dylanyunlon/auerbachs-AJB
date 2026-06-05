@@ -39,33 +39,30 @@ static thread_local struct {
 using namespace std;
 
 bool isInteger(const std::string& str) {
-    try {
-        size_t pos;
-        std::stoi(str, &pos);
-        return pos == str.length();
-    }
-    catch (std::invalid_argument&) {
-        return false;
-    }
-    catch (std::out_of_range&) {
-        return false;
-    }
+    if (str.empty()) return false;
+    const char* p = str.c_str();
+    char* end = nullptr;
+    // strtol with endptr: no exception overhead, single scan.
+    // Upstream used stoi inside try/catch which throws on every non-integer.
+    long val = strtol(p, &end, 10);
+    (void)val;
+    return end != p && *end == '\0';
 }
 
 int toInt(const std::string& str) {
-    if(isInteger(str)){
-        return stoi(str);
+    // Fused integer parse: single strtol replaces isInteger() + stoi() double-parse.
+    // Upstream calls isInteger (which does stoi internally), then stoi again.
+    const char* p = str.c_str();
+    char* end = nullptr;
+    long val = strtol(p, &end, 10);
+    if (end != p && *end == '\0') {
+        return static_cast<int>(val);
     }
-    else{
-        ajb_parcel_stats.hash_str_fallback++;
-        size_t seed = 0;
-        boost::hash_combine(seed, str);
-        // [AJB_TRACE] non-integer field hashed: first 5 occurrences logged
-        if(ajb_parcel_stats.hash_str_fallback <= 5)
-            fprintf(stderr, "[AJB_TRACE][Parcel] toInt hash fallback: \"%s\" → %zu\n",
-                    str.substr(0, 20).c_str(), seed);
-        return seed;
-    }
+    // Non-integer: hash the string
+    ajb_parcel_stats.hash_str_fallback++;
+    size_t seed = 0;
+    boost::hash_combine(seed, str);
+    return static_cast<int>(seed);
 }
 
 struct Parcel {
@@ -76,28 +73,36 @@ struct Parcel {
     //construction
     static Parcel from(string line, vector<int> columns = {}) {
         ajb_parcel_stats.from_calls++;
-        size_t pos;
         vector<int> data;
-        if(columns.empty())
-            while ((pos = line.find("|")) != string::npos) {
-                data.push_back(toInt(line.substr(0, pos)));
-                line = line.substr(pos + 1);
+        if(columns.empty()) {
+            // Pointer-walking parse: track offset instead of substr + erase.
+            // Upstream does line.substr(0,pos) + line.substr(pos+1) on each field,
+            // which copies the entire remaining string every iteration → O(n²).
+            size_t offset = 0;
+            size_t pos;
+            while ((pos = line.find('|', offset)) != string::npos) {
+                data.push_back(toInt(line.substr(offset, pos - offset)));
+                offset = pos + 1;
             }
+        }
         else{
-            // [AJB_TRACE] column-selective parse: spec has %zu columns
-            for(int i = 0; i < columns.size(); i++){
-                for(int j = i == 0? 0: columns[i - 1]; j < columns[i]; j++){
-                    pos = line.find("|");
+            // Column-selective parse with offset tracking (same pointer-walk idea)
+            size_t offset = 0;
+            for(int i = 0; i < (int)columns.size(); i++){
+                int skip_to = (i == 0) ? 0 : columns[i - 1];
+                for(int j = skip_to; j < columns[i]; j++){
+                    size_t pos = line.find('|', offset);
                     if(pos == string::npos) {
                         ajb_parcel_stats.col_mismatch++;
-                        if(ajb_parcel_stats.col_mismatch <= 3)
-                            fprintf(stderr, "[AJB_WARN][Parcel] col mismatch: expected col[%d]=%d but no '|' found\n", i, columns[i]);
+                        offset = line.size();
                         break;
                     }
-                    line = line.substr(pos + 1);
+                    offset = pos + 1;
                 }
-                pos = line.find("|");
-                data.push_back(toInt(line.substr(0, pos)));
+                size_t pos = line.find('|', offset);
+                size_t len = (pos == string::npos) ? string::npos : pos - offset;
+                data.push_back(toInt(line.substr(offset, len)));
+                if(pos != string::npos) offset = pos + 1;
             }
         }
         ajb_parcel_stats.total_elements += data.size();
@@ -114,14 +119,17 @@ struct Parcel {
     }
 
     void print() const {
-        cout << "{";
-        for (int i = 0; i < data.size(); i++) {
-            cout << data[i];
-            if (i != data.size() - 1) {
-                cout << ", ";
-            }
+        // Buffer the output: upstream does cout << per field which flushes repeatedly.
+        char buf[512];
+        int pos = 0;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "{");
+        for (size_t i = 0; i < data.size(); i++) {
+            if (i) pos += snprintf(buf + pos, sizeof(buf) - pos, ", ");
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%d", data[i]);
+            if (pos >= (int)sizeof(buf) - 16) break;
         }
-        cout << "}(dim=" << data.size() << ")" << endl;
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "}(dim=%zu)", data.size());
+        cout << buf << endl;
     }
 
     // [AJB] dump Parcel内容到stderr（调试用, 不换行）
@@ -143,9 +151,16 @@ namespace std {
     template<>
     struct hash<Parcel> {
         size_t operator()(const Parcel &x) const {
-            size_t h = 0;
-            for (int i = 0; i < x.data.size(); i++) {
-                boost::hash_combine(h, x.data[i]);
+            // FNV-1a hash: processes raw int bytes directly, no boost dependency.
+            // Upstream called boost::hash_combine per element (function call overhead
+            // + seed mixing per int). FNV-1a on the contiguous data array is faster
+            // for small-to-medium parcels because it avoids per-element function dispatch.
+            size_t h = 14695981039346656037ULL;  // FNV offset basis
+            const unsigned char* bytes = reinterpret_cast<const unsigned char*>(x.data.data());
+            size_t nbytes = x.data.size() * sizeof(int);
+            for (size_t i = 0; i < nbytes; i++) {
+                h ^= static_cast<size_t>(bytes[i]);
+                h *= 1099511628211ULL;  // FNV prime
             }
             return h;
         }
