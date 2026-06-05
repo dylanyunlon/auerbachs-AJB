@@ -122,6 +122,11 @@ public:
             vec.begin(), vec.end(), p.vec.begin(), p.vec.end());
     }
 
+    // AJB: operator> needed by sumCnt range validation
+    bool operator > (const Point<T>& p) const {
+        return p < *this;
+    }
+
 
     /**
      * Prints the point to standard out.

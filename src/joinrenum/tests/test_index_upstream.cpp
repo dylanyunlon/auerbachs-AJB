@@ -1,6 +1,8 @@
 #include <bits/stdc++.h>
 #include "Index.hpp"
 #include "ReadConfig.hpp"
+#define BINARY_SEARCH_NO_MAIN
+#include "BinarySearch.cpp"
 
 void printVector(const vector<int>& vec) {
     for (const auto& val : vec) {
@@ -86,12 +88,12 @@ int main() {
     auto start = clock();
     int mismatch = 0;
     for(int i = 0; i < halfTime; i++) {
-        int b = MultiHeadBinarySearch(veciters, flag, test[i], q);
+        int b = MultiHeadBinarySearch(veciters, test[i]);
         (void)b;
     }
     for(int i = halfTime; i < testTime; i++) {
-        int b_vec = MultiHeadBinarySearch(veciters, flag, test[i], q);
-        int b_col = MultiHeadBinarySearch(coliters, flag, test[i], q);
+        int b_vec = MultiHeadBinarySearch(veciters, test[i]);
+        int b_col = MultiHeadBinarySearch(coliters, test[i]);
         if(b_vec != b_col) mismatch++;
     }
     auto end = clock();

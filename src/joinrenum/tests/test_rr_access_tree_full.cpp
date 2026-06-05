@@ -99,19 +99,14 @@ int main() {
     for (int idx = 0; idx < (int)agm; idx++) {
         int rank = access_order[idx];
         auto ta = chrono::steady_clock::now();
-        pair<bool, vector<int>> res = tree.RRAccess(rank);
+        bool res = tree.RRAccess(rank);
         auto tb = chrono::steady_clock::now();
 
         // upstream: print each result line
-        cout << rank << ": " << res.first << ", ";
-        for (size_t j = 0; j < res.second.size(); j++) {
-            cout << res.second[j] << ",";
-        }
-        cout << endl;
+        cout << rank << ": " << res << endl;
 
-        if (res.first) {
+        if (res) {
             success_count++;
-            result_tuples.push_back(move(res.second));
         } else {
             fail_count++;
         }

@@ -53,6 +53,7 @@ static thread_local struct {
 #include "Bucket.hpp"
 #include "JoinTree.hpp"
 #include "BucketPool.hpp"
+#include <random>
 // #include "MHBS.hpp"
 using namespace std;
 
@@ -95,6 +96,7 @@ class Index {
         double totalSplitTime = 0;
         double totalCacheHitTime = 0;
         double totalBoundPrepareTime = 0;
+        std::mt19937 gen{std::random_device{}()};  // AJB: persistent RNG
 
         Index() {};
 
@@ -787,7 +789,7 @@ class Index {
             // vector<int> cardinalities(B.iters.size(), 0);
             for(size_t i = 0; i < B.iters.size(); i++) {
                 // AJB: 缓存splitDim列引用避免重复三层下标
-                const auto& sdcol = data[i][varPos[i][splitDim]];
+                auto& sdcol = data[i][varPos[i][splitDim]];
                 vecIters[i].first = sdcol.begin() + B.iters[i].first;
                 vecIters[i].second = sdcol.begin() + B.iters[i].second;
                 // cardinalities[i] = B.iters[i].second - B.iters[i].first;
@@ -1142,6 +1144,7 @@ class Index {
                 fprintf(stdout, "Relation: %zu\n", i);
                 tables[i].print();
             }
+        }
 
         // [AJB] dump所有诊断计数
         void ajb_dump_stats() {
@@ -1157,6 +1160,5 @@ class Index {
             ajb_idx_stats.reset();
             cntCacheHit = cntTotalCall = cntAGMCall = cntSplitCall = cntBSCall = totalrrtreenode = 0;
             totalAGMTime = totalCountOracleTime = totalSplitTime = totalCacheHitTime = totalBoundPrepareTime = 0;
-        }
         }
 };

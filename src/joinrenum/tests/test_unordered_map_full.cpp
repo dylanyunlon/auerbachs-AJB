@@ -92,7 +92,8 @@ int main() {
         // prefetch the bucket that this hash maps to
         size_t bucket_idx = h % cache.bucket_count();
 #ifdef __GNUC__
-        __builtin_prefetch(&cache.bucket_count() + bucket_idx, 0, 1);
+        // AJB: prefetch key data to reduce cache misses on upcoming find()
+        __builtin_prefetch(key.data(), 0, 1);
 #endif
         if (cache.find(key) != cache.end()) {
             found++;

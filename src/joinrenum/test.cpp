@@ -21,12 +21,12 @@ using namespace std;
 
 void printInfo(Index &idx) {
     // upstream: core stats (verbatim)
-    fprintf(stdout, "Cache Hit of SplitBucket: %lld Total Call: %lld\n", idx.cntCacheHit, idx.cntTotalCall);  // AJB-algo: fprintf
-    fprintf(stdout, "Total AGM Call: %lld\n", idx.cntAGMCall);
+    fprintf(stdout, "Cache Hit of SplitBucket: %d Total Call: %d\n", idx.cntCacheHit, idx.cntTotalCall);  // AJB-algo: fprintf
+    fprintf(stdout, "Total AGM Call: %d\n", idx.cntAGMCall);
     fprintf(stdout, "Total AGM Time: %f\n", idx.totalAGMTime);
     fprintf(stdout, "Total Count Oracle Time: %f\n", idx.totalCountOracleTime);
     fprintf(stdout, "Total Split Time: %f\n", idx.totalSplitTime);
-    fprintf(stdout, "Total Split Call: %lld\n", idx.cntSplitCall);
+    fprintf(stdout, "Total Split Call: %d\n", idx.cntSplitCall);
     fprintf(stdout, "Total Cache Hit Time: %f\n", idx.totalCacheHitTime);
 
     // AJB: structured dump to stderr for parse_ajb_trace.py
@@ -129,14 +129,14 @@ int main() {
     // cout << endl;
     // if(freopen("res/res_q1_bmitu.txt", "w", stdout) == NULL)cout << "WRITEERR" << endl;
     int step = 20;
-    fprintf(stderr, "[AJB_STATE] AGM bound = %d\n", idx.AGM());
+    fprintf(stderr, "[AJB_STATE] AGM bound = %lld\n", idx.AGM());
     cout << idx.AGM() << endl;
     //////////////////////////////REnum-BMITU
     BanPickTree bp(idx.AGM());
     if(freopen("res/result.txt", "w", stdout) == NULL)
         fprintf(stderr, "[AJB_WARN] Cannot open res/result.txt\n");
 
-    fprintf(stderr, "[AJB_TRACE] REnum-BMITU loop starting, AGM=%d\n", idx.AGM());
+    fprintf(stderr, "[AJB_TRACE] REnum-BMITU loop starting, AGM=%lld\n", idx.AGM());
     auto start = std::chrono::high_resolution_clock::now();
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> elapsed_ms = end - start;
@@ -144,21 +144,21 @@ int main() {
     while(bp.remaining()){
         cnt++;
         int s = bp.pick();
-        pair<bool, vector<int> > res = idx.randomAccess_opt(idx.getFullBucket(), s);
+        pair<bool, vector<int> > res = idx.randomAccess(idx.getFullBucket(), s);
         if(res.first){
             cntsuccess++;
             if(cntsuccess < step || cntsuccess % step == 0){
             end = std::chrono::high_resolution_clock::now();
-            elapsed = end - start;
+            elapsed_ms = end - start;
             // AJB: fprintf代替cout链——避免iostream格式化开销
             fprintf(stdout, "%d, %d, %lld, %f, %f\n",
-                    cntsuccess, cnt, (long long)bp.remaining(), bp.getPercentage(), elapsed.count());
+                    cntsuccess, cnt, (long long)bp.remaining(), bp.getPercentage(), elapsed_ms.count());
         }
             if(cntsuccess % 500 == 0) {
                 printInfo(idx);
                 // AJB: progress trace to stderr
                 fprintf(stderr, "[AJB_TRACE] progress: %d successes, %d total, %.1f%% done, %.3fs\n",
-                        cntsuccess, cnt, bp.getPercentage() * 100, elapsed.count());
+                        cntsuccess, cnt, bp.getPercentage() * 100, elapsed_ms.count());
             }
 
         }        
@@ -220,12 +220,12 @@ int main() {
     // }
     
     end = std::chrono::high_resolution_clock::now();
-    elapsed = end - start;
+    elapsed_ms = end - start;
     // AJB: 最终统计用fprintf一次写出, 避免cout链的多次刷新
-    double throughput = elapsed.count() > 0.0 ? cntsuccess / elapsed.count() : 0.0;
+    double throughput = elapsed_ms.count() > 0.0 ? cntsuccess / elapsed_ms.count() : 0.0;
     double success_rate = cnt > 0 ? 100.0 * cntsuccess / cnt : 0.0;
     fprintf(stdout, "%d, %d, %lld, %f, %f\n",
-            cntsuccess, cnt, (long long)bp.remaining(), bp.getPercentage(), elapsed.count());
+            cntsuccess, cnt, (long long)bp.remaining(), bp.getPercentage(), elapsed_ms.count());
 
     printInfo(idx);
 
@@ -234,8 +234,8 @@ int main() {
     fprintf(stderr, "[AJB_BP] successes=%d probes=%d success_rate=%.1f%%\n",
             cntsuccess, cnt, success_rate);
     fprintf(stderr, "[AJB_BP] wall=%.3fs throughput=%.1f results/s\n",
-            elapsed.count(), throughput);
-    fprintf(stderr, "[AJB_TIMER] REnum-BMITU total: %.3fs\n", elapsed.count());
+            elapsed_ms.count(), throughput);
+    fprintf(stderr, "[AJB_TIMER] REnum-BMITU total: %.3fs\n", elapsed_ms.count());
     fprintf(stderr, "[AJB] test.cpp COMPLETE\n");
     return 0;
 }

@@ -66,8 +66,8 @@ int main() {
         if (CO[i]) {
             auto lb = CO[i]->getLowerBounds();
             auto ub = CO[i]->getUpperBounds();
-            fprintf(stderr, "[AJB_STATE]   CO[%zu]: dim=%d range=[", i, lb.dim());
-            for (int d = 0; d < lb.dim(); d++) {
+            fprintf(stderr, "[AJB_STATE]   CO[%zu]: dim=%zu range=[", i, lb.size());
+            for (size_t d = 0; d < lb.size(); d++) {
                 if (d) fprintf(stderr, " ");
                 fprintf(stderr, "%d..%d", lb[d], ub[d]);
             }
@@ -147,7 +147,7 @@ int main() {
     }
     for (int r = 0; r < NRUNS; r++) {
         auto ta = chrono::high_resolution_clock::now();
-        upp_iter = tree.treeUpp(B.splitDim, B.iters);
+        upp_iter = tree.treeUpp(B);
         auto tb = chrono::high_resolution_clock::now();
         iter_times[r] = chrono::duration<double,micro>(tb - ta).count();
     }
@@ -159,9 +159,9 @@ int main() {
     cout << upp_iter << endl;
 
     fprintf(stderr, "[AJB_TIMER] treeUpp(bound): median=%.3fus (of %d runs) -> %lld\n",
-            bound_times[NRUNS/2], NRUNS, upp_bound);
+            bound_times[NRUNS/2], NRUNS, (long long)upp_bound);
     fprintf(stderr, "[AJB_TIMER] treeUpp(iters): median=%.3fus (of %d runs) -> %lld\n",
-            iter_times[NRUNS/2], NRUNS, upp_iter);
+            iter_times[NRUNS/2], NRUNS, (long long)upp_iter);
     fprintf(stderr, "[AJB_STATE] treeUpp agreement: %s\n",
             upp_bound == upp_iter ? "MATCH" : "DIVERGE");
 

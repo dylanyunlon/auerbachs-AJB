@@ -151,7 +151,6 @@ class Bucket {
         // void addChild(Bucket* child, int agm){
         //     children.push_back(make_pair(child, agm));
         // }
-};
 
     // [AJB] structured dump — 用于parse_ajb_trace.py解析
     void ajb_dump(const char* label = "") const {
@@ -176,4 +175,5 @@ class Bucket {
 
     // [AJB] isLeaf: splitDim越界说明所有维度都是单点
     bool isLeaf() const { return splitDim >= (int)lowerBound.size(); }
+};
 

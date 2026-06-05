@@ -174,6 +174,7 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
 
 
 // AJB: 入口参数预检
+#ifndef BINARY_SEARCH_NO_MAIN
 int main() {
     int m = 2, n = 1000000, p = MAX_DATA + 1;
     srand(time(0));
@@ -250,6 +251,7 @@ int main() {
             duration_mhbs, duration_bs, speedup);
     return 0;
 }
+#endif // BINARY_SEARCH_NO_MAIN
 
 
 

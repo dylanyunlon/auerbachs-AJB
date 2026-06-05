@@ -7,10 +7,27 @@
 //   parse error detection with row-level diagnostics, data distribution
 //   summary (min/max/median per column), and push_back throughput counters.
 // =============================================================================
+//
+// Created by shai.zeevi on 04/06/2019.
+//
+
+#ifndef RANDOMORDERENUMERATION_TABLE_H
+#define RANDOMORDERENUMERATION_TABLE_H
+
 #include <cstdio>
+#include <cstring>
 #include <chrono>
 #include <algorithm>  // AJB: for nth_element (median)
 #include <numeric>    // AJB: for accumulate
+#include <string>
+#include <vector>
+#include <fstream>
+#include <unordered_map>
+#include <unordered_set>
+#include <assert.h>
+#include "iostream"
+// #include "RangeTree.hpp"
+#include "CountOracle.hpp"
 
 // [AJB] Table-level operation counters — tracks load, push, select throughput
 static thread_local struct {
@@ -33,24 +50,6 @@ static thread_local struct {
         file_io_ms = dedup_ms = co_build_ms = 0.0;
     }
 } ajb_table_stats;
-
-//
-// Created by shai.zeevi on 04/06/2019.
-//
-
-#ifndef RANDOMORDERENUMERATION_TABLE_H
-#define RANDOMORDERENUMERATION_TABLE_H
-
-#include <string>
-#include <vector>
-#include <fstream>
-#include <unordered_map>
-#include <unordered_set>
-#include <assert.h>
-#include "iostream"
-// #include "RangeTree.hpp"
-#include "CountOracle.hpp"
-#include <chrono>
 typedef long long ll;
 // namespace RT = RangeTree;
 
@@ -214,8 +213,8 @@ struct Table {
         ajb_table_stats.total_rows_loaded += parcelSet.size();
 
         // [AJB_STATE] per-column data distribution (first 3 columns, min/med/max)
-        if(!list.empty() && list[0].size() > 0) {
-            int ncols = std::min((int)list[0].size(), 3);
+        if(!list.empty() && list[0].dim() > 0) {
+            int ncols = std::min((int)list[0].dim(), 3);
             for(int c = 0; c < ncols; c++) {
                 std::vector<int> col_vals;
                 col_vals.reserve(list.size());

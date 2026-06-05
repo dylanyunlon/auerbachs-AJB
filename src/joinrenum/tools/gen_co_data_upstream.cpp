@@ -1,6 +1,6 @@
 #include<bits/stdc++.h>
 #include <sys/resource.h>
-#include "LexRangeTree.hpp"
+#include "CountOracle.hpp"
 using namespace std;
 int memoryUsage() {
     ifstream file("/proc/self/status");

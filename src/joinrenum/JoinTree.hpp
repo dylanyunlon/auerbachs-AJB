@@ -197,7 +197,7 @@ public:
         joinPos = vector<vector<vector<int > > >(q.getRelNames().size(), vector<vector<int> >());
         parent = vector<int>(q.getRelNames().size(), -1);
         countRels = vector<vector<int> >(q.getVarNumber(), vector<int>());
-        visVar = vector<bool>(q.getVarNumber(), false);
+        visVar = vector<uint8_t>(q.getVarNumber(), 0);
         cache.resize(q.getRelNames().size());
         treeBound.resize(q.getRelNames().size());
         vector<bool> visited(q.getRelNames().size(), false);

@@ -73,7 +73,7 @@ int main() {
     // upstream: just prints both results
     // changed: compute both, check they agree (same data, different rep)
     double upp_bound = tree.treeUpp(B.splitDim, bound);
-    double upp_iter  = tree.treeUpp(B.splitDim, B.iters);
+    double upp_iter  = tree.treeUpp(B);
     cout << upp_bound << endl;
     cout << upp_iter << endl;
     if(abs(upp_bound) + abs(upp_iter) > 1e-12) {

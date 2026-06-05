@@ -80,13 +80,13 @@ int main() {
         printf("]\n");
     }
 
-    // Test treeUpp with both bound-based and iter-based calls
+    // Test treeUpp with both bound-based and bucket-based calls
     long long upp_bound = tree.treeUpp(B.splitDim, bound);
-    long long upp_iter  = tree.treeUpp(B.splitDim, B.iters);
+    long long upp_iter  = tree.treeUpp(B);
 
     printf("\n[AJB_RESULTS] treeUpp comparison:\n");
-    printf("  bound-based = %lld\n", upp_bound);
-    printf("  iter-based  = %lld\n", upp_iter);
+    printf("  bound-based = %d\n", upp_bound);
+    printf("  bucket-based = %d\n", upp_iter);
 
     // AJB: consistency check
     if (upp_bound != upp_iter) {

@@ -52,13 +52,10 @@ int main(int argc, char* argv[]) {
     {
         ScopedTimer t("rr_access_enumeration");
         for (long long i = 1; i <= tree->AGM; i++) {
-            pair<bool, vector<int>> res = tree->RRAccess(i);
+            bool res = tree->RRAccess(i);
             total++;
-            if (res.first) {
+            if (res) {
                 successes++;
-                if (result_dims.empty() || (int)res.second.size() != result_dims.back()) {
-                    result_dims.push_back(res.second.size());
-                }
             } else {
                 failures++;
                 if (first_failure_at < 0) first_failure_at = i;
@@ -66,10 +63,7 @@ int main(int argc, char* argv[]) {
 
             // AJB: per-access verbose output (only with -v)
             if (verbose) {
-                printf("  [%lld] ok=%d result=[", i, res.first);
-                for (size_t j = 0; j < res.second.size(); j++)
-                    printf("%s%d", j ? "," : "", res.second[j]);
-                printf("]\n");
+                printf("  [%lld] ok=%d\n", i, (int)res);
             }
         }
     }

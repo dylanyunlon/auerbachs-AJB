@@ -14,6 +14,8 @@
 #include <chrono>
 #include "Index.hpp"
 #include "ReadConfig.hpp"
+#define BINARY_SEARCH_NO_MAIN
+#include "BinarySearch.cpp"
 
 // upstream: vector printer
 void printVector(const vector<int>& vec) {
@@ -172,7 +174,7 @@ int main() {
 
     auto tstart = chrono::high_resolution_clock::now();
     for(int i = 0; i < testTime; i++) {
-        int b = MultiHeadBinarySearch(veciters, flag, test[i], q);
+        int b = MultiHeadBinarySearch(veciters, test[i]);
 
         // histogram: which quartile of [0, AGM) does b fall into?
         int bucket = min(3, b / agm_quarter);

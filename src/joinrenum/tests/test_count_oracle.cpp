@@ -160,10 +160,10 @@ int main(int argc, char* argv[]) {
     // AJB: print structure summary
     printf("[AJB] CountOracle bounds: lower=[");
     auto lb = tree->getLowerBounds();
-    for (int d = 0; d < lb.dim(); d++) printf("%s%d", d ? "," : "", lb[d]);
+    for (size_t d = 0; d < lb.size(); d++) printf("%s%d", d ? "," : "", lb[d]);
     printf("] upper=[");
     auto ub = tree->getUpperBounds();
-    for (int d = 0; d < ub.dim(); d++) printf("%s%d", d ? "," : "", ub[d]);
+    for (size_t d = 0; d < ub.size(); d++) printf("%s%d", d ? "," : "", ub[d]);
     printf("]\n");
 
     // Free point data (upstream style — reclaim memory)

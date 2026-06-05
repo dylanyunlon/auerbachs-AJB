@@ -7,8 +7,18 @@
 //   hash function quality metrics (distribution entropy estimate),
 //   and per-parse timing for large-file profiling.
 // =============================================================================
+
+#ifndef RANDOMORDERENUMERATION_PARCEL_H
+#define RANDOMORDERENUMERATION_PARCEL_H
+
 #include <cstdio>
 #include <chrono>
+#include <iostream>
+#include "Table.h"
+#include "SplitTable.h"
+#include <boost/functional/hash.hpp>
+#ifdef PROJECTION
+#endif
 
 // [AJB] Parcel操作诊断 — 扩展: parse统计 + hash质量
 static thread_local struct {
@@ -24,17 +34,6 @@ static thread_local struct {
     }
     void reset() { sort_calls = merge_calls = total_elements = from_calls = hash_str_fallback = col_mismatch = 0; }
 } ajb_parcel_stats;
-
-#ifndef RANDOMORDERENUMERATION_PARCEL_H
-#define RANDOMORDERENUMERATION_PARCEL_H
-
-#include <iostream>
-#include <chrono>
-#include "Table.h"
-#include "SplitTable.h"
-#include <boost/functional/hash.hpp>
-#ifdef PROJECTION
-#endif
 
 using namespace std;
 

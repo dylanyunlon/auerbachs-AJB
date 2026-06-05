@@ -79,7 +79,7 @@ int main() {
     fprintf(stderr, "[AJB_BP] phase=cache_flush\n");
     flush_cache();
 
-    string filename = "db/Ra.tbl";
+    string filename = "db/Ra.csv";
     ifstream infile(filename);
     if (!infile.is_open()) {
         fprintf(stderr, "[AJB_FAIL] cannot open %s\n", filename.c_str());

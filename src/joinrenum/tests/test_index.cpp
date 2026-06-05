@@ -11,6 +11,8 @@
 #include <bits/stdc++.h>
 #include "Index.hpp"
 #include "ReadConfig.hpp"
+#define BINARY_SEARCH_NO_MAIN
+#include "BinarySearch.cpp"
 
 // AJB: inline scoped timer
 struct ScopedTimer {
@@ -95,7 +97,7 @@ int main(int argc, char* argv[]) {
     {
         ScopedTimer t("multi_head_binary_search");
         for (int i = 0; i < testTime; i++) {
-            int b = MultiHeadBinarySearch(veciters, flag, test[i], q);
+            int b = MultiHeadBinarySearch(veciters, test[i]);
             total_results += b;
         }
     }

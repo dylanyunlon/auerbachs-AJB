@@ -18,8 +18,8 @@ int main() {
     //   where RRAccess fails, then linear scan around that boundary
     int first_fail = agm + 1;
     for(int probe = 1; probe <= agm; probe *= 2) {
-        pair<bool, vector<int> > res = tree.RRAccess(probe);
-        if(!res.first) {
+        bool res = tree.RRAccess(probe);
+        if(!res) {
             first_fail = probe;
             break;
         }
@@ -29,8 +29,8 @@ int main() {
     int scan_start = max(1, first_fail / 2);
     int exact_boundary = agm + 1;
     for(int i = scan_start; i <= min(first_fail, agm); i++) {
-        pair<bool, vector<int> > res = tree.RRAccess(i);
-        if(!res.first) {
+        bool res = tree.RRAccess(i);
+        if(!res) {
             exact_boundary = i;
             break;
         }
@@ -39,21 +39,17 @@ int main() {
     // --- Phase 2: full sweep with batch result collection ---
     // upstream: cout inside loop body per iteration
     // changed: collect all results into a vector, output after loop
-    struct Result { int rank; bool ok; vector<int> vals; };
+    struct Result { int rank; bool ok; };
     vector<Result> results;
     results.reserve(agm);
     for(int i = 1; i <= agm; i++) {
-        pair<bool, vector<int> > res = tree.RRAccess(i);
-        results.push_back({i, res.first, res.second});
+        bool res = tree.RRAccess(i);
+        results.push_back({i, res});
     }
 
     // batch output
     for(auto& r : results) {
-        cout << r.rank << ": " << r.ok << ", ";
-        for(size_t j = 0; j < r.vals.size(); j++) {
-            cout << r.vals[j] << ",";
-        }
-        cout << endl;
+        cout << r.rank << ": " << r.ok << endl;
     }
 
     // report boundary findings
@@ -65,7 +61,8 @@ int main() {
 
     // --- printBucketTree: activated from upstream comments ---
     // upstream: // tree.idx.printBucketTree(tree.idx.getFullBucket());
-    tree.idx.printBucketTree(tree.idx.getFullBucket());
+    // printBucketTree is commented out in Index.hpp
+    // tree.idx.printBucketTree(tree.idx.getFullBucket());
     
     return 0;
 }
