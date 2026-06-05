@@ -1,0 +1,182 @@
+# =============================================================
+# Claude self-evolution development loop
+# =============================================================
+# Secrets (both configured):
+#   ANTHROPIC_API_KEY  — Claude API key
+#   AUTO_MERGE_TOKEN   — GitHub PAT
+# =============================================================
+
+name: Claude Self-Evolution
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Task description for Claude"
+        required: false
+        default: "Continue the next milestone in docs/CLAUDE_PROGRESS.md"
+      milestone_range:
+        description: "Milestone range (e.g. M791-M840)"
+        required: false
+
+  issues:
+    types: [labeled]
+
+  # Uncomment to enable daily auto-run (UTC 02:00 = Beijing 10:00)
+  # schedule:
+  #   - cron: '0 2 * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  claude-develop:
+    name: Claude Development Cycle
+    runs-on: ubuntu-latest
+
+    if: |
+      github.event_name != 'issues' ||
+      contains(github.event.issue.labels.*.name, 'claude-task')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.AUTO_MERGE_TOKEN }}
+          fetch-depth: 0
+
+      - name: Determine task
+        id: task
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TASK: ${{ github.event.inputs.task }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "$INPUT_TASK" ]; then
+            TASK="$INPUT_TASK"
+            BRANCH="claude/manual-$(date +%Y%m%d-%H%M%S)"
+          elif [ "$EVENT" = "issues" ]; then
+            TASK="Issue #${{ github.event.issue.number }}: $ISSUE_TITLE\n\n$ISSUE_BODY"
+            BRANCH="claude/issue-${{ github.event.issue.number }}"
+          else
+            NEXT=$(grep -m1 '^\- \[ \]' docs/CLAUDE_PROGRESS.md || echo "No pending tasks")
+            TASK="Continue development: $NEXT"
+            BRANCH="claude/auto-$(date +%Y%m%d)"
+          fi
+
+          echo "task<<TASK_EOF" >> "$GITHUB_OUTPUT"
+          echo -e "$TASK" >> "$GITHUB_OUTPUT"
+          echo "TASK_EOF" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Create feature branch
+        run: git checkout -b "${{ steps.task.outputs.branch }}"
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code 2>/dev/null || true
+
+      - name: Run Claude Code
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          claude --print \
+            --model claude-sonnet-4-20250514 \
+            --max-turns 30 \
+            "You are working on the auerbachs-AJB project.
+             Read docs/CLAUDE_PROGRESS.md to understand the current state.
+             Your task: ${{ steps.task.outputs.task }}
+
+             === HARD RULES (CI will reject your PR if violated) ===
+
+             RULE 1 - IN-PLACE ONLY:
+             Modify existing files directly. NEVER create copies with
+             suffixes like _v2, _v3, _port, _new, _copy, _alt, _rewrite,
+             _refactor, _mod, _fixed, _backup, _2, etc.
+             BAD:  src/common/data_generator_v2.cuh
+             BAD:  src/hybrid_sort/radix_sort_port.cuh
+             GOOD: edit src/common/data_generator.cuh in place
+
+             RULE 2 - NO DUPLICATE FILES:
+             Never place a file with the same basename in a different
+             directory. If merge_join.cuh exists in src/merge_join/,
+             do not create another merge_join.cuh elsewhere.
+
+             RULE 3 - NEW FILES MUST USE ajb_ PREFIX:
+             Any genuinely new file (not in upstream) must start with
+             ajb_ (e.g. ajb_skew_detector.cuh), or live under tests/
+             or tools/ directories.
+
+             RULE 4 - NEVER MODIFY upstream/:
+             The upstream/ directory is read-only reference code.
+
+             RULE 5 - DIFF RATE >= 20%:
+             Every file that has a same-name counterpart in upstream/
+             must differ by at least 20% (algorithm-level changes,
+             not cosmetic). CI runs: python3 scripts/ci_guard.py
+
+             RULE 6 - ALGORITHM-LEVEL CHANGES ONLY:
+             Changes must be to data structures, traversal strategies,
+             computation paths, or control flow. NOT: adding comments,
+             renaming variables, inserting print statements.
+
+             RULE 7 - UPDATE PROGRESS:
+             Update docs/CLAUDE_PROGRESS.md with what you completed.
+             Commit with descriptive messages.
+
+             ========================================================" \
+          || echo "Claude Code exited with: $?"
+
+      - name: Commit and push
+        run: |
+          git config user.name "claude-dev"
+          git config user.email "claude-dev@anthropic.com"
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "Claude auto-dev: ${{ steps.task.outputs.branch }}"
+          fi
+
+          COMMITS=$(git log origin/main..HEAD --oneline | wc -l)
+          if [ "$COMMITS" -eq 0 ]; then
+            echo "No changes made, skipping PR"
+            exit 0
+          fi
+
+          git push origin "${{ steps.task.outputs.branch }}"
+
+      - name: Create Pull Request
+        env:
+          GH_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN }}
+        run: |
+          BRANCH="${{ steps.task.outputs.branch }}"
+
+          if ! git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+            echo "Branch not pushed, skip PR"
+            exit 0
+          fi
+
+          COMMITS=$(git log origin/main..HEAD --oneline)
+
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "Claude auto-dev: $BRANCH" \
+            --body "## Auto-generated by Claude Self-Evolution
+
+          **Task:** ${{ steps.task.outputs.task }}
+
+          **Commits:**
+          \`\`\`
+          $COMMITS
+          \`\`\`" \
+            --label "auto-merge"
+
+      - name: Close issue if triggered by issue
+        if: github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN }}
+        run: |
+          gh issue close ${{ github.event.issue.number }} \
+            --comment "Handled by Claude. Check linked PR."

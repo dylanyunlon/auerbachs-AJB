@@ -1,0 +1,110 @@
+# =============================================================
+# Auto-merge PRs created by Claude (or any allow-listed bot)
+# =============================================================
+# 触发: PR 打开/更新时
+# 合入条件: (1) CI门禁通过 (2) 作者白名单或auto-merge标签
+#
+# Secrets: AUTO_MERGE_TOKEN (已配置)
+# Settings: Allow auto-merge, Actions写权限
+# =============================================================
+
+name: Auto-Merge Claude PRs
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  check_suite:
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  ci-gate:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Python syntax check
+        run: |
+          find . -name '*.py' -not -path './upstream/*' | while read f; do
+            python3 -c "import ast; ast.parse(open('$f').read())" || exit 1
+          done
+
+      - name: Shell script syntax check
+        run: |
+          find . -name '*.sh' -not -path './upstream/*' | while read f; do
+            bash -n "$f" || exit 1
+          done
+
+      - name: CMakeLists.txt exists
+        run: test -f CMakeLists.txt
+
+      - name: CI Guard (anti-bypass + diff rate)
+        run: |
+          python3 scripts/ci_guard.py --verbose --min-rate 0.20
+
+  auto-merge:
+    name: Auto-approve and merge
+    runs-on: ubuntu-latest
+    needs: [ci-gate]
+    if: |
+      always() &&
+      needs.ci-gate.result == 'success' &&
+      github.event_name == 'pull_request'
+    steps:
+      - name: Check if PR is from Claude
+        id: check-author
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          ALLOWED_AUTHORS=(
+            "claude-dev"
+            "github-actions[bot]"
+            "dylanyunlon"
+          )
+
+          AUTHOR_OK=false
+          for author in "${ALLOWED_AUTHORS[@]}"; do
+            if [ "$PR_AUTHOR" = "$author" ]; then
+              AUTHOR_OK=true
+              break
+            fi
+          done
+
+          LABEL_OK=false
+          if echo "$PR_LABELS" | grep -q "auto-merge"; then
+            LABEL_OK=true
+          fi
+
+          if [ "$AUTHOR_OK" = true ] || [ "$LABEL_OK" = true ]; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+            echo "[OK] PR eligible (author=$PR_AUTHOR)"
+          else
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "[SKIP] PR not eligible (author=$PR_AUTHOR)"
+          fi
+
+      - name: Approve PR
+        if: steps.check-author.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr review "$PR_URL" --approve --body \
+            "Auto-approved: CI passed, author in allow-list."
+
+      - name: Squash merge
+        if: steps.check-author.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr merge "$PR_URL" --auto --squash --body \
+            "Auto-merged by CI pipeline"
