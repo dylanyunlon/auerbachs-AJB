@@ -163,8 +163,10 @@ int main() {
 
         }        
         if(res.first) bp.ban(s,s);
-
-        else bp.ban(res.second[0], res.second[1]);
+        // AJB: guard empty failure vector — randomAccess may return {}
+        // when k exceeds all sons' AGMs; fall back to banning single slot
+        else if(res.second.size() >= 2) bp.ban(res.second[0], res.second[1]);
+        else bp.ban(s, s);
         // double done = bp.getPercentage();
         // if(int(done * 100) % 10 == 0 && int(done * 100) != int(last_percentage*100)){
         //     last_percentage = done;

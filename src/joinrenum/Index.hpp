@@ -227,7 +227,7 @@ class Index {
             vector<const vector<int>*> splitCol(iters.size(), nullptr);
             for(size_t i = 0; i < iters.size(); i++) {
                 if(mask[splitDim][i] && varPos[i][splitDim] >= 0)
-                    splitCol[i] = &(*splitCol[i]);
+                    splitCol[i] = &data[i][varPos[i][splitDim]];
             }
             int mini, maxi, cnt = 0;
             long long upp;
@@ -954,7 +954,8 @@ class Index {
                 if(k <= sons[i].AGM) return randomAccess(sons[i], k, sons[i].AGM);
                 k -= sons[i].AGM;
             }
-            return make_pair(false, vector<int>{});
+            // AJB: return {agm_remaining} so caller can estimate empty range
+            return make_pair(false, vector<int>{(int)(agm - k)});
         }
 
         ///////////////////////////// TBD: BETTER TRIVAL INTERVAL
