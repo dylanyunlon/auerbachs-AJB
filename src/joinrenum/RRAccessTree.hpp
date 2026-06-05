@@ -117,17 +117,17 @@ public:
      */
     RRAccessTreeNode(Bucket* B, vector<Bucket> && children_buckets) : B(B), children_buckets(move(children_buckets)) {
         emptySize = B->AGM;
-        for(int i = 0; i < this->children_buckets.size(); i++) {
+        for(size_t i = 0; i < this->children_buckets.size(); i++) {  // AJB: size_t
             emptySize -= this->children_buckets[i].AGM;
         }
-        children_pointers = vector<RRAccessTreeNode*>(this->children_buckets.size(), NULL);
+        children_pointers.assign(this->children_buckets.size(), nullptr);  // AJB-algo: assign over ctor
         // [AJB_TRACE] 节点创建: emptySize=AGM-sum(children.AGM), 如果emptySize很大说明这层空洞多
         ajb_rrt_stats.node_creates++;
         ajb_rrt_stats.total_children += this->children_buckets.size();
     }
 
     void print() {
-        cout << "AGM: " << B->AGM << ", size: " << children_buckets.size() << ", ";
+        fprintf(stdout, "AGM: %lld, size: %zu, ", B->AGM, children_buckets.size());  // AJB-algo: fprintf
         B->print();
     }
 

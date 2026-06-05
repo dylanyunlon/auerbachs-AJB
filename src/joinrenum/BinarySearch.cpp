@@ -51,10 +51,13 @@ double F(const vector<int> & pos) {
 
 void gendata(int m, int n, int p) {
     matrix.resize(m);
+    // AJB-algo: mt19937 + uniform_int for better distribution than rand()<<15
+    std::mt19937 rng(static_cast<unsigned>(time(0)));
     for (int i = 0; i < m; i++) {
         matrix[i].resize(n);
+        std::uniform_int_distribution<int> dist(0, p - 1);
         for (int j = 0; j < n; j++) {
-            matrix[i][j] = ((rand() << 15) + rand()) % p;
+            matrix[i][j] = dist(rng);
         }
         sort(matrix[i].begin(), matrix[i].end());
     }
@@ -100,7 +103,7 @@ int BinarySearch(const vector<pair<vector<int>::iterator, vector<int>::iterator>
     vector<int> pos(iters.size());
     while(l <= r) {
         cntLoop2++;
-        mid = (l + r) >> 1;
+        mid = l + ((r - l) >> 1);  // AJB-algo: overflow-safe midpoint
         // pos = 
         int ans = F(getpos(iters, mid));
         cntF2++;
@@ -193,8 +196,11 @@ int main() {
     double now, nxt;
     int TestTimes = 100000;
     vector<int> vec(TestTimes);
-    for(int i = 0; i < TestTimes; i++) {
-        vec[i] = rand() % (1000010);
+    // AJB-algo: mt19937 for reproducible test input
+    {
+        std::mt19937 test_rng(42);
+        std::uniform_int_distribution<int> test_dist(0, 1000009);
+        for(int i = 0; i < TestTimes; i++) vec[i] = test_dist(test_rng);
     }
     fprintf(stderr, "[AJB_STATE][BinarySearch] TestTimes=%d generated\n", TestTimes);
 

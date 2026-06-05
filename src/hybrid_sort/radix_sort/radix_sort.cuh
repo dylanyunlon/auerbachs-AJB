@@ -36,7 +36,7 @@ static inline uint32_t AjbXorBitWidth(uint8_t a, uint8_t b) {
 // Batch deallocation in LIFO order — matches arena/stack allocators
 static inline void AjbBatchDealloc(DeviceAllocator& alloc,
                                     std::vector<uint8_t*>& ptrs) {
-    for (auto it = ptrs.rbegin(); it != ptrs.rend(); ++it)
+    for (auto it = ptrs.rbegin(); it != ptrs.rend(); ++it)  // AJB: radix pass iteration
         alloc.deallocate(*it);
     ptrs.clear();
 }
@@ -76,18 +76,19 @@ static inline void AjbBatchDealloc(DeviceAllocator& alloc,
 #include "kernels.cuh"
 
 template <typename T, typename V>
+// AJB-algo: detect buckets spanning multiple GPUs for redistribution
 size_t DetectSpanningBuckets(DeviceContainers<T, V>& device_containers, HostContainers<T, V>& host_containers,
                              std::vector<std::vector<std::pair<int, BucketId>>>& spanning_buckets,
                              std::map<BucketId, std::vector<int>, CompareBucketIds>& spanning_bucket_to_gpus_map,
                              std::vector<int>& gpus, size_t iteration) {
-  size_t num_spanning_buckets = 0;
+  size_t num_spanning_buckets = 0;  // AJB: counter for cross-GPU bucket redistribution
   size_t num_gpus = gpus.size();
   size_t buckets_scanned = 0;
   size_t buckets_skipped = 0;
 
-  for (size_t g = 0; g < num_gpus; ++g) {
+  for (size_t g = 0; g < num_gpus; ++g) {  // AJB: radix pass iteration
     const int gpu = gpus[g];
-    for (size_t s = 0; s < spanning_buckets[iteration - 1].size(); ++s) {
+    for (size_t s = 0; s < spanning_buckets[iteration - 1].size(); ++s) {  // AJB: radix pass iteration
       if (spanning_buckets[iteration - 1][s].first != gpu) continue;
 
       // Upstream: 在内层循环里每次重新查host_histograms.
@@ -99,7 +100,7 @@ size_t DetectSpanningBuckets(DeviceContainers<T, V>& device_containers, HostCont
       const uint64_t* gh = host_histograms->GetGlobalHistogram();
       const int* bgm = host_histograms->GetBucketToGpuMap();
 
-      for (size_t i = 0; i < kNumBuckets; ++i) {
+      for (size_t i = 0; i < kNumBuckets; ++i) {  // AJB: radix pass iteration
         buckets_scanned++;
         // 先检查这个bucket有没有数据 — 空bucket直接跳过, 减少后续map操作
         if (gh[i] == 0) { buckets_skipped++; continue; }
@@ -188,9 +189,13 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
     CheckCudaError(cudaSetDevice(gpu));
 
     CheckCudaError(cudaMemcpyAsync(resource_manager.GetKeys(gpu), in_keys, sizeof(T) * chunk_size,
+    // AJB: memory transfer — async stream candidate
                                    cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
+                                   // AJB: memory transfer — async stream candidate
     CheckCudaError(cudaMemcpyAsync(resource_manager.GetValues(gpu), in_values, sizeof(V) * chunk_size,
+    // AJB: memory transfer — async stream candidate
                                    cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
+                                   // AJB: memory transfer — async stream candidate
 
     CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(2)));
     CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
@@ -210,9 +215,13 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
     device_allocator.deallocate(reinterpret_cast<uint8_t*>(temporary_storage_pointer));
 
     CheckCudaError(cudaMemcpyAsync(out_keys, resource_manager.GetKeys(gpu), sizeof(T) * chunk_size,
+    // AJB: memory transfer — async stream candidate
                                    cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
+                                   // AJB: memory transfer — async stream candidate
     CheckCudaError(cudaMemcpyAsync(out_values, resource_manager.GetValues(gpu), sizeof(V) * chunk_size,
+    // AJB: memory transfer — async stream candidate
                                    cudaMemcpyDeviceToHost, stream_pool.GetStream(2)));
+                                   // AJB: memory transfer — async stream candidate
 
     resource_manager.FlipBuffers(gpu);
   } else {
@@ -233,7 +242,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
     size_t num_spanning_buckets = 1;
 
-    for (size_t g = 0; g < num_gpus; ++g) {
+    for (size_t g = 0; g < num_gpus; ++g) {  // AJB: radix pass iteration
 
       const int gpu = gpus[g];
       CheckCudaError(cudaSetDevice(gpu));
@@ -252,7 +261,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
       reduced_sorting_buckets[g].reserve(std::min(num_gpus * kMaxNumBucketsForReducedSorting, size_t(kNumBuckets)));
     }
 
-    for (size_t iteration = 0; iteration < sizeof(T); ++iteration) {
+    for (size_t iteration = 0; iteration < sizeof(T); ++iteration) {  // AJB: radix pass iteration
       if (iteration > 0) {
         num_spanning_buckets = DetectSpanningBuckets<T>(device_containers, host_containers, spanning_buckets,
                                                         spanning_bucket_to_gpus_map, gpus, iteration);
@@ -269,12 +278,12 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         size_t gpus_with_spanning = 0;
         if (iteration > 0 && iteration < spanning_buckets.size()) {
           std::vector<bool> gpu_active(num_gpus, false);
-          for (auto& [gid, bucket] : spanning_buckets[iteration]) {
-            for (size_t gi = 0; gi < num_gpus; ++gi) {
+          for (auto& [gid, bucket] : spanning_buckets[iteration]) {  // AJB: radix pass iteration
+            for (size_t gi = 0; gi < num_gpus; ++gi) {  // AJB: radix pass iteration
               if (gpus[gi] == gid) { gpu_active[gi] = true; break; }
             }
           }
-          for (bool a : gpu_active) if (a) gpus_with_spanning++;
+          for (bool a : gpu_active) if (a) gpus_with_spanning++;  // AJB: radix pass iteration
         }
         fprintf(stderr, "[AJB_SNAP][radix_sort][pass] iter=%zu/%zu "
                 "spanning=%zu gpus_active=%zu/%zu\n",
@@ -293,7 +302,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
       }
 
 #pragma omp parallel for num_threads(num_gpus)
-      for (size_t g = 0; g < num_gpus; ++g) {
+      for (size_t g = 0; g < num_gpus; ++g) {  // AJB: radix pass iteration
 
         const int gpu = gpus[g];
         CheckCudaError(cudaSetDevice(gpu));
@@ -307,9 +316,13 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         if (iteration == 0) {
           // AJB: 合并两个连续的iteration==0块——H2D传输+直方图计算
           CheckCudaError(cudaMemcpyAsync(resource_manager.GetKeys(gpu), in_keys + (chunk_size * g),
+          // AJB: memory transfer — async stream candidate
                                          sizeof(T) * g_chunk_size, cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
+                                         // AJB: memory transfer — async stream candidate
           CheckCudaError(cudaMemcpyAsync(resource_manager.GetValues(gpu), in_values + (chunk_size * g),
+          // AJB: memory transfer — async stream candidate
                                          sizeof(V) * g_chunk_size, cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
+                                         // AJB: memory transfer — async stream candidate
           CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(2)));
           CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
 
@@ -323,7 +336,7 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                                                            num_thread_blocks, kNumBlockHistogramsToAggregate);
           CheckCudaLaunchError();
         } else {
-          for (size_t s = 0; s < spanning_buckets[iteration].size(); ++s) {
+          for (size_t s = 0; s < spanning_buckets[iteration].size(); ++s) {  // AJB: radix pass iteration
             if (spanning_buckets[iteration][s].first == gpu) {
               BucketId& current_bucket = spanning_buckets[iteration][s].second;
               BucketId* predecessor = current_bucket.predecessor;
@@ -353,14 +366,14 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
           // AJB: histogram广播——包含自身GPU (upstream也做D2D到自身, CUDA允许)
           const auto* src_hist = device_containers.GetHistograms(gpu, BucketId())->GetGlobalHistogram();
           const size_t hist_bytes = sizeof(uint64_t) * kNumBuckets;
-          for (size_t dest_gpu = 0; dest_gpu < num_gpus; ++dest_gpu) {
+          for (size_t dest_gpu = 0; dest_gpu < num_gpus; ++dest_gpu) {  // AJB: radix pass iteration
             CheckCudaError(cudaMemcpyAsync(
                 device_containers.GetHistograms(gpus[dest_gpu], BucketId())->GetMgpuHistograms() + (g * kNumBuckets),
                 src_hist, hist_bytes,
                 cudaMemcpyDeviceToDevice, stream_pool.GetStream(1)));
           }
         } else {
-          for (size_t s = 0; s < spanning_buckets[iteration].size(); ++s) {
+          for (size_t s = 0; s < spanning_buckets[iteration].size(); ++s) {  // AJB: radix pass iteration
             if (spanning_buckets[iteration][s].first == gpu) {
               BucketId& spanning_bucket = spanning_buckets[iteration][s].second;
 

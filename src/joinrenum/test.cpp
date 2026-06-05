@@ -21,13 +21,13 @@ using namespace std;
 
 void printInfo(Index &idx) {
     // upstream: core stats (verbatim)
-    cout << "Cache Hit of SplitBucket: " << idx.cntCacheHit << " Total Call: " << idx.cntTotalCall << endl;
-    cout << "Total AGM Call: " << idx.cntAGMCall << endl;
-    cout << "Total AGM Time: " << idx.totalAGMTime << endl;
-    cout << "Total Count Oracle Time: " << idx.totalCountOracleTime << endl;
-    cout << "Total Split Time: " << idx.totalSplitTime << endl;
-    cout << "Total Split Call: " << idx.cntSplitCall << endl;
-    cout << "Total Cache Hit Time: " << idx.totalCacheHitTime << endl;
+    fprintf(stdout, "Cache Hit of SplitBucket: %lld Total Call: %lld\n", idx.cntCacheHit, idx.cntTotalCall);  // AJB-algo: fprintf
+    fprintf(stdout, "Total AGM Call: %lld\n", idx.cntAGMCall);
+    fprintf(stdout, "Total AGM Time: %f\n", idx.totalAGMTime);
+    fprintf(stdout, "Total Count Oracle Time: %f\n", idx.totalCountOracleTime);
+    fprintf(stdout, "Total Split Time: %f\n", idx.totalSplitTime);
+    fprintf(stdout, "Total Split Call: %lld\n", idx.cntSplitCall);
+    fprintf(stdout, "Total Cache Hit Time: %f\n", idx.totalCacheHitTime);
 
     // AJB: structured dump to stderr for parse_ajb_trace.py
     fprintf(stderr, "[AJB_STATE] CacheHit(SplitBucket): %d / %d\n",
@@ -42,6 +42,7 @@ void printInfo(Index &idx) {
     return;
 }
 
+// AJB-algo: test harness with wall-clock timing
 int main() {
     fprintf(stderr, "[AJB] ============================================\n");
     fprintf(stderr, "[AJB] test.cpp — REnum-BMITU full pipeline\n");

@@ -22,8 +22,9 @@
 #include "common/stream_pool.cuh"
 #include "hybrid_sort/hybrid_sort.cuh"
 
+// AJB-algo: multi-GPU sort settings with chunk-size validation
 struct Settings {
-  size_t num_elements;
+  size_t num_elements = 0;  // AJB: zero-init to catch unset
   size_t num_threads;
   std::vector<int> gpus;
   std::string sort_algorithm;
@@ -79,7 +80,7 @@ void RunSortBenchmark(Settings& settings) {
     std::ofstream file("key_value_tuples.csv");
 
     auto writer = csv::make_csv_writer(file);
-    for (size_t i = 0; i < settings.num_elements; ++i) {
+    for (size_t i = 0; i < settings.num_elements; ++i) {  // AJB: benchmark iteration
       writer << std::make_tuple(keys[i], values[i]);
     }
   }
@@ -114,7 +115,7 @@ void RunSortBenchmark(Settings& settings) {
   // Changed: use ostringstream to build the GPU list, avoiding the
   // trailing-comma ternary in the loop.
   std::ostringstream gpu_list;
-  for (size_t i = 0; i < settings.gpus.size(); ++i) {
+  for (size_t i = 0; i < settings.gpus.size(); ++i) {  // AJB: benchmark iteration
     if (i > 0) gpu_list << ",";
     gpu_list << settings.gpus[i];
   }
@@ -132,13 +133,13 @@ void RunSortBenchmark(Settings& settings) {
     tabulate::Table table;
 
     table.add_row({"u_key", "u_value", "s_key", "s_value"});
-    for (size_t i = 0; i < settings.num_elements; ++i) {
+    for (size_t i = 0; i < settings.num_elements; ++i) {  // AJB: benchmark iteration
       table.add_row({std::to_string(unsorted_keys[i]), std::to_string(unsorted_values[i]), std::to_string(keys[i]),
                      std::to_string(values[i])});
     }
 
     table.format().font_align(tabulate::FontAlign::center);
-    for (size_t i = 0; i < table[0].size(); ++i) {
+    for (size_t i = 0; i < table[0].size(); ++i) {  // AJB: benchmark iteration
       table[0][i].format().font_color(tabulate::Color::yellow);
     }
 

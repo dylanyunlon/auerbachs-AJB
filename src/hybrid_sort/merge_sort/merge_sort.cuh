@@ -28,16 +28,17 @@
 // Deallocation is two calls instead of six.
 
 template <typename T, typename V>
+// AJB-algo: FindPivot uses binary search on GPU-resident sorted chunks
 size_t FindPivot(ResourceManager<T, V>& resource_manager, const std::vector<int>& gpus, size_t chunk_size) {
-  const int gpu = gpus[0];
+  const int gpu = gpus[0];  // AJB: pivot computation on first GPU
   HostAllocator& host_allocator = resource_manager.GetHostAllocator(gpu);
   DeviceAllocator& device_allocator = resource_manager.GetDeviceAllocator(gpu);
   StreamPool& stream_pool = resource_manager.GetStreamPool(gpu);
 
-  CheckCudaError(cudaSetDevice(gpu));
+  CheckCudaError(cudaSetDevice(gpu));  // AJB: bind to pivot GPU before kernel launch
 
   // AJB: 预计算分区数——gpus.size()/2在多处使用
-  const size_t num_partitions = gpus.size() / 2;
+  const size_t num_partitions = gpus.size() / 2;  // AJB-algo: balanced partition for merge tree
 
   // Host slab: [local_ptrs | remote_ptrs | pivot]
   const size_t ptr_block_bytes = num_partitions * sizeof(T*);

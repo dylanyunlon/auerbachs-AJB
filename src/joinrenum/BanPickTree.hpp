@@ -54,11 +54,21 @@ private:
     int root = -1;
     long long H = 0;
 
+    // AJB-algo: in-order via explicit stack + snprintf batch output
     void printSubTree(int v) {
         if (v == -1) return;
-        printSubTree(pool[v].left);
-        cout << pool[v].low << " " << pool[v].high << " " << pool[v].take << endl;
-        printSubTree(pool[v].right);
+        std::vector<int> stk;
+        stk.reserve(32);
+        int cur = v;
+        char buf[96];
+        while (cur != -1 || !stk.empty()) {
+            while (cur != -1) { stk.push_back(cur); cur = pool[cur].left; }
+            cur = stk.back(); stk.pop_back();
+            int n = snprintf(buf, sizeof(buf), "%lld %lld %lld\n",
+                             pool[cur].low, pool[cur].high, pool[cur].take);
+            fwrite(buf, 1, n, stdout);
+            cur = pool[cur].right;
+        }
     }
 
     void rotateLeft(int& v) {
@@ -160,8 +170,13 @@ public:
 
     void ban(long long low, long long high) {
         ajb_bpt_stats.ban_calls++;
-        long long before_remaining = remaining();
         if (low > high) return;
+        low = std::max(low, 1LL); high = std::min(high, H);
+        if (low > high) return;
+        long long before_remaining = remaining();
+        if (before_remaining <= 0) return;
+        if (pool.size() == pool.capacity())
+            pool.reserve(pool.capacity() < 16 ? 16 : pool.capacity() * 2);
         if (root == -1) {
             pool.emplace_back(low, high);
             root = pool.size() - 1;
@@ -175,23 +190,30 @@ public:
     }
 
     long long pick() {
-        return remaining() ? G() : 0;
+        long long rem = remaining();
+        if (rem <= 0) return 0;
+        long long result = G();
+        // [AJB_BP] invariant: picked value must be available
+        if (result < 1 || result > H) {
+            fprintf(stderr, "[AJB_BP][BanPickTree::pick] OOB result=%lld H=%lld\n", result, H);
+        }
+        return result;
     }
 
     long long remaining() {
         return root != -1 ? H - pool[root].take : H;
     }
 
+    // AJB-algo: three-way compare (fewer branches per iteration)
     bool available(long long x) {
+        if (root == -1) return (x >= 1 && x <= H);
         int u = root;
         while (u != -1) {
-            if (x >= pool[u].low && x <= pool[u].high) return false;
-            if (x < pool[u].low)
-                u = pool[u].left;
-            else
-                u = pool[u].right;
+            if (x < pool[u].low) u = pool[u].left;
+            else if (x > pool[u].high) u = pool[u].right;
+            else return false;
         }
-        return true;
+        return (x >= 1 && x <= H);
     }
 
     bool available(long long low, long long high) {

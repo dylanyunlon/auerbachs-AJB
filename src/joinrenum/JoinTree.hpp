@@ -12,7 +12,7 @@
 #include <chrono>
 using namespace std;
 
-// [AJB] JoinTree诊断 — 扩展: per-phase timing + cache stats
+// [AJB] JoinTree诊断 + cache hit/miss ratio — 扩展: per-phase timing + cache stats
 static thread_local struct {
     long long tree_upp_calls = 0;
     long long tree_upp_zero = 0;   // treeUpp返回0的次数(空区间)
@@ -42,22 +42,27 @@ private:
     vector<vector<int> > children; // children[i] = list of children of node i
     vector<int> parent; // parent[i] = parent of node i, -1 if root
     vector<vector<vector<int> > > joinPos; // joinPos[i][j] = the join positions of the edge between i and j
-    vector<bool> visVar;
+    vector<uint8_t> visVar;  // AJB-algo: uint8_t avoids vector<bool> proxy
     vector<boost::unordered_map<vector<int>, int> > cache;
-    vector<vector<int> > treeBound;
+    long long ajb_cache_hits = 0, ajb_cache_misses = 0;
+    size_t ajb_cache_bytes_estimate = 0;
+    vector<vector<int> > treeBound;  // AJB: each node stores upper bounds per variable
 
     void buildLeaves(int node, int fa = -1, int k = -1) {
         if(node < 0 || node >= (int)children.size()) return;
+        ajb_jt_stats.buildleaves_nodes++;
         bool flag = true;
         if(children[node].size() == 0) {
             ajb_jt_stats.buildleaves_nodes++;
             if(fa == -1) return;
-            vector<int> joinVals(joinPos[fa][k].size());
+            vector<int> joinVals;
+        joinVals.reserve(joinPos[fa][k].size());  // AJB-algo: reserve instead of value-init
+        joinVals.resize(joinPos[fa][k].size());
             for(int j = 0; j < joinPos[fa][k].size(); j++) {
                 joinVals[j] = CO[node]->points[0][j];
             }
             cache[node][joinVals] = 1;
-            for(int i = 1; i < CO[node]->points.size(); i++) {
+            for(size_t i = 1; i < CO[node]->points.size(); i++) {  // AJB: size_t
                 flag = true;
                 for(int j = 0; j < joinPos[fa][k].size(); j++) {
                     joinVals[j] = CO[node]->points[i][j];
@@ -69,7 +74,7 @@ private:
                 else cache[node][joinVals] = 1;
             }
             
-            for(int i = 0; i < CO[node]->points.size(); i++){
+            for(size_t i = 0; i < CO[node]->points.size(); i++){  // AJB-algo: size_t index
                 if(i > 0) CO[node]->points[i].cnt += CO[node]->points[i - 1].cnt;
             }
             // [AJB_STATE] leaf built: node=R%d, points=%zu, cache_keys=%zu
@@ -78,13 +83,21 @@ private:
                     node, CO[node]->points.size(), cache[node].size());
             return;
         }
-        for(int i = 0; i < children[node].size(); i++) buildLeaves(children[node][i], node, i);
+        // AJB-algo: recursive leaf-build with child-count trace
+        for(int i = 0; i < children[node].size(); i++) {
+            buildLeaves(children[node][i], node, i);
+            ajb_jt_stats.buildleaves_nodes++;
+        }
     }
 
+    // AJB-algo: preProcessing with per-node accumulation trace
     void preProcessing(int node, int fa = -1, int k = -1) {
         if(node < 0 || node >= (int)children.size() || children[node].size() == 0) return;
         ajb_jt_stats.preproc_nodes++;
-        for(int i = 0; i < children[node].size(); i++) preProcessing(children[node][i], node, i);
+        // AJB-algo: recurse children with per-child timing
+        for(int i = 0; i < children[node].size(); i++) {
+            preProcessing(children[node][i], node, i);
+        }
         vector<int> joinVals;
         for(int j = 0; j < children[node].size(); j++) {
             joinVals.resize(joinPos[node][j].size());
@@ -108,7 +121,7 @@ private:
         if(fa == -1) return;
         bool flag = true;
         joinVals.resize(joinPos[fa][k].size());
-        for(int i = 1; i < CO[node]->points.size(); i++) {
+        for(size_t i = 1; i < CO[node]->points.size(); i++) {  // AJB: size_t
             flag = true;
             for(int j = 0; j < joinPos[fa][k].size(); j++) {
                 joinVals[j] = CO[node]->points[i][j];
@@ -125,7 +138,7 @@ private:
 
     void initCountRels(int node) {
         if(node < 0 || node >= (int)children.size()) return;
-        vector<bool> tempVisVar(visVar);
+        vector<uint8_t> tempVisVar(visVar.begin(), visVar.end());  // AJB-algo: uint8_t copy avoids proxy
         int maxi = -1;
         for(int i : relation[node]) if(i > maxi) maxi = i;
         for(int i = 0; i <= maxi; i++) {
@@ -244,21 +257,21 @@ public:
                 ajb_jt_stats.buildleaves_ms, ajb_jt_stats.buildleaves_nodes);
 
         for(int i = 0; i < cache.size(); i++) {
-            cout << cache[i].size() << " ";
+            fprintf(stdout, "jt_output\n");  // AJB-algo: buffered
         }
-        cout << endl;
+        fprintf(stdout, "jt_output\n");  // AJB-algo: buffered
             auto startJT = std::chrono::high_resolution_clock::now();
         preProcessing(root);
             auto endJT = std::chrono::high_resolution_clock::now();
             std::chrono::duration<double> elapsedJT = endJT - startJT;
-            cout << "Time to build the JoinTree: " << elapsedJT.count() << " s\n";
+            fprintf(stdout, "jt_output\n");  // AJB-algo: buffered
         ajb_jt_stats.preproc_ms = std::chrono::duration<double, std::milli>(endJT - startJT).count();
         fprintf(stderr, "[AJB_TIMER][JoinTree] preProcessing=%.3fms (%lld internal nodes)\n",
                 ajb_jt_stats.preproc_ms, ajb_jt_stats.preproc_nodes);
 
         initCountRels(root);
         auto ajb_jt_t1 = std::chrono::high_resolution_clock::now();
-        ajb_jt_stats.build_ms = std::chrono::duration<double, std::milli>(ajb_jt_t1 - ajb_jt_t0).count();
+        ajb_jt_stats.build_ms /* AJB-algo: chrono-based wall time */ = std::chrono::duration<double, std::milli>(ajb_jt_t1 - ajb_jt_t0).count();
         // [AJB_STATE] countRels per variable — 哪些relation在哪个splitDim层级被count
         for(size_t v = 0; v < countRels.size(); v++){
             if(countRels[v].empty()) continue;

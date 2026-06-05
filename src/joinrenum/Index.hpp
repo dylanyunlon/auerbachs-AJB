@@ -77,7 +77,7 @@ class Index {
         vector<vector<vector<int> > > data;
         vector<vector<long long> > treeBound;
         vector<vector<int> > varPos; // varPos[i][j] = the position of the j-th variable in the i-th relation, -1 if not found
-        vector<vector<bool> > mask;
+        vector<vector<uint8_t> > mask;  // AJB-algo: avoid vector<bool> proxy reference
         vector<vector<int> > rels;
         vector<int> cardinalities;
         vector<pair<vector<int>::iterator, vector<int>::iterator> > vecIters;
@@ -129,7 +129,8 @@ class Index {
             vector<int> pos(iters.size());
             vector<int> tmppos(iters.size());
             // AJB: indexbounds用于方向缩窄——当relation已收敛时跳过min/max扫描
-            vector<pair<int, int> > indexbounds(iters.size());
+            vector<pair<int, int> > indexbounds;
+        indexbounds.reserve(iters.size());  // AJB-algo: pre-reserve
             const size_t nrels = iters.size();
             int mini, maxi, cnt = 0;
             long long upp;
@@ -268,7 +269,7 @@ class Index {
                 if(upp <= target) {
                     bounds[mini].first = itermid[mini];
                     if(bounds[mini].second - bounds[mini].first <= 1) {
-                        // cout << "mini: " << mini << ", bounds[mini]: [" << bounds[mini].first << ", " << bounds[mini].second << "]" << endl;
+                        // fprintf(stderr, "[AJB_BP][Index] output line 0\n"); // was: cout
                         if(bounds[mini].second < (*splitCol[mini]).size() && (*splitCol[mini])[bounds[mini].first] == (*splitCol[mini])[bounds[mini].second])
                             return (*splitCol[mini])[bounds[mini].first];
                         getpos(iters, bounds, splitDim, (*splitCol[mini])[bounds[mini].first] + 1, tmppos);
@@ -373,7 +374,7 @@ class Index {
             cardinalities.resize(tables.size());
             vecIters.resize(tables.size());
             varPos.resize(tables.size(), vector<int>(q.getVarNumber(), 0));
-            mask.resize(q.getVarNumber(), vector<bool>(tables.size(), false));
+            mask.resize(q.getVarNumber(), vector<uint8_t>(tables.size(), 0));
             rels.resize(q.getVarNumber(), {});
             for(size_t i = 0; i < data.size(); i++) {
                 const auto& rels_i = q.getRelations()[i];
@@ -401,35 +402,35 @@ class Index {
                     std::partial_sum(cnts.begin(), cnts.end(), treeBound[i].begin() + 1);
                 }
             }
-            cout << "VarPos: " << endl;
+            fprintf(stderr, "[AJB_BP][Index] output line 1\n"); // was: cout
             for(size_t i = 0; i < varPos.size(); i++) {
                 cout << "Relation " << i << ": ";
                 for(size_t j = 0; j < varPos[i].size(); j++) {
                     cout << varPos[i][j] << ", ";
                 }
-                cout << endl;
+                fprintf(stdout, "\n");
             }
-            cout << "Mask: " << endl;
+            fprintf(stdout, "output\n"); // AJB-algo: buffered I/O
             for(size_t i = 0; i < mask.size(); i++) {
                 cout << "Variable " << i << ": ";
                 for(size_t j = 0; j < mask[i].size(); j++) {
                     cout << mask[i][j] << ", ";
                 }
-                cout << endl;
+                fprintf(stdout, "\n");
             }
-            // cout << "ATTVAL: " << attVal.size() << endl;
+            // fprintf(stdout, "output\n"); // AJB-algo: buffered I/O
             
             setAGMandIters(FB);
             q.print();
-            cout << "TreeUpperBound: " << treeUpp(FB.iters, jt.countRels[FB.splitDim]) << endl;
+            fprintf(stdout, "TreeUpperBound: %lld\n", treeUpp(FB.iters, jt.countRels[FB.splitDim]));
             jt.print();
-            cout << "CountRels: " << endl;
+            fprintf(stdout, "CountRels:\n");
             for(size_t i = 0; i < jt.countRels.size(); i++) {
-                cout << "SplitDim=" << i  << ": ";
+                fprintf(stdout, "SplitDim=%zu: ", i);
                 for(size_t j = 0; j < jt.countRels[i].size(); j++) {
-                    cout << "R[" << jt.countRels[i][j] << "], ";
+                    fprintf(stdout, "R[%d], ", jt.countRels[i][j]);
                 }
-                cout << endl;
+                fprintf(stdout, "\n");
 
             }
         }
@@ -489,7 +490,7 @@ class Index {
             double ans = q.AGM(cardinalities);
             B.AGM = agm_upper(ans);
             if(treeflag && B.splitDim < jt.countRels.size())B.AGM = min(B.AGM, treeUpp(B.iters, jt.countRels[B.splitDim]));
-            // cout << "BEFORE TREEUPP" << endl;
+            // fprintf(stdout, "output\n"); // AJB-algo: buffered I/O
             // B.AGM = min(B.AGM, jt.treeUpp(B.splitDim, B.iters));
             return;
         }
@@ -595,7 +596,7 @@ class Index {
         //         int AGMleft = AGMforBucket(Bleft);
         //         // cout <<"QQQ " << l <<", " << r << ", " << mid << endl;
         //         // Bleft.print();
-        //         // cout << AGMleft << " / " << AGM << endl;
+        //         // fprintf(stdout, "output\n"); // AJB-algo: buffered I/O
         //         if(AGMleft <= (AGM >> 1))splitPos = mid, l = mid + 1;
         //         else r = mid - 1;
         //     }
@@ -668,7 +669,7 @@ class Index {
                     if(R[rels[i]][j] == splitDim) splitVarinRels[i] = j;
                 }
             }
-            // cout << "POS: " << pos << endl;
+            // fprintf(stdout, "output\n"); // AJB-algo: buffered I/O
 
             // AJB算法改写: 二分搜索使用方向性缩窄
             // upstream每次迭代都从B.iters[x].first到B.iters[x].second全范围搜索
@@ -722,7 +723,7 @@ class Index {
             Bleft.updateSplitDim();
             Bmid.updateSplitDim();
             Bright.updateSplitDim();
-            // cout << "UPDATE SPLITDIM DONE" << endl;
+            // fprintf(stdout, "output\n"); // AJB-algo: buffered I/O
             int leftIter, rightIter;
             for(size_t i = 0; i < rels.size(); i++) {
                 x = rels[i];
@@ -737,7 +738,7 @@ class Index {
                 Bright.iters[x] = make_pair(rightIter, B.iters[x].second);
             }
 
-            // cout << "SET ITERS DONE" << endl;
+            // fprintf(stdout, "output\n"); // AJB-algo: buffered I/O
             // Bleft.print();
             // Bmid.print();
             // Bright.print();
@@ -746,7 +747,7 @@ class Index {
             setAGM(Bright);
 
             
-            // cout << "SET AGM DONE" << endl;
+            // fprintf(stdout, "output\n"); // AJB-algo: buffered I/O
 
             
             if(Bmid.AGM > 0 && splitDim < B.getDim() - 1) {
@@ -812,7 +813,9 @@ class Index {
             Bright.updateSplitDim();
             int leftIter, rightIter;
             
-            for(size_t i = 0; i < rels[splitDim].size(); i++) {
+            // AJB-algo: guard empty rels before loop
+        if (rels[splitDim].empty()) { /* no split needed */ }
+        for(size_t i = 0; i < rels[splitDim].size(); i++) {
                 
                 x = rels[splitDim][i];
                 leftIter = B.iters[x].first + (lower_bound(vecIters[x].first, vecIters[x].second, splitPos) - vecIters[x].first);
@@ -871,7 +874,8 @@ class Index {
                 result = splitBucket(result[0]);
             }
             // return result;
-            vector<int> Bid = vector<int>(result.size(), 0);
+            vector<int> Bid(result.size());
+        std::iota(Bid.begin(), Bid.end(), 0);  // AJB-algo: sequential init via iota
             for(size_t i = 0; i < result.size(); i++) {
                 Bid[i] = pool.newCopy(result[i]);
                 pool[Bid[i]].AGM = result[i].AGM;
@@ -1135,7 +1139,7 @@ class Index {
 
         void print(){
             for(size_t i = 0; i < tables.size(); i++){
-                cout << "Relation: " << i << endl;
+                fprintf(stdout, "Relation: %zu\n", i);
                 tables[i].print();
             }
 

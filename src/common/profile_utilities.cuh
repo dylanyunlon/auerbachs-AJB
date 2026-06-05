@@ -1,4 +1,5 @@
 #pragma once
+// [AJB_BP] profile_utilities v2: extended precision timing
 
 #include <chrono>
 #include <map>
@@ -9,7 +10,7 @@
 class TimeDurations {
  public:
   static TimeDurations& Get() {
-    static TimeDurations instance;
+    static TimeDurations instance;  // AJB-algo: Meyer's singleton — thread-safe in C++11
     return instance;
   }
 

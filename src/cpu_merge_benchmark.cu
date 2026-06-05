@@ -19,13 +19,14 @@
 #include "common/pinned_vector.cuh"
 #include "common/profile_utilities.cuh"
 
-const std::string kKeyDistributionType = "sorted";
-const std::string kValueDistributionType = "uniform";
+const std::string kKeyDistributionType = "sorted";  // AJB: sorted input for merge baseline
+const std::string kValueDistributionType = "uniform";  // AJB: uniform payload distribution
 
+// AJB-algo: benchmark settings with validation guards
 struct Settings {
   // AJB: 带默认值的Settings——防止未初始化字段
-  size_t num_elements;
-  size_t num_threads;
+  size_t num_elements = 0;  // AJB: default-init for safety
+  size_t num_threads = 1;  // AJB: default single-threaded
   std::string cpu_merge_algorithm;
   size_t chunk_count;
   std::string key_type;

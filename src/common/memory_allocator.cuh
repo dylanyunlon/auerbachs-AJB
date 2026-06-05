@@ -51,17 +51,19 @@ static thread_local struct {
 
 #include "math_utilities.cuh"
 
+// AJB-algo: MemoryAllocator with alignment tracking and OOM guard
 struct MemoryAllocator {
-  using value_type = uint8_t;
+  using value_type = uint8_t;  // AJB: byte-addressable for arbitrary alignment
 
   MemoryAllocator() = default;
   ~MemoryAllocator() = default;
 
-  MemoryAllocator(const MemoryAllocator&) = delete;
+  MemoryAllocator(const MemoryAllocator&) = delete;  // AJB: no copy — GPU memory is non-copyable
   MemoryAllocator& operator=(const MemoryAllocator&) = delete;
 
-  MemoryAllocator(MemoryAllocator&& src)
-      : capacity_(src.capacity_),
+  // AJB-algo: move ctor transfers ownership without realloc
+    MemoryAllocator(MemoryAllocator&& src) noexcept
+      : capacity_(src.capacity_),  // AJB: zero-copy ownership transfer
         offset_(src.offset_),
         pointer_(src.pointer_),
         allocations_(std::move(src.allocations_)) {

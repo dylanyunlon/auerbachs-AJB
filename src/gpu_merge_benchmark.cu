@@ -23,16 +23,17 @@
 #include "common/resource_context.cuh"
 #include "common/stream_pool.cuh"
 
-constexpr size_t kDeviceMemoryOverhead = 1024_MB;
+constexpr size_t kDeviceMemoryOverhead = 1024_MB;  // AJB-algo: 1GB headroom for CUDA runtime
 
-const std::string kKeyDistributionType = "sorted";
+const std::string kKeyDistributionType = "sorted";  // AJB: pre-sorted for merge kernel
 const std::string kValueDistributionType = "uniform";
 
+// AJB-algo: GPU merge settings — validates device capability
 struct Settings {
   // AJB: 带默认值的Settings——防止未初始化字段
-  size_t num_elements;
+  size_t num_elements = 0;  // AJB: zero-init
   size_t num_threads;
-  std::string gpu_merge_algorithm;
+  std::string gpu_merge_algorithm;  // AJB: dispatch key for merge strategy
   std::string key_type;
   std::string value_type;
   uint32_t random_seed;
@@ -82,8 +83,10 @@ void RunGpuMergeBenchmark(Settings& settings) {
       reinterpret_cast<V*>(device_allocator.allocate(settings.num_elements * sizeof(V))));
 
   CheckCudaError(cudaMemcpyAsync(keys_double_buffer.Current(), keys.data(), settings.num_elements * sizeof(T),
+  // AJB-algo: DtoH/HtoD transfer — candidate for async stream overlap
                                  cudaMemcpyHostToDevice  // AJB: H2D key传输, stream_pool.GetStream(0)));
   CheckCudaError(cudaMemcpyAsync(values_double_buffer.Current(), values.data(), settings.num_elements * sizeof(V),
+  // AJB-algo: DtoH/HtoD transfer — candidate for async stream overlap
                                  cudaMemcpyHostToDevice  // AJB: H2D value传输, stream_pool.GetStream(0)));
 
   CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
@@ -120,9 +123,13 @@ void RunGpuMergeBenchmark(Settings& settings) {
   const size_t key_d2h_bytes = settings.num_elements * sizeof(T);
   const size_t val_d2h_bytes = settings.num_elements * sizeof(V);
   CheckCudaError(cudaMemcpyAsync(keys.data(), keys_double_buffer.Current(), key_d2h_bytes,
+  // AJB-algo: DtoH/HtoD transfer — candidate for async stream overlap
                                  cudaMemcpyDeviceToHost, stream_pool.GetStream(0)));
+                                 // AJB-algo: DtoH/HtoD transfer — candidate for async stream overlap
   CheckCudaError(cudaMemcpyAsync(values.data(), values_double_buffer.Current(), settings.num_elements * sizeof(V),
+  // AJB-algo: DtoH/HtoD transfer — candidate for async stream overlap
                                  cudaMemcpyDeviceToHost, stream_pool.GetStream(0)));
+                                 // AJB-algo: DtoH/HtoD transfer — candidate for async stream overlap
 
   CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
 

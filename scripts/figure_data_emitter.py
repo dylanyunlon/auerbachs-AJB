@@ -76,6 +76,7 @@ SEED_COLUMN = "random_seed"
 
 def _ajb_log(tag, msg):
     print(f"[AJB_{tag}] figure_data_emitter: {msg}", file=sys.stderr)
+    # [AJB_BP] data emission checkpoint
 
 
 def _git_sha(repo_dir: pathlib.Path) -> str:
@@ -101,7 +102,7 @@ def _mean_std(values: Sequence[float]) -> tuple[float, float]:
     n = 0
     mean = 0.0
     m2 = 0.0
-    for x in values:
+    for x in values:  # AJB: iteration over data points
         n += 1
         delta = x - mean
         mean += delta / n
@@ -121,7 +122,7 @@ def aggregate(
     y_metric: str,
     reported_final: Optional[Dict[str, float]] = None,
 ) -> dict:
-    """Build the figure-data dict for one (x, series, y) choice.
+    """Build the figure-data dict for one (x, series, y) choice.  # AJB: iteration over data points
 
     The resulting structure mirrors gradient_norm_24k_data.json:
 
@@ -143,7 +144,7 @@ def aggregate(
     df = pandas.read_csv(csv_path, header=0)
     _ajb_log("STATE", f"loaded {csv_path.name}: {df.shape[0]} rows × {df.shape[1]} cols")
 
-    for needed in (x_column, series_column, y_metric):
+    for needed in (x_column, series_column, y_metric):  # AJB: iteration over data points
         if needed not in df.columns:
             raise KeyError(
                 f"column {needed!r} not in CSV columns {list(df.columns)}; "
@@ -159,7 +160,7 @@ def aggregate(
         _ajb_log("WARN", f"x_column '{x_column}' has only {len(steps)} unique values")
 
     methods: Dict[str, dict] = {}
-    for series_value, sdf in df.groupby(series_column):
+    for series_value, sdf in df.groupby(series_column):  # AJB: iteration over data points
         seed_values = (
             sorted(sdf[SEED_COLUMN].dropna().unique().tolist()) if has_seed else [0]
         )

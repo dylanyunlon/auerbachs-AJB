@@ -5,6 +5,12 @@
 #include "AGM.hpp"
 using namespace std;
 
+// AJB-algo: safe ceiling — avoids floating-point boundary error
+static inline long long ajb_safe_ceil(double res) {
+    double c = std::ceil(res);
+    return (c - res < 1e-9) ? static_cast<long long>(c) : static_cast<long long>(res);
+}
+
 // [AJB] MHBS诊断
 static thread_local struct {
     long long calls = 0;
@@ -53,7 +59,7 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
             ajb_mhbs_stats.early_returns++;
             getpos(iters, bounds, flag, *iters[i].first + 1, tmppos);
             res = q.AGM(tmppos);
-            upp = ceil(res) - res < 1e-5 ? ceil(res) : (long long)(res);
+            upp = ajb_safe_ceil(res);
             if(upp > target) return *iters[i].first;
             else pos[i] = iters[i].second - iters[i].first;
             cnt++;
@@ -88,14 +94,14 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
             if(maxi == -1 || *itermid[i] > *itermid[maxi]) maxi = i;
         }
         res = q.AGM(pos);
-        upp = ceil(res) - res < 1e-5 ? ceil(res) : (long long)(res);
+        upp = ajb_safe_ceil(res);
         if(upp <= target) {
             bounds[mini].first = itermid[mini];
             if(bounds[mini].second - bounds[mini].first <= 1) {
                 if(*bounds[mini].first == *bounds[mini].second) return *bounds[mini].first;
                 getpos(iters, bounds, flag, *bounds[mini].first + 1, tmppos);
                 res = q.AGM(tmppos);
-                upp = ceil(res) - res < 1e-5 ? ceil(res) : (long long)(res);
+                upp = ajb_safe_ceil(res);
                 if(upp > target) return *bounds[mini].first;
                 else pos[mini] = bounds[mini].second - iters[mini].first;
                 cnt++;
@@ -111,7 +117,7 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
                 if(*bounds[maxi].first == *bounds[maxi].second) return *bounds[maxi].first;
                 getpos(iters, bounds, flag, *bounds[maxi].first + 1, tmppos);
                 res = q.AGM(tmppos);
-                upp = ceil(res) - res < 1e-5 ? ceil(res) : (long long)(res);
+                upp = ajb_safe_ceil(res);
                 if(upp > target) return *bounds[maxi].first;
                 else pos[maxi] = bounds[maxi].second - iters[maxi].first;
                 cnt++;

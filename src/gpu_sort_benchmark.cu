@@ -24,7 +24,7 @@
 #include "common/stream_pool.cuh"
 
 // AJB: GPU内存开销——CUB临时缓冲区+stream同步
-constexpr size_t kDeviceMemoryOverhead = 1024_MB;
+constexpr size_t kDeviceMemoryOverhead = 1024_MB;  // AJB-algo: reserve for radix histogram buffers
 
 // AJB: 数据分布——均匀键+有序值
 const std::string kKeyDistributionType = "uniform";

@@ -11,15 +11,16 @@
 #include "hybrid_sort/resource_manager.cuh"
 
 template <typename T, typename V>
+// AJB-algo: per-GPU device memory containers for radix sort
 class DeviceContainers {
  public:
   DeviceContainers(const std::vector<int>& gpus, size_t chunk_size, size_t num_blocks,
                    ResourceManager<T, V>& resource_manager)
       : gpus_(gpus),
-        histogram_buffers_(gpus.size()),
+        histogram_buffers_(gpus.size()),  // AJB: one histogram buffer per GPU
         histogram_maps_(gpus.size()),
         next_histogram_index_(gpus.size(), 0),
-        epsilon_(kEpsilon * chunk_size),
+        epsilon_(kEpsilon * chunk_size),  // AJB-algo: epsilon tolerance for bucket boundary overlap
         gamma_(kGamma * chunk_size) {
 
     // Upstream: std::map<int,int> 做GPU id→index映射.

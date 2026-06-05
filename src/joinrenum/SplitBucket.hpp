@@ -54,8 +54,9 @@ class Bucket {
          *       will be set to the size of the lowerBound vector.
          */
         Bucket(vector<int> lowerBound, vector<int> upperBound){
-            this->lowerBound = lowerBound;
-            this->upperBound = upperBound;
+            // AJB-algo: move semantics to avoid copy when rvalue
+            this->lowerBound = std::move(lowerBound);
+            this->upperBound = std::move(upperBound);
             while(splitDim < lowerBound.size() && lowerBound[splitDim] == upperBound[splitDim])splitDim++;
             // [AJB_TRACE] Bucket ctor: scan dimensions for first non-degenerate
             if((int)lowerBound.size() > ajb_split_stats.max_dim_seen)
@@ -112,8 +113,9 @@ class Bucket {
 
         bool operator<(const Bucket& B) const {
             if (lowerBound.size() != B.getLowerBound().size() || upperBound.size() != B.getUpperBound().size()) {
-                cout << "Bucket size mismatch @ lessEQ" << endl;
-                cout << lowerBound.size() << " != " << B.getLowerBound().size() << "||" << upperBound.size() << " != " << B.getUpperBound().size() << endl;
+                // AJB-algo: fprintf diagnostic instead of cout
+                fprintf(stderr, "[AJB_BP][Bucket::op<] size mismatch: %zu!=%zu || %zu!=%zu\n",
+                        lowerBound.size(), B.getLowerBound().size(), upperBound.size(), B.getUpperBound().size());
                 return false;
             }
             if (lowerBound < B.getLowerBound()) return true;
@@ -128,12 +130,14 @@ class Bucket {
             return newBucket;
         }
 
+        // AJB-algo: print via snprintf buffer (avoids cout stream overhead)
         void print() const {
-            cout << "Bucket(splitDim=" << splitDim << "): ";
-            for(int i = 0; i < lowerBound.size(); i++){
-                cout << "[" << lowerBound[i] << ", " << upperBound[i] << "] ";
-            }
-            cout << endl;
+            char buf[512]; int off = 0;
+            off += snprintf(buf+off, sizeof(buf)-off, "Bucket(splitDim=%d): ", splitDim);
+            for(size_t i = 0; i < lowerBound.size(); i++)
+                off += snprintf(buf+off, sizeof(buf)-off, "[%d, %d] ", lowerBound[i], upperBound[i]);
+            off += snprintf(buf+off, sizeof(buf)-off, "\n");
+            fwrite(buf, 1, off, stdout);
         }
 
         // [AJB] dump Bucket state to stderr for trace parsing

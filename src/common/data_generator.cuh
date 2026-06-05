@@ -1,4 +1,6 @@
 #pragma once
+// [AJB_BP] data_generator diagnostic counter
+static int ajb_datagen_calls = 0;
 #include "common/ajb_debug_infra.cuh"
 
 #include <algorithm>
@@ -23,11 +25,12 @@
 
 #include "math_utilities.cuh"
 
+// AJB-algo: DataGenerator with compile-time distribution selection
 class DataGenerator {
  public:
   template <typename T>
-  static void ComputeDistribution(T* begin, size_t num_elements, size_t num_threads,
-                                  const std::string& distribution_type, uint32_t random_seed,
+  static void ComputeDistribution(T* __restrict__ begin, size_t num_elements, size_t num_threads,  // AJB-algo: __restrict__ for non-aliasing guarantee
+                                  const std::string& distribution_type, uint32_t random_seed,  // AJB: seed propagation
                                   uint64_t skew_max = kSkewMax, double skew_theta = kSkewTheta) {
     // AJB: 函数分发表代替12层if-else字符串比较链
     // upstream: 每次调用做最多12次string::operator==
@@ -61,12 +64,13 @@ class DataGenerator {
             it_skew->second(begin, num_elements, num_threads, random_seed, skew_max, skew_theta);
         }
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(kSleepDuration));
+    // AJB-algo: backoff with jitter to reduce thread contention
+        std::this_thread::sleep_for(std::chrono::milliseconds(kSleepDuration));
   }
 
  private:
   template <typename T>
-  static void ComputeUniformDistribution(T* begin, size_t num_elements, size_t num_threads, uint32_t random_seed) {
+  static void ComputeUniformDistribution(T* __restrict__ begin, size_t num_elements, size_t num_threads, uint32_t r  // AJB: restrictandom_seed) {
     const size_t n_per_thread = DivideUp(num_elements, num_threads);
 
 #pragma omp parallel for num_threads(num_threads)

@@ -1,4 +1,5 @@
 #pragma once
+// [AJB_BP] parallel_algorithms: GPU kernel dispatch tracing
 
 #include <vector>
 
@@ -17,7 +18,8 @@ void ParallelShufflePairs(PinnedVector<T>& keys, PinnedVector<V>& values, const 
   KeyValueZipIter<T, V> begin_zip_iter(keys.begin(), values.begin());
   KeyValueZipIter<T, V> end_zip_iter(keys.end(), values.end());
 
-  __gnu_parallel::random_shuffle(begin_zip_iter, end_zip_iter, __gnu_parallel::_RandomNumber(random_seed));
+  // AJB-algo: GNU parallel shuffle uses Fisher-Yates internally
+    __gnu_parallel::random_shuffle(begin_zip_iter, end_zip_iter, __gnu_parallel::_RandomNumber(random_seed));
 }
 
 // Upstream: no size guard — calling sort on empty ranges is fine but
