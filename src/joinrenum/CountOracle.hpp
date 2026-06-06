@@ -3,16 +3,24 @@ using namespace std;
 // sumCnt(pl,pr) = O(log n) via binary search, 是treeUpp的核心瓶颈
 
 // [AJB] CountOracle诊断
+// M915: exponential doubling search, tree level stats
 static thread_local struct {
     long long sumcnt_calls = 0;
     long long sumcnt_zero  = 0;  // 返回0的次数 = empty range
     long long count_calls  = 0;
     long long range_calls  = 0;
+    long long exp_doubling_steps = 0;  // M915: exponential doubling总步数
+    long long exp_doubling_saves = 0;  // M915: 比标准binary search节省的步数
     void dump(const char* tag = "CountOracle") {
+#ifdef AJB_DEBUG
         fprintf(stderr, "[AJB_STATE][%s] sumCnt=%lld(zero=%lld) count=%lld getRange=%lld\n",
                 tag, sumcnt_calls, sumcnt_zero, count_calls, range_calls);
+        fprintf(stderr, "[AJB_STATE][%s] exp_doubling: steps=%lld saves=%lld\n",
+                tag, exp_doubling_steps, exp_doubling_saves);
+#endif
     }
-    void reset() { sumcnt_calls = sumcnt_zero = count_calls = range_calls = 0; }
+    void reset() { sumcnt_calls = sumcnt_zero = count_calls = range_calls = 0;
+                    exp_doubling_steps = exp_doubling_saves = 0; }
 } ajb_co_stats;
 
 /**
@@ -205,7 +213,9 @@ public:
         sort(points.begin(), points.end());
         this->points = points;
         // [AJB_BP] construction完成: bounds + per-dim mean + spread ratio
+        // M915: tree level stats — 分析点集在每个维度的分布层级
         // spread ratio = range/mean, 高ratio说明数据分散, 低ratio说明聚集
+#ifdef AJB_DEBUG
         fprintf(stderr, "[AJB_BP][CountOracle] built: %zu pts, dim=%zu\n", npts, ndim);
         for(size_t d = 0; d < ndim; d++){
             double mean = npts > 0 ? dim_sum[d] / npts : 0.0;
@@ -214,6 +224,17 @@ public:
             fprintf(stderr, "[AJB_BP][CountOracle]   dim%zu: [%d,%d] mean=%.1f spread=%.2f\n",
                     d, lowerbound[d], upperbound[d], mean, spread);
         }
+        // M915: tree level stats — 统计每个值的出现频率(基于sorted points)
+        // 用首维的唯一值数量作为tree顶层节点数的估算
+        if(npts > 1) {
+            int unique_dim0 = 1;
+            for(size_t i = 1; i < npts; i++) {
+                if(points[i][0] != points[i-1][0]) unique_dim0++;
+            }
+            fprintf(stderr, "[AJB_BP][CountOracle]   tree_level_stats: dim0_unique=%d density=%.2f\n",
+                    unique_dim0, (double)npts / unique_dim0);
+        }
+#endif
     }
 
     int sumCnt(const Point<T> &pl, const Point<T> &pr) {
@@ -223,14 +244,52 @@ public:
             ajb_co_stats.sumcnt_zero++;
             return 0;
         }
-        // AJB: 用ptrdiff_t偏移量代替iterator, 避免iterator拷贝开销
-        auto itl = lower_bound(points.begin(), points.end(), pl);
+        // AJB M915: exponential doubling for lower_bound
+        // 标准lower_bound在整个points上搜索: O(log N)
+        // 当结果在数组前半部分时, exponential doubling先找到[0, 2^k)的窗口
+        // 然后只在该窗口内binary search: O(log k) where k = 结果位置
+        auto itl = points.begin();
+        auto itl_end = points.end();
+        const size_t total = points.size();
+        if(total > 64) {
+            // exponential doubling phase: 倍增步长直到越过目标
+            size_t step = 1;
+            size_t pos = 0;
+            while(pos + step < total && points[pos + step] < pl) {
+                pos += step;
+                step <<= 1;
+                ajb_co_stats.exp_doubling_steps++;
+            }
+            // 在[pos, min(pos+step, total))内binary search
+            itl = std::lower_bound(points.begin() + pos, 
+                                   points.begin() + std::min(pos + step, total), pl);
+            // 计算节省的步数(估算)
+            if(step > 1) {
+                int standard_steps = 0;
+                size_t t = total;
+                while(t > 1) { t >>= 1; standard_steps++; }
+                int actual_steps = 0;
+                t = std::min(step, total - pos);
+                while(t > 1) { t >>= 1; actual_steps++; }
+                if(standard_steps > actual_steps) ajb_co_stats.exp_doubling_saves += (standard_steps - actual_steps);
+            }
+        } else {
+            itl = lower_bound(points.begin(), points.end(), pl);
+        }
         auto itr = upper_bound(itl, points.end(), pr);  // 从itl开始搜索——缩小范围
+
         int result;
         if(itr == points.begin()) result = 0;
         else if(itl == points.begin()) result = (itr - 1)->cnt;
         else result = (itr - 1)->cnt - (itl - 1)->cnt;
         if(result == 0) ajb_co_stats.sumcnt_zero++;
+#ifdef AJB_DEBUG
+        // M915: 打印查询范围、遍历的节点数、返回的count值
+        if(ajb_co_stats.sumcnt_calls <= 5) {
+            fprintf(stderr, "[AJB_DEBUG][CountOracle] sumCnt: range_size=%ld result=%d total=%zu\n",
+                    (long)(itr - itl), result, points.size());
+        }
+#endif
         return result;
     }
 
@@ -385,15 +444,18 @@ public:
             for(int i = total - limit; i < total; i++) points[i].print();
         }
         // [AJB_BP] 分位数: 25%/50%/75%位置的点的cnt值
+#ifdef AJB_DEBUG
         if(total >= 4) {
             fprintf(stderr, "[AJB_BP][CountOracle] cnt@quartiles: Q1=%lld Q2=%lld Q3=%lld max=%lld\n",
                     points[total/4].cnt, points[total/2].cnt,
                     points[3*total/4].cnt, points[total-1].cnt);
         }
+#endif
     }
 
     // [AJB] 诊断dump: 输出排序验证 + per-dim值域 + prefix-sum一致性检查
     void ajb_dump_endpoints(int n = 3) const {
+#ifdef AJB_DEBUG
         int total = static_cast<int>(points.size());
         fprintf(stderr, "[AJB_BP][CountOracle] === diagnostic dump (%d points) ===\n", total);
         // 排序正确性: 检查前100个相邻pair
@@ -407,6 +469,7 @@ public:
         for(int i = 0; i < min(n, total); i++) points[i].ajb_dump("  head");
         if(total > 2*n) fprintf(stderr, "[AJB_BP]   ... (%d omitted)\n", total - 2*n);
         for(int i = max(n, total - n); i < total; i++) points[i].ajb_dump("  tail");
+#endif
     }
 
 };

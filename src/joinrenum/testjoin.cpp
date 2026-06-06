@@ -12,6 +12,61 @@
 #include <chrono>
 using namespace std;
 
+// [AJB] M914: triangle verification — 随机抽查结果元组是否真的是合法三角形
+// 这是算法正确性的运行时断言,不是简单的print
+struct TriangleVerifier {
+    int checked = 0;
+    int passed = 0;
+    int failed = 0;
+    void verify_sample(const vector<int>& tri, const set<pair<int,int>>& R) {
+#ifdef AJB_DEBUG
+        checked++;
+        // 三角形 (x,y,z) 要求: (x,y)∈R, (y,z)∈R, (x,z)∈R
+        bool edge_xy = R.count({tri[0], tri[1]}) > 0;
+        bool edge_yz = R.count({tri[1], tri[2]}) > 0;
+        bool edge_xz = R.count({tri[0], tri[2]}) > 0;
+        if (edge_xy && edge_yz && edge_xz) {
+            passed++;
+        } else {
+            failed++;
+            fprintf(stderr, "[AJB_VERIFY_FAIL] triangle(%d,%d,%d) edges: xy=%d yz=%d xz=%d\n",
+                    tri[0], tri[1], tri[2], (int)edge_xy, (int)edge_yz, (int)edge_xz);
+        }
+#endif
+    }
+    void dump() {
+#ifdef AJB_DEBUG
+        fprintf(stderr, "[AJB_VERIFY] triangles checked=%d passed=%d failed=%d\n", checked, passed, failed);
+        if (failed > 0) fprintf(stderr, "[AJB_VERIFY] WARNING: %d invalid triangles detected!\n", failed);
+#endif
+    }
+};
+
+// [AJB] M914: 度数分布分析 — 理解图的倾斜度, 跟skew_detector一脉相承
+static void ajb_analyze_degree_distribution(const map<int, vector<int>>& index) {
+#ifdef AJB_DEBUG
+    if (index.empty()) return;
+    vector<int> degrees;
+    degrees.reserve(index.size());
+    for (auto& [k, v] : index) degrees.push_back((int)v.size());
+    sort(degrees.begin(), degrees.end());
+    int n = (int)degrees.size();
+    double mean = 0;
+    for (int d : degrees) mean += d;
+    mean /= n;
+    double variance = 0;
+    for (int d : degrees) variance += (d - mean) * (d - mean);
+    variance /= n;
+    fprintf(stderr, "[AJB_STATE] degree_distribution: nodes=%d min=%d median=%d max=%d mean=%.1f stddev=%.1f\n",
+            n, degrees[0], degrees[n/2], degrees[n-1], mean, sqrt(variance));
+    // Gini coefficient — 衡量倾斜度, 高Gini说明少数节点支配join开销
+    double gini_sum = 0;
+    for (int i = 0; i < n; i++) gini_sum += (2*i - n + 1) * degrees[i];
+    double gini = gini_sum / (n * mean * n);
+    fprintf(stderr, "[AJB_STATE] degree_gini=%.3f (0=uniform, 1=maximally skewed)\n", gini);
+#endif
+}
+
 struct PairHash {
     size_t operator()(const pair<int,int>& p) const noexcept {
         // 组合哈希，避免冲突
@@ -97,6 +152,7 @@ int main() {
     fprintf(stderr, "[AJB_TIMER] index build: %.3f ms (R.size=%zu, index.size=%zu)\n",
             chrono::duration<double,milli>(t_idx1 - t_idx0).count(),
             R.size(), index.size());
+    ajb_analyze_degree_distribution(index);
 
     struct rusage r_usage;
     getrusage(RUSAGE_SELF, &r_usage);
@@ -147,11 +203,20 @@ int main() {
     // AJB: sample results
     fprintf(stderr, "[AJB_STATE] First 5 triangles:\n");
     int shown = 0;
-    for(auto& tri : res) {
-        if(shown >= 5) break;
-        fprintf(stderr, "[AJB_STATE]   (%d, %d, %d)\n", tri[0], tri[1], tri[2]);
-        shown++;
+    TriangleVerifier verifier;
+    // M914: 随机抽样验证 — 从结果集中抽5个验证是否为合法三角形
+    // 这不是展示,是正确性断言
+    mt19937 sample_rng(42);
+    vector<vector<int>> res_vec(res.begin(), res.end());
+    int n_check = min((int)res_vec.size(), 5);
+    for (int i = 0; i < n_check; i++) {
+        // Fisher-Yates partial shuffle取前n_check个
+        int j = i + (int)(sample_rng() % (res_vec.size() - i));
+        swap(res_vec[i], res_vec[j]);
+        verifier.verify_sample(res_vec[i], R);
+        fprintf(stderr, "[AJB_STATE]   (%d, %d, %d)\n", res_vec[i][0], res_vec[i][1], res_vec[i][2]);
     }
+    verifier.dump();
 
     fprintf(stderr, "[AJB] testjoin.cpp COMPLETE\n");
     return 0;

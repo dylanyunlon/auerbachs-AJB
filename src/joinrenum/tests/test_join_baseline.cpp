@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[AJB_TIMER] cache_flush: %.1f ms\n",
             chrono::duration<double,milli>(t_flush1 - t_flush0).count());
 
-    // upstream: load edge data — try .tbl then .csv
+    // upstream: load edge data — try .tbl then .csv, auto-detect delimiter
     string filename = dbpath + "Ra.tbl";
     char delim = '|';
     ifstream infile(filename);
@@ -71,6 +71,18 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[AJB_FAIL] Cannot open %sRa.tbl or %sRa.csv\n",
                 dbpath.c_str(), dbpath.c_str());
         return 1;
+    }
+    // [AJB] M918: 自动探测分隔符 — 读首行判断含 '|' 还是 ','
+    {
+        string probe_line;
+        if(getline(infile, probe_line)) {
+            if(probe_line.find('|') != string::npos) delim = '|';
+            else if(probe_line.find(',') != string::npos) delim = ',';
+            else if(probe_line.find('\t') != string::npos) delim = '\t';
+            // 回到文件开头重新读取
+            infile.clear();
+            infile.seekg(0, ios::beg);
+        }
     }
     fprintf(stderr, "[AJB_TRACE] Loading from %s (delim='%c')\n", filename.c_str(), delim);
 
@@ -98,12 +110,19 @@ int main(int argc, char** argv) {
             chrono::duration<double,milli>(t_load1 - t_load0).count(),
             data.size(), parse_errors);
 
-    // AJB: edge distribution analysis
+    // AJB: edge distribution analysis — 三角join的三个relation视角
     fprintf(stderr, "[AJB_STATE] --- Edge distribution ---\n");
     set<int> distinct_src, distinct_dst;
     for(auto& [x,y] : data) { distinct_src.insert(x); distinct_dst.insert(y); }
     fprintf(stderr, "[AJB_STATE]   edges=%zu  distinct_src=%zu  distinct_dst=%zu\n",
             data.size(), distinct_src.size(), distinct_dst.size());
+    // [AJB] M918: 三角join = R(x,y) ⋈ R(y,z) ⋈ R(x,z), 三个relation视角
+    // R_xy = forward edges, R_yz = index lookup, R_xz = membership check
+    fprintf(stderr, "[AJB_STATE] --- Triangle join relation sizes ---\n");
+    fprintf(stderr, "[AJB_STATE]   R_xy (forward edges)       = %zu\n", data.size());
+    fprintf(stderr, "[AJB_STATE]   R_yz (index-lookup source) = %zu (same relation, %zu distinct keys)\n",
+            data.size(), distinct_dst.size());
+    fprintf(stderr, "[AJB_STATE]   R_xz (membership check)    = will deduplicate into set\n");
 
     // upstream: build index
     auto t_idx0 = chrono::high_resolution_clock::now();
@@ -161,14 +180,42 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[AJB_STATE] throughput: %.1f M probes/s  %.1f K edges/s\n",
                 total / join_sec / 1e6, count / join_sec / 1e3);
 
-    // AJB: sample results
-    fprintf(stderr, "[AJB_STATE] First 5 triangles:\n");
-    int shown = 0;
-    for(auto& tri : res) {
-        if(shown >= 5) break;
-        fprintf(stderr, "[AJB_STATE]   (%d, %d, %d)\n", tri[0], tri[1], tri[2]);
-        shown++;
+    // [AJB] M918: 结果抽样验证 — 随机检查5个结果元组
+    // 验证: (x,y) ∈ R, (y,z) ∈ R, (x,z) ∈ R
+    if(!res.empty()) {
+        fprintf(stderr, "[AJB_STATE] --- Random sample verification (5 tuples) ---\n");
+        vector<vector<int>> res_vec(res.begin(), res.end());
+        srand(42);
+        int sample_count = min((int)res_vec.size(), 5);
+        int verified_ok = 0;
+        for(int s = 0; s < sample_count; s++) {
+            int idx = rand() % (int)res_vec.size();
+            int x = res_vec[idx][0], y = res_vec[idx][1], z = res_vec[idx][2];
+            bool xy_ok = R.count({x, y}) > 0;
+            bool yz_ok = R.count({y, z}) > 0;
+            bool xz_ok = R.count({x, z}) > 0;
+            bool all_ok = xy_ok && yz_ok && xz_ok;
+            if(all_ok) verified_ok++;
+            fprintf(stderr, "[AJB_STATE]   sample[%d]: (%d,%d,%d) xy=%s yz=%s xz=%s → %s\n",
+                    s, x, y, z,
+                    xy_ok ? "OK" : "FAIL", yz_ok ? "OK" : "FAIL", xz_ok ? "OK" : "FAIL",
+                    all_ok ? "PASS" : "FAIL");
+        }
+        fprintf(stderr, "[AJB_STATE]   verified: %d/%d OK\n", verified_ok, sample_count);
     }
+
+    // [AJB] M918: 各阶段耗时汇总
+    double flush_ms = chrono::duration<double,milli>(t_flush1 - t_flush0).count();
+    double load_ms = chrono::duration<double,milli>(t_load1 - t_load0).count();
+    double idx_ms = chrono::duration<double,milli>(t_idx1 - t_idx0).count();
+    double join_ms = join_sec * 1000.0;
+    double total_ms = flush_ms + load_ms + idx_ms + join_ms;
+    fprintf(stderr, "[AJB_TIMER] --- Phase breakdown ---\n");
+    fprintf(stderr, "[AJB_TIMER]   cache_flush : %8.3f ms (%5.1f%%)\n", flush_ms, 100.0*flush_ms/total_ms);
+    fprintf(stderr, "[AJB_TIMER]   data_load   : %8.3f ms (%5.1f%%)\n", load_ms, 100.0*load_ms/total_ms);
+    fprintf(stderr, "[AJB_TIMER]   index_build : %8.3f ms (%5.1f%%)\n", idx_ms, 100.0*idx_ms/total_ms);
+    fprintf(stderr, "[AJB_TIMER]   triangle_join:%8.3f ms (%5.1f%%)\n", join_ms, 100.0*join_ms/total_ms);
+    fprintf(stderr, "[AJB_TIMER]   total       : %8.3f ms\n", total_ms);
 
     ajbMem("post_join");
     fprintf(stderr, "[AJB] VERDICT: test_join_baseline PASSED\n");

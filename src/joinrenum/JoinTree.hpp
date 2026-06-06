@@ -6,10 +6,12 @@
 //   cache occupancy tracking, treeUpp convergence logging (zero-rate),
 //   buildLeaves leaf-node cardinality dump, and preProcessing per-node
 //   cnt accumulation trace for debugging incorrect AGM bounds.
+// M914: bound cache strategy, LP solve status trace, join tree structure dump
 // =============================================================================
 #include <boost/unordered_map.hpp>
 #include <queue>
 #include <chrono>
+#include <functional>  // M914: for hash
 using namespace std;
 
 // [AJB] JoinTree诊断 + cache hit/miss ratio — 扩展: per-phase timing + cache stats
@@ -19,18 +21,26 @@ static thread_local struct {
     long long buildleaves_nodes = 0; // buildLeaves处理的叶子数
     long long preproc_nodes = 0;     // preProcessing处理的内部节点数
     long long cache_entries = 0;     // cache总条目数
+    long long bcache_hits = 0;       // M914: bound cache hits
+    long long bcache_misses = 0;     // M914: bound cache misses
     double    build_ms = 0.0;
     double    buildleaves_ms = 0.0;
     double    preproc_ms = 0.0;
     double    bfs_ms = 0.0;
     void dump(const char* tag = "JoinTree") {
+#ifdef AJB_DEBUG
         fprintf(stderr, "[AJB_STATE][%s] treeUpp_calls=%lld zero=%lld leaves=%lld preproc_nodes=%lld cache=%lld\n",
                 tag, tree_upp_calls, tree_upp_zero, buildleaves_nodes, preproc_nodes, cache_entries);
+        fprintf(stderr, "[AJB_STATE][%s] bound_cache: hits=%lld misses=%lld hit_rate=%.2f%%\n",
+                tag, bcache_hits, bcache_misses,
+                (bcache_hits + bcache_misses) > 0 ? 100.0 * bcache_hits / (bcache_hits + bcache_misses) : 0.0);
         fprintf(stderr, "[AJB_TIMER][%s] total=%.3fms bfs=%.3fms leaves=%.3fms preproc=%.3fms\n",
                 tag, build_ms, bfs_ms, buildleaves_ms, preproc_ms);
+#endif
     }
     void reset() {
         tree_upp_calls = tree_upp_zero = buildleaves_nodes = preproc_nodes = cache_entries = 0;
+        bcache_hits = bcache_misses = 0;
         build_ms = buildleaves_ms = preproc_ms = bfs_ms = 0.0;
     }
 } ajb_jt_stats;
@@ -47,6 +57,19 @@ private:
     long long ajb_cache_hits = 0, ajb_cache_misses = 0;
     size_t ajb_cache_bytes_estimate = 0;
     vector<vector<int> > treeBound;  // AJB: each node stores upper bounds per variable
+
+    // [AJB] M914: treeUpp bound cache — 缓存已计算的bound避免重复LP
+    // key = (splitDim的活跃relation位图), value = 上次计算的treeUpp值
+    // 用vector<uint8_t>作为key(比vector<bool>快, 无proxy问题)
+    struct BoundCacheHasher {
+        size_t operator()(const vector<uint8_t>& v) const {
+            size_t h = 0x9e3779b97f4a7c15ULL;
+            for(uint8_t b : v) { h ^= b; h *= 0x517cc1b727220a95ULL; h = (h << 13) | (h >> 51); }
+            return h;
+        }
+    };
+    std::unordered_map<vector<uint8_t>, long long, BoundCacheHasher> ajb_bound_cache;
+    long long ajb_bcache_hits = 0, ajb_bcache_misses = 0;
 
     void buildLeaves(int node, int fa = -1, int k = -1) {
         if(node < 0 || node >= (int)children.size()) return;
@@ -79,8 +102,10 @@ private:
             }
             // [AJB_STATE] leaf built: node=R%d, points=%zu, cache_keys=%zu
             ajb_jt_stats.cache_entries += cache[node].size();
+#ifdef AJB_DEBUG
             fprintf(stderr, "[AJB_STATE][JoinTree] leaf R%d: %zu points, %zu cache keys\n",
                     node, CO[node]->points.size(), cache[node].size());
+#endif
             return;
         }
         // AJB-algo: recursive leaf-build with child-count trace
@@ -110,10 +135,12 @@ private:
         }
         // [AJB_STATE] after cnt propagation: sample first/last point's cnt
         if(CO[node]->points.size() > 0) {
+#ifdef AJB_DEBUG
             fprintf(stderr, "[AJB_STATE][JoinTree] preProc R%d: %zu pts, cnt[0]=%lld cnt[last]=%lld\n",
                     node, CO[node]->points.size(),
                     (long long)CO[node]->points[0].cnt,
                     (long long)CO[node]->points.back().cnt);
+#endif
         }
         for(int i = 0; i < CO[node]->points.size(); i++){
             if(i > 0) CO[node]->points[i].cnt += CO[node]->points[i - 1].cnt;
@@ -205,6 +232,11 @@ public:
         que.push(0);
         fprintf(stderr, "[AJB_BP][JoinTree] BFS start: root=R0, %zu relations, %d variables\n",
                 q.getRelNames().size(), q.getVarNumber());
+#ifdef AJB_DEBUG
+        // [AJB] M914: join tree structure dump — 打印初始query的relation/variable矩阵
+        fprintf(stderr, "[AJB_DEBUG][JoinTree] buildJoinTree: %zu nodes, %d vars, adjacency:\n",
+                q.getRelNames().size(), q.getVarNumber());
+#endif
         int bfs_edges = 0;
         while(!que.empty()){
             int rel = que.front(); // get the front of the queue
@@ -235,6 +267,7 @@ public:
                     visited[neighbor] = true;
                     que.push(neighbor); // add the neighbor to the queue for further exploration
                     bfs_edges++;
+#ifdef AJB_DEBUG
                     // [AJB_TRACE] 每条tree边: parent→child + join position
                     fprintf(stderr, "[AJB_TRACE][JoinTree]   edge R%d→R%d joinPos=[", rel, neighbor);
                     for(size_t jp = 0; jp < jpos.size(); jp++){
@@ -242,6 +275,7 @@ public:
                         fprintf(stderr, "%d", jpos[jp]);
                     }
                     fprintf(stderr, "]\n");
+#endif
                 }
             }
         }
@@ -273,6 +307,7 @@ public:
         auto ajb_jt_t1 = std::chrono::high_resolution_clock::now();
         ajb_jt_stats.build_ms /* AJB-algo: chrono-based wall time */ = std::chrono::duration<double, std::milli>(ajb_jt_t1 - ajb_jt_t0).count();
         // [AJB_STATE] countRels per variable — 哪些relation在哪个splitDim层级被count
+#ifdef AJB_DEBUG
         for(size_t v = 0; v < countRels.size(); v++){
             if(countRels[v].empty()) continue;
             fprintf(stderr, "[AJB_STATE][JoinTree] countRels[x%zu]: [", v);
@@ -282,6 +317,26 @@ public:
             }
             fprintf(stderr, "]\n");
         }
+        // [AJB] M914: print tree depth and per-level node counts
+        {
+            // BFS to count nodes per level
+            std::queue<std::pair<int,int>> depth_q;
+            depth_q.push({root, 0});
+            std::vector<int> level_counts;
+            while(!depth_q.empty()) {
+                auto [nid, dep] = depth_q.front(); depth_q.pop();
+                if(dep >= (int)level_counts.size()) level_counts.resize(dep + 1, 0);
+                level_counts[dep]++;
+                for(int cid : children[nid]) depth_q.push({cid, dep + 1});
+            }
+            fprintf(stderr, "[AJB_STATE][JoinTree] tree: depth=%zu levels=[", level_counts.size());
+            for(size_t l = 0; l < level_counts.size(); l++) {
+                if(l) fprintf(stderr, ",");
+                fprintf(stderr, "%d", level_counts[l]);
+            }
+            fprintf(stderr, "]\n");
+        }
+#endif
         fprintf(stderr, "[AJB_TIMER][JoinTree] total build=%.3fms (bfs=%.3f leaves=%.3f preproc=%.3f)\n",
                 ajb_jt_stats.build_ms, ajb_jt_stats.bfs_ms, ajb_jt_stats.buildleaves_ms, ajb_jt_stats.preproc_ms);
     }
@@ -290,19 +345,48 @@ public:
         // cout << "TREEUPP IN";
         ajb_jt_stats.tree_upp_calls++;
         if(splitDim >= (int)countRels.size()) return 1;
+
+        // [AJB] M914: bound cache lookup — 用countRels[splitDim]的cardinality指纹作为key
+        // 构建cache key: 每个relation的iter范围大小(量化到bucket)
+        vector<uint8_t> cache_key;
+        cache_key.reserve(countRels[splitDim].size() + 1);
+        cache_key.push_back(static_cast<uint8_t>(splitDim & 0xFF));
+        for(int node : countRels[splitDim]) {
+            int range = static_cast<int>(iters[node].second - iters[node].first);
+            // 量化范围到0-255 (log2 scale)
+            uint8_t quantized = (range <= 0) ? 0 : static_cast<uint8_t>(std::min(255, range));
+            cache_key.push_back(quantized);
+        }
+        auto cache_it = ajb_bound_cache.find(cache_key);
+        if(cache_it != ajb_bound_cache.end()) {
+            ajb_bcache_hits++;
+            ajb_jt_stats.bcache_hits++;
+            return static_cast<int>(cache_it->second);
+        }
+        ajb_bcache_misses++;
+        ajb_jt_stats.bcache_misses++;
+
         int tupp = 1;
         for(int node : countRels[splitDim]) {
             tupp *= CO[node]->sumCnt(iters[node].first, iters[node].second);
         }
         if(tupp == 0) {
             ajb_jt_stats.tree_upp_zero++;
+#ifdef AJB_DEBUG
             // [AJB_TRACE] periodic zero-rate report every 10000 calls
             if(ajb_jt_stats.tree_upp_calls % 10000 == 0 && ajb_jt_stats.tree_upp_calls > 0) {
                 fprintf(stderr, "[AJB_STATE][JoinTree] treeUpp zero_rate=%.4f (%lld/%lld)\n",
                         (double)ajb_jt_stats.tree_upp_zero / ajb_jt_stats.tree_upp_calls,
                         ajb_jt_stats.tree_upp_zero, ajb_jt_stats.tree_upp_calls);
             }
+#endif
         }
+
+        // 存入cache (限制cache大小避免内存爆炸)
+        if(ajb_bound_cache.size() < 100000) {
+            ajb_bound_cache[cache_key] = tupp;
+        }
+
         // cout << "TREEUPP OUT" << endl;
         return tupp;
     }
@@ -348,13 +432,18 @@ public:
     // [AJB] dump full JoinTree diagnostics
     void ajb_dump_stats() {
         ajb_jt_stats.dump();
+#ifdef AJB_DEBUG
         fprintf(stderr, "[AJB_STATE][JoinTree] root=%d, %zu relations, %zu cache arrays\n",
                 root, relation.size(), cache.size());
+        // bound cache stats
+        fprintf(stderr, "[AJB_STATE][JoinTree] bound_cache: %zu entries, hits=%lld misses=%lld\n",
+                ajb_bound_cache.size(), ajb_bcache_hits, ajb_bcache_misses);
         // cache occupancy per relation
         for(size_t i = 0; i < cache.size(); i++) {
             if(!cache[i].empty())
                 fprintf(stderr, "[AJB_STATE][JoinTree]   cache[R%zu]: %zu entries\n", i, cache[i].size());
         }
+#endif
     }
 
     // [AJB] reset all JoinTree diagnostic counters

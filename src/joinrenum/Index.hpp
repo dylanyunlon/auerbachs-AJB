@@ -7,6 +7,7 @@
 //   tags, MHBS convergence trace (iteration count per call), split chain
 //   depth tracking, preProcessing per-relation timing breakdown,
 //   setAGMandIters bound-range dump, and sample()/randomAccess() path trace.
+// M916: HyperLogLog cardinality estimation, split dim selection trace
 // =============================================================================
 #include <cstdio>
 #include <chrono>
@@ -30,6 +31,7 @@ static thread_local struct {
     int max_split_children = 0;
     int max_split_depth = 0;            // splitBucket递归最大深度
     void dump(const char* tag = "Index") {
+#ifdef AJB_DEBUG
         fprintf(stderr, "[AJB_STATE][%s] preprocess=%lld agm=%lld set_agm=%lld split=%lld split_bs=%lld mhbs=%lld\n",
                 tag, preprocess_calls, agm_calls, set_agm_calls, split_calls, split_bs_calls, mhbs_calls);
         fprintf(stderr, "[AJB_STATE][%s] mhbs_iters=%lld mhbs_max_single=%lld split_pool=%lld\n",
@@ -38,6 +40,7 @@ static thread_local struct {
                 tag, preprocess_ms, agm_total_ms, split_total_ms, mhbs_total_ms);
         fprintf(stderr, "[AJB_STATE][%s] max_split_children=%d max_split_depth=%d\n",
                 tag, max_split_children, max_split_depth);
+#endif
     }
     void reset() {
         preprocess_calls = agm_calls = set_agm_calls = split_calls = split_bs_calls = mhbs_calls = 0;

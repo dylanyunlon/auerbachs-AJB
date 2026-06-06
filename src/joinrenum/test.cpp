@@ -11,12 +11,74 @@
 #include <random>
 #include <vector>
 #include <chrono>
+#include <cstring>
+#include <sys/resource.h>
+#include <unistd.h>
 #include "Table.h"
 #include "Parcel.h"
 #include "Index.hpp"
 #include "ReadConfig.hpp"
 #include "BanPickTree.hpp"
 using namespace std;
+
+// [AJB] M913: system-level diagnostics — 运行时环境信息
+// 帮助在不同机器上复现问题: 编译器版本、优化级别、数据路径
+static void ajb_print_system_info() {
+#ifdef AJB_DEBUG
+    fprintf(stderr, "[AJB_SYS] C++ standard: %ld\n", (long)__cplusplus);
+#ifdef __OPTIMIZE__
+    fprintf(stderr, "[AJB_SYS] optimization: ON (Release)\n");
+#else
+    fprintf(stderr, "[AJB_SYS] optimization: OFF (Debug)\n");
+#endif
+    fprintf(stderr, "[AJB_SYS] AJB_DEBUG: enabled\n");
+    char cwd[256];
+    if (getcwd(cwd, sizeof(cwd))) fprintf(stderr, "[AJB_SYS] cwd: %s\n", cwd);
+    // 进程内存基线
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0)
+        fprintf(stderr, "[AJB_SYS] startup_maxRSS: %ld KB\n", ru.ru_maxrss);
+#endif
+}
+
+// [AJB] M913: per-probe tracing — 每个randomAccess的输入/输出/耗时
+// 用于定位哪些probe特别慢(可能在Index.splitBucket或RangeTree上卡住)
+struct AjbProbeTracker {
+    int total_probes = 0;
+    int success_count = 0;
+    int fail_count = 0;
+    double fastest_us = 1e18;
+    double slowest_us = 0;
+    int slowest_probe_id = -1;
+    long long total_ban_range = 0; // 累计ban的区间宽度
+    void record(int probe_id, int s, bool ok, const vector<int>& result, double elapsed_us) {
+#ifdef AJB_DEBUG
+        total_probes++;
+        if (ok) success_count++; else fail_count++;
+        if (elapsed_us < fastest_us) fastest_us = elapsed_us;
+        if (elapsed_us > slowest_us) { slowest_us = elapsed_us; slowest_probe_id = probe_id; }
+        if (!ok && result.size() >= 2) total_ban_range += (result[1] - result[0] + 1);
+        // 每1000个probe输出一次摘要,避免淹没日志
+        if (total_probes % 1000 == 0) {
+            fprintf(stderr, "[AJB_PROBE_BATCH] probes=%d ok=%d fail=%d fastest=%.1fus slowest=%.1fus(#%d) avg_ban_range=%.1f\n",
+                    total_probes, success_count, fail_count, fastest_us, slowest_us,
+                    slowest_probe_id, fail_count > 0 ? (double)total_ban_range/fail_count : 0.0);
+        }
+#endif
+    }
+    void dump_final() {
+#ifdef AJB_DEBUG
+        struct rusage ru;
+        long peak_rss = 0;
+        if (getrusage(RUSAGE_SELF, &ru) == 0) peak_rss = ru.ru_maxrss;
+        fprintf(stderr, "[AJB_FINAL] total_probes=%d success=%d fail=%d\n", total_probes, success_count, fail_count);
+        fprintf(stderr, "[AJB_FINAL] fastest=%.1fus slowest=%.1fus(probe#%d)\n", fastest_us, slowest_us, slowest_probe_id);
+        fprintf(stderr, "[AJB_FINAL] peak_RSS=%ld KB  avg_ban_range=%.1f\n",
+                peak_rss, fail_count > 0 ? (double)total_ban_range/fail_count : 0.0);
+#endif
+    }
+};
+static AjbProbeTracker ajb_probe_tracker;
 
 
 void printInfo(Index &idx) {
@@ -44,6 +106,7 @@ void printInfo(Index &idx) {
 
 // AJB-algo: test harness with wall-clock timing
 int main() {
+    ajb_print_system_info();
     fprintf(stderr, "[AJB] ============================================\n");
     fprintf(stderr, "[AJB] test.cpp — REnum-BMITU full pipeline\n");
     fprintf(stderr, "[AJB] ============================================\n");
@@ -144,7 +207,11 @@ int main() {
     while(bp.remaining()){
         cnt++;
         int s = bp.pick();
+        auto probe_t0 = chrono::high_resolution_clock::now();
         pair<bool, vector<int> > res = idx.randomAccess(idx.getFullBucket(), s);
+        auto probe_t1 = chrono::high_resolution_clock::now();
+        double probe_us = chrono::duration<double,micro>(probe_t1 - probe_t0).count();
+        ajb_probe_tracker.record(cnt, s, res.first, res.second, probe_us);
         if(res.first){
             cntsuccess++;
             if(cntsuccess < step || cntsuccess % step == 0){
@@ -238,6 +305,7 @@ int main() {
     fprintf(stderr, "[AJB_BP] wall=%.3fs throughput=%.1f results/s\n",
             elapsed_ms.count(), throughput);
     fprintf(stderr, "[AJB_TIMER] REnum-BMITU total: %.3fs\n", elapsed_ms.count());
+    ajb_probe_tracker.dump_final();
     fprintf(stderr, "[AJB] test.cpp COMPLETE\n");
     return 0;
 }
