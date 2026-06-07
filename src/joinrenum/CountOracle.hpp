@@ -9,13 +9,48 @@ static thread_local struct {
     long long sumcnt_zero  = 0;  // 返回0的次数 = empty range
     long long count_calls  = 0;
     long long range_calls  = 0;
-    long long exp_doubling_steps = 0;  // M915: exponential doubling总步数
-    long long exp_doubling_saves = 0;  // M915: 比标准binary search节省的步数
+    long long exp_doubling_steps = 0;
+    long long exp_doubling_saves = 0;
     // [AJB] Adaptive FM stats
     long long afm_calls           = 0;
-    long long afm_total_input     = 0;  // 所有调用的输入元素总数
-    long long afm_total_estimate  = 0;  // 所有调用的估计值总和
-    double    afm_max_error_pct   = 0.0; // 跟踪最大相对误差
+    long long afm_total_input     = 0;
+    long long afm_total_estimate  = 0;
+    double    afm_max_error_pct   = 0.0;
+
+    // M1071: Kahan summation accuracy tracker
+    double kahan_total_naive = 0.0;  // naive sum for comparison
+    double kahan_total_comp  = 0.0;  // Kahan compensated sum
+    double kahan_compensation = 0.0; // running compensation term
+    long long kahan_updates = 0;
+
+    void kahan_add(double value) {
+        // Kahan summation: O(1) per call, reduces float roundoff from O(n*eps) to O(eps)
+        kahan_total_naive += value;
+        double y = value - kahan_compensation;
+        double t = kahan_total_comp + y;
+        kahan_compensation = (t - kahan_total_comp) - y;
+        kahan_total_comp = t;
+        kahan_updates++;
+    }
+    double kahan_error() const {
+        return kahan_updates > 0 ? fabs(kahan_total_naive - kahan_total_comp) : 0.0;
+    }
+
+    // M1071: point distribution IQR (set during construction)
+    double iqr_q1 = 0.0, iqr_q3 = 0.0, iqr_val = 0.0;
+    int    iqr_n = 0;
+
+    void compute_iqr(const std::vector<int>& vals) {
+        if(vals.size() < 4) return;
+        auto sorted_v = vals;
+        std::sort(sorted_v.begin(), sorted_v.end());
+        int n = sorted_v.size();
+        iqr_q1 = sorted_v[n / 4];
+        iqr_q3 = sorted_v[3 * n / 4];
+        iqr_val = iqr_q3 - iqr_q1;
+        iqr_n = n;
+    }
+
     void dump(const char* tag = "CountOracle") {
 #ifdef AJB_DEBUG
         fprintf(stderr, "[AJB_STATE][%s] sumCnt=%lld(zero=%lld) count=%lld getRange=%lld\n",
@@ -24,12 +59,25 @@ static thread_local struct {
                 tag, exp_doubling_steps, exp_doubling_saves);
         fprintf(stderr, "[AJB_STATE][%s] adaptive_fm: calls=%lld total_input=%lld total_est=%lld max_err=%.2f%%\n",
                 tag, afm_calls, afm_total_input, afm_total_estimate, afm_max_error_pct);
+        // M1071: Kahan accuracy
+        if(kahan_updates > 0) {
+            fprintf(stderr, "[AJB_BP][%s] kahan: n=%lld naive=%.4f comp=%.4f drift=%.2e\n",
+                    tag, kahan_updates, kahan_total_naive, kahan_total_comp, kahan_error());
+        }
+        // M1071: IQR
+        if(iqr_n > 0) {
+            fprintf(stderr, "[AJB_STATE][%s] point_iqr: Q1=%.0f Q3=%.0f IQR=%.0f n=%d\n",
+                    tag, iqr_q1, iqr_q3, iqr_val, iqr_n);
+        }
 #endif
     }
     void reset() { sumcnt_calls = sumcnt_zero = count_calls = range_calls = 0;
                     exp_doubling_steps = exp_doubling_saves = 0;
                     afm_calls = afm_total_input = afm_total_estimate = 0;
-                    afm_max_error_pct = 0.0; }
+                    afm_max_error_pct = 0.0;
+                    kahan_total_naive = kahan_total_comp = kahan_compensation = 0.0;
+                    kahan_updates = 0;
+                    iqr_q1 = iqr_q3 = iqr_val = 0.0; iqr_n = 0; }
 } ajb_co_stats;
 
 // ============================================================================
@@ -479,8 +527,14 @@ public:
         else if(itl == points.begin()) result = (itr - 1)->cnt;
         else result = (itr - 1)->cnt - (itl - 1)->cnt;
         if(result == 0) ajb_co_stats.sumcnt_zero++;
+        // M1071: Kahan compensated sum tracking
+        ajb_co_stats.kahan_add((double)result);
+        if(ajb_co_stats.sumcnt_calls % 500 == 0) {
+            fprintf(stderr, "[AJB_BP][CountOracle] kahan_sumcnt #%lld: result=%d drift=%.2e naive=%.1f comp=%.1f\n",
+                    ajb_co_stats.sumcnt_calls, result, ajb_co_stats.kahan_error(),
+                    ajb_co_stats.kahan_total_naive, ajb_co_stats.kahan_total_comp);
+        }
 #ifdef AJB_DEBUG
-        // M915: 打印查询范围、遍历的节点数、返回的count值
         if(ajb_co_stats.sumcnt_calls <= 5) {
             fprintf(stderr, "[AJB_DEBUG][CountOracle] sumCnt: range_size=%ld result=%d total=%zu\n",
                     (long)(itr - itl), result, points.size());

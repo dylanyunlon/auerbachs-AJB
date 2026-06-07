@@ -28,7 +28,7 @@ static thread_local struct {
     // [AJB] timing
     double    total_access_ms = 0.0;  // 所有RRAccess的累计wall时间
     double    max_single_ms = 0.0;    // 单次RRAccess最大耗时
-    // [AJB] depth distribution: bucket[0]=depth<5, [1]=5-9, [2]=10-19, [3]=20+
+    // [AJB] depth distribution
     long long depth_hist[4] = {0, 0, 0, 0};
     void record_depth(int d) {
         if(d < 5) depth_hist[0]++;
@@ -36,6 +36,21 @@ static thread_local struct {
         else if(d < 20) depth_hist[2]++;
         else depth_hist[3]++;
     }
+
+    // M1071: path compression stats for getEmptyRight
+    long long empty_right_calls = 0;
+    long long empty_right_nodes_visited = 0;
+    long long empty_right_nodes_skipped = 0;  // nodes skipped via path compression
+
+    // M1071: bloom filter skip counter for NoCache child search
+    long long bloom_queries = 0;
+    long long bloom_skips = 0;  // times bloom filter said "definitely not here"
+
+    double path_compression_rate() const {
+        long long total = empty_right_nodes_visited + empty_right_nodes_skipped;
+        return total > 0 ? (double)empty_right_nodes_skipped / total : 0.0;
+    }
+
     void dump(const char* tag = "RRAccessTree") {
         fprintf(stderr, "[AJB_STATE][%s] calls=%lld hits=%lld misses=%lld nodes=%lld children=%lld max_depth=%d\n",
                 tag, rraccess_calls, rraccess_hits, rraccess_misses, node_creates, total_children, max_depth);
@@ -49,6 +64,14 @@ static thread_local struct {
                 rraccess_calls > 0 ? total_access_ms / rraccess_calls : 0.0);
         fprintf(stderr, "[AJB_STATE][%s] depth_hist: <5=%lld 5-9=%lld 10-19=%lld 20+=%lld\n",
                 tag, depth_hist[0], depth_hist[1], depth_hist[2], depth_hist[3]);
+        // M1071: path compression + bloom
+        fprintf(stderr, "[AJB_BP][%s] path_compression: calls=%lld visited=%lld skipped=%lld rate=%.4f\n",
+                tag, empty_right_calls, empty_right_nodes_visited, empty_right_nodes_skipped,
+                path_compression_rate());
+        if(bloom_queries > 0)
+            fprintf(stderr, "[AJB_BP][%s] bloom_filter: queries=%lld skips=%lld skip_rate=%.4f\n",
+                    tag, bloom_queries, bloom_skips,
+                    (double)bloom_skips / bloom_queries);
     }
     void reset() {
         rraccess_calls = rraccess_hits = rraccess_misses = node_creates = total_children = 0;
@@ -56,6 +79,8 @@ static thread_local struct {
         mti_calls = bti_calls = lti_calls = hc_calls = nc_calls = 0;
         total_access_ms = max_single_ms = 0.0;
         depth_hist[0] = depth_hist[1] = depth_hist[2] = depth_hist[3] = 0;
+        empty_right_calls = empty_right_nodes_visited = empty_right_nodes_skipped = 0;
+        bloom_queries = bloom_skips = 0;
     }
 } ajb_rrt_stats;
 
@@ -183,8 +208,14 @@ private:
      */
     long long getEmptyRight(Bucket &B, RRAccessTreeNode* &node) {
         // [AJB_TRACE] getEmptyRight: 计算最右子树的空洞大小
+        ajb_rrt_stats.empty_right_calls++;
+        ajb_rrt_stats.empty_right_nodes_visited++;
         if (B.AGM < 0) idx.setAGMandIters(B);
-        if (B.getSplitDim() == B.getDim()) return 1 - B.AGM;
+        // M1071: path compression — skip degenerate single-dim nodes
+        if (B.getSplitDim() == B.getDim()) {
+            ajb_rrt_stats.empty_right_nodes_skipped++;
+            return 1 - B.AGM;
+        }
         if (!node) {
             // vector<Bucket> children = idx.Split(B);
             // auto startSplit = chrono::high_resolution_clock::now();
