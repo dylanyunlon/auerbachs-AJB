@@ -61,6 +61,26 @@ private:
     // [AJB] M914: treeUpp bound cache — 缓存已计算的bound避免重复LP
     // key = (splitDim的活跃relation位图), value = 上次计算的treeUpp值
     // 用vector<uint8_t>作为key(比vector<bool>快, 无proxy问题)
+
+    // [AJB] M1013: Gini coefficient for subtree size balance detection
+    // After buildTree, compute the Gini index of children-counts across all
+    // internal nodes to measure how balanced the tree structure is.
+    // Gini=0 → perfectly balanced; Gini→1 → maximally unbalanced.
+    static double ajb_compute_gini(const std::vector<int>& sizes) {
+        if(sizes.empty() || sizes.size() == 1) return 0.0;
+        double sum = 0.0;
+        for(int s : sizes) sum += s;
+        if(sum == 0.0) return 0.0;
+        double n = (double)sizes.size();
+        double abs_diff_sum = 0.0;
+        for(size_t i = 0; i < sizes.size(); i++)
+            for(size_t j = i + 1; j < sizes.size(); j++)
+                abs_diff_sum += std::fabs((double)sizes[i] - (double)sizes[j]);
+        // Gini = (2 * sum of |xi - xj|) / (n * (n-1) * mean)
+        double mean = sum / n;
+        return abs_diff_sum / (n * (n - 1.0) * mean + 1e-15);
+    }
+
     struct BoundCacheHasher {
         size_t operator()(const vector<uint8_t>& v) const {
             size_t h = 0x9e3779b97f4a7c15ULL;
@@ -306,6 +326,54 @@ public:
         initCountRels(root);
         auto ajb_jt_t1 = std::chrono::high_resolution_clock::now();
         ajb_jt_stats.build_ms /* AJB-algo: chrono-based wall time */ = std::chrono::duration<double, std::milli>(ajb_jt_t1 - ajb_jt_t0).count();
+
+        // [AJB_STATE] M1013: compute Gini coefficient of subtree sizes
+        // Collect children count for each internal node, compute Gini index
+        // to measure structural balance of the join tree.
+        {
+            std::vector<int> subtree_sizes;
+            subtree_sizes.reserve(children.size());
+            // BFS to count subtree size (number of descendants) per node
+            std::vector<int> desc_count(children.size(), 0);
+            // post-order DFS via stack to compute subtree sizes
+            std::vector<int> order;
+            order.reserve(children.size());
+            {
+                std::vector<int> dfs_stk;
+                dfs_stk.push_back(root);
+                while(!dfs_stk.empty()) {
+                    int nd = dfs_stk.back(); dfs_stk.pop_back();
+                    order.push_back(nd);
+                    for(int c : children[nd]) dfs_stk.push_back(c);
+                }
+            }
+            // reverse post-order: leaves first
+            for(int i = (int)order.size() - 1; i >= 0; i--) {
+                int nd = order[i];
+                desc_count[nd] = 1; // count self
+                for(int c : children[nd]) desc_count[nd] += desc_count[c];
+            }
+            // Collect children subtree sizes for internal nodes
+            for(size_t nd = 0; nd < children.size(); nd++) {
+                if(!children[nd].empty()) {
+                    for(int c : children[nd]) {
+                        subtree_sizes.push_back(desc_count[c]);
+                    }
+                }
+            }
+            double gini = ajb_compute_gini(subtree_sizes);
+            fprintf(stderr, "[AJB_STATE][JoinTree] gini_balance: gini=%.4f subtree_samples=%zu (0=balanced, 1=max_skew)\n",
+                    gini, subtree_sizes.size());
+            // [AJB_STATE] full subtree size distribution dump
+            if(subtree_sizes.size() <= 20) {
+                fprintf(stderr, "[AJB_STATE][JoinTree] subtree_sizes=[");
+                for(size_t i = 0; i < subtree_sizes.size(); i++) {
+                    if(i) fprintf(stderr, ",");
+                    fprintf(stderr, "%d", subtree_sizes[i]);
+                }
+                fprintf(stderr, "]\n");
+            }
+        }
         // [AJB_STATE] countRels per variable — 哪些relation在哪个splitDim层级被count
 #ifdef AJB_DEBUG
         for(size_t v = 0; v < countRels.size(); v++){

@@ -12,6 +12,24 @@ static inline long long ajb_safe_ceil(double res) {
 }
 
 // [AJB] MHBS诊断
+// [AJB] M1012: search depth statistics + branch skew (left vs right visit ratio)
+// Tracks per-call depth and accumulates left/right branch visit counts
+// to detect systematic bias in the binary search (e.g. always going left
+// suggests data is heavily skewed toward one end of the value domain).
+struct AjbMhbsDepthWelford {
+    long long n = 0;
+    double mean = 0.0;
+    double m2 = 0.0;
+    void update(double x) {
+        n++;
+        double delta = x - mean;
+        mean += delta / n;
+        double delta2 = x - mean;
+        m2 += delta * delta2;
+    }
+    double variance() const { return n < 2 ? 0.0 : m2 / (n - 1); }
+    double stddev() const { return n < 2 ? 0.0 : std::sqrt(m2 / (n - 1)); }
+};
 static thread_local struct {
     long long calls = 0;
     long long iterations = 0;     // while循环总轮数
@@ -23,6 +41,10 @@ static thread_local struct {
     long long early_exit_all_converged = 0;  // early exit因所有range都收敛
     long long mini_updates = 0;   // 更新mini bound的次数
     long long maxi_updates = 0;   // 更新maxi bound的次数
+    // [AJB_BP] M1012: branch skew detection — left vs right traversals
+    long long left_visits = 0;    // mini bound tightened (go-left branch)
+    long long right_visits = 0;   // maxi bound tightened (go-right branch)
+    AjbMhbsDepthWelford depth_acc; // Welford accumulator for per-call iteration depth
     void dump(const char* tag = "MHBS") {
         fprintf(stderr, "[AJB_STATE][%s] calls=%lld iters=%lld early_ret=%lld max_rels=%d avg_iters=%.1f\n",
                 tag, calls, iterations, early_returns, max_rels,
@@ -33,11 +55,20 @@ static thread_local struct {
                 early_exit_all_converged);
         fprintf(stderr, "[AJB_STATE][%s] bound_updates: mini=%lld maxi=%lld\n",
                 tag, mini_updates, maxi_updates);
+        // M1012: branch skew + depth stats
+        double skew_ratio = (left_visits + right_visits) > 0
+            ? (double)left_visits / (left_visits + right_visits) : 0.5;
+        fprintf(stderr, "[AJB_BP][%s] branch_skew: left=%lld right=%lld ratio=%.4f (0.5=balanced)\n",
+                tag, left_visits, right_visits, skew_ratio);
+        fprintf(stderr, "[AJB_BP][%s] depth_stats: n=%lld mean=%.2f stddev=%.2f variance=%.4f\n",
+                tag, depth_acc.n, depth_acc.mean, depth_acc.stddev(), depth_acc.variance());
     }
     void reset() {
         calls = iterations = early_returns = 0; max_rels = 0;
         total_range_before = total_range_after = early_exit_all_converged = 0;
         mini_updates = maxi_updates = 0;
+        left_visits = right_visits = 0;
+        depth_acc = AjbMhbsDepthWelford{};
     }
 } ajb_mhbs_stats;
 
@@ -126,6 +157,7 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
         upp = ajb_safe_ceil(res);
         if(upp <= target) {
             ajb_mhbs_stats.mini_updates++;
+            ajb_mhbs_stats.left_visits++;  // M1012: left branch taken (tighten lower bound)
             bounds[mini].first = itermid[mini];
             if(bounds[mini].second - bounds[mini].first <= 1) {
                 if(*bounds[mini].first == *bounds[mini].second) return *bounds[mini].first;
@@ -143,6 +175,7 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
         }
         else {
             ajb_mhbs_stats.maxi_updates++;
+            ajb_mhbs_stats.right_visits++;  // M1012: right branch taken (tighten upper bound)
             bounds[maxi].second = itermid[maxi];
             if(bounds[maxi].second - bounds[maxi].first <= 1) {
                 if(*bounds[maxi].first == *bounds[maxi].second) return *bounds[maxi].first;
@@ -164,6 +197,8 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
         if(bounds[i].second != iters[i].second) ans = min(ans, *bounds[i].second);
     }
     // [AJB_BP] M929: measure final search range reduction
+    // [AJB_BP] M1012: record per-call depth into Welford accumulator
+    ajb_mhbs_stats.depth_acc.update((double)loop_iters);
     {
         long long ajb_final_range = 0;
         for (int i = 0; i < (int)iters.size(); i++)
@@ -176,6 +211,15 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
             fprintf(stderr, "[AJB_BP][MHBS] #%lld range_reduction: %lld→%lld (%.2f%% reduced) iters=%d\n",
                     ajb_mhbs_stats.calls, ajb_init_range, ajb_final_range,
                     reduction * 100.0, loop_iters);
+        }
+        // [AJB_BP] M1012: periodic branch skew and depth summary every 100 calls
+        if (ajb_mhbs_stats.calls % 100 == 0 && ajb_mhbs_stats.calls > 0) {
+            double skew = (ajb_mhbs_stats.left_visits + ajb_mhbs_stats.right_visits) > 0
+                ? (double)ajb_mhbs_stats.left_visits / (ajb_mhbs_stats.left_visits + ajb_mhbs_stats.right_visits)
+                : 0.5;
+            fprintf(stderr, "[AJB_BP][MHBS] periodic_skew: calls=%lld left=%lld right=%lld skew=%.4f depth_mean=%.2f depth_stddev=%.2f\n",
+                    ajb_mhbs_stats.calls, ajb_mhbs_stats.left_visits, ajb_mhbs_stats.right_visits,
+                    skew, ajb_mhbs_stats.depth_acc.mean, ajb_mhbs_stats.depth_acc.stddev());
         }
     }
     // [AJB_TRACE] MHBS converged: 轮数多说明值域跨度大

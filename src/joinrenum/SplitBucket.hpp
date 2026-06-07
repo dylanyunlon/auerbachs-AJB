@@ -25,6 +25,10 @@
 #include <numeric>
 
 // [AJB] Split诊断 — 扩展: 带per-dim统计
+// [AJB] M1016: split point quality entropy metric
+// When a bucket is split (replaceSelf), compute the entropy of the
+// child-size ratio: H = -p*log(p) - (1-p)*log(1-p) where p = child_range / parent_range.
+// Perfect 50/50 split → H=ln(2)≈0.693; degenerate split → H→0.
 static thread_local struct {
     long long split_calls = 0;
     long long children_total = 0;
@@ -41,6 +45,22 @@ static thread_local struct {
     long long dim_freq[16] = {};
     // [AJB_BP] M932: replaceSelf dim-change tracking
     long long dim_change_count = 0;
+    // [AJB_STATE] M1016: split entropy accumulator (Welford on entropy values)
+    long long entropy_n = 0;
+    double entropy_mean = 0.0;
+    double entropy_m2 = 0.0;
+    double entropy_min = 1e18;
+    double entropy_max = -1e18;
+    void entropy_update(double h) {
+        entropy_n++;
+        double delta = h - entropy_mean;
+        entropy_mean += delta / entropy_n;
+        double delta2 = h - entropy_mean;
+        entropy_m2 += delta * delta2;
+        if(h < entropy_min) entropy_min = h;
+        if(h > entropy_max) entropy_max = h;
+    }
+    double entropy_stddev() const { return entropy_n < 2 ? 0.0 : std::sqrt(entropy_m2 / (entropy_n - 1)); }
     void dump(const char* tag = "SplitBucket") {
         fprintf(stderr, "[AJB_STATE][%s] calls=%lld children=%lld avg=%.2f replace=%lld replace_self=%lld max_dim=%d\n",
                 tag, split_calls, children_total,
@@ -57,6 +77,9 @@ static thread_local struct {
             fprintf(stderr, "d%d=%lld", d, dim_freq[d]);
         }
         fprintf(stderr, "] dim_changes=%lld\n", dim_change_count);
+        // M1016: split entropy dump
+        fprintf(stderr, "[AJB_STATE][%s] split_entropy: n=%lld mean=%.4f stddev=%.4f min=%.4f max=%.4f (ideal=0.6931)\n",
+                tag, entropy_n, entropy_mean, entropy_stddev(), entropy_min, entropy_max);
     }
     void reset() {
         split_calls = children_total = replace_calls = replace_self_calls = 0; max_dim_seen = 0;
@@ -64,6 +87,8 @@ static thread_local struct {
         min_child_volume = 1e18; max_child_volume = 0.0; volume_measurements = 0;
         for(int i = 0; i < 16; i++) dim_freq[i] = 0;
         dim_change_count = 0;
+        entropy_n = 0; entropy_mean = 0.0; entropy_m2 = 0.0;
+        entropy_min = 1e18; entropy_max = -1e18;
     }
 } ajb_split_stats;
 
@@ -214,6 +239,25 @@ class Bucket {
                 fprintf(stderr, "[AJB_TRACE][Bucket] replaceSelf: splitDim %d→%d (range [%d,%d]) vol %.0f→%.0f\n",
                         old_splitDim, (int)splitDim, lower, upper, vol_before, vol_after);
             }
+
+            // [AJB_STATE] M1016: split entropy — measure quality of the split point
+            // p = vol_after / vol_before is the fraction of parent volume retained
+            // Entropy H = -p*log(p) - (1-p)*log(1-p), max at p=0.5
+            if(vol_before > 0.0 && vol_after >= 0.0) {
+                double p = vol_after / vol_before;
+                if(p > 1.0) p = 1.0; // clamp
+                double h = 0.0;
+                if(p > 1e-15 && p < 1.0 - 1e-15) {
+                    h = -p * std::log(p) - (1.0 - p) * std::log(1.0 - p);
+                }
+                ajb_split_stats.entropy_update(h);
+                // [AJB_STATE] emit for first 10 or every 500th
+                if(ajb_split_stats.replace_self_calls <= 10 || ajb_split_stats.replace_self_calls % 500 == 0) {
+                    fprintf(stderr, "[AJB_STATE][Bucket] split_entropy: p=%.4f entropy=%.4f mean_entropy=%.4f n=%lld (ideal=0.6931)\n",
+                            p, h, ajb_split_stats.entropy_mean, ajb_split_stats.entropy_n);
+                }
+            }
+
             return;
         }
 

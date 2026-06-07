@@ -6,6 +6,9 @@
 // [AJB] 底层用AVL树(不是segment tree), 支持O(log n) ban和pick
 
 // [AJB] BanPickTree诊断
+// [AJB] M1014: pool utilization tracking — exponential moving average (EMA)
+// of banned/total ratio to detect when ban rate is accelerating or decelerating.
+// alpha=0.1 gives ~10-observation smoothing window.
 #include <cstdio>
 static thread_local struct {
     long long pick_calls = 0;
@@ -24,6 +27,12 @@ static thread_local struct {
     long long pick_min = 0;
     long long pick_max = 0;
     double    pick_sum = 0.0;
+    // [AJB_STATE] M1014: pool utilization EMA tracking
+    double    utilization_ema = 0.0;       // EMA of banned/total ratio
+    double    utilization_ema_alpha = 0.1;  // smoothing factor
+    long long ema_samples = 0;
+    double    util_min = 1.0;
+    double    util_max = 0.0;
     void dump(const char* tag = "BanPickTree") {
         fprintf(stderr, "[AJB_STATE][%s] picks=%lld bans=%lld overlaps=%lld total_banned=%lld\n",
                 tag, pick_calls, ban_calls, ban_overlap, total_banned);
@@ -36,12 +45,16 @@ static thread_local struct {
         fprintf(stderr, "[AJB_STATE][%s] pick_range: min=%lld max=%lld avg=%.1f\n",
                 tag, pick_min, pick_max,
                 pick_calls > 0 ? pick_sum / pick_calls : 0.0);
+        // M1014: pool utilization EMA dump
+        fprintf(stderr, "[AJB_STATE][%s] pool_util_ema: current=%.6f samples=%lld min=%.6f max=%.6f\n",
+                tag, utilization_ema, ema_samples, util_min, util_max);
     }
     void reset() {
         pick_calls = ban_calls = ban_overlap = total_banned = 0;
         max_tree_height = 0; leaf_count = internal_count = 0;
         ban_empty = ban_clipped = ban_merged = 0;
         pick_min = 0; pick_max = 0; pick_sum = 0.0;
+        utilization_ema = 0.0; ema_samples = 0; util_min = 1.0; util_max = 0.0;
     }
 } ajb_bpt_stats;
 
@@ -230,6 +243,27 @@ public:
         long long actually_banned = before_remaining - remaining();
         ajb_bpt_stats.total_banned += actually_banned;
         if(actually_banned < (high - low + 1)) ajb_bpt_stats.ban_overlap++;
+
+        // [AJB_STATE] M1014: update pool utilization EMA
+        // ratio = fraction of total space that has been banned (utilization)
+        if(H > 0) {
+            double current_util = 1.0 - (double)remaining() / (double)H;
+            if(ajb_bpt_stats.ema_samples == 0) {
+                ajb_bpt_stats.utilization_ema = current_util;
+            } else {
+                double a = ajb_bpt_stats.utilization_ema_alpha;
+                ajb_bpt_stats.utilization_ema = a * current_util + (1.0 - a) * ajb_bpt_stats.utilization_ema;
+            }
+            ajb_bpt_stats.ema_samples++;
+            if(current_util < ajb_bpt_stats.util_min) ajb_bpt_stats.util_min = current_util;
+            if(current_util > ajb_bpt_stats.util_max) ajb_bpt_stats.util_max = current_util;
+            // [AJB_STATE] M1014: emit EMA snapshot every 500 bans or first 5
+            if(ajb_bpt_stats.ban_calls <= 5 || ajb_bpt_stats.ban_calls % 500 == 0) {
+                fprintf(stderr, "[AJB_STATE][BanPickTree] pool_util_ema: ban#=%lld util=%.6f ema=%.6f pool_size=%zu remaining=%lld H=%lld\n",
+                        ajb_bpt_stats.ban_calls, current_util, ajb_bpt_stats.utilization_ema,
+                        pool.size(), remaining(), H);
+            }
+        }
         // [AJB_BP] M934: detect merges (pool didn't grow = node was merged)
         if (pool.size() <= pool_before)
             ajb_bpt_stats.ban_merged++;

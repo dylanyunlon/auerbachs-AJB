@@ -9,6 +9,32 @@ using namespace std;
 
 // [AJB] M913: Enumerator诊断: 追踪enumerate过程中的成功率、ban效率、内存增长
 // M913扩展: tuple hash去重检测, periodic进度dump
+// [AJB] M1011: Welford online accumulator for iteration-level tuple yield stats
+// Tracks per-epoch (every 10 iterations) how many tuples are produced,
+// computes running mean/variance of yield to detect throughput anomalies.
+struct AjbWelfordYield {
+    long long n = 0;
+    double mean = 0.0;
+    double m2 = 0.0;
+    double min_val = 1e18;
+    double max_val = -1e18;
+    void update(double x) {
+        n++;
+        double delta = x - mean;
+        mean += delta / n;
+        double delta2 = x - mean;
+        m2 += delta * delta2;
+        if(x < min_val) min_val = x;
+        if(x > max_val) max_val = x;
+    }
+    double variance() const { return n < 2 ? 0.0 : m2 / (n - 1); }
+    double stddev() const { return n < 2 ? 0.0 : std::sqrt(m2 / (n - 1)); }
+    double cv() const { return (n < 2 || mean == 0.0) ? 0.0 : stddev() / std::fabs(mean); }
+    void dump_bp(const char* tag) {
+        fprintf(stderr, "[AJB_BP][%s] welford_yield: epochs=%lld mean=%.4f stddev=%.4f cv=%.4f min=%.1f max=%.1f variance=%.6f\n",
+                tag, n, mean, stddev(), cv(), min_val, max_val, variance());
+    }
+};
 static thread_local struct {
     long long total_attempts = 0;
     long long total_success  = 0;
@@ -17,14 +43,16 @@ static thread_local struct {
     long long progress_dumps = 0;    // 进度dump次数
     double    last_hit_rate  = 0.0;
     double    peak_rss_mb    = 0.0;
+    AjbWelfordYield yield_welford;   // M1011: per-epoch yield statistics
     void dump(const char* tag = "Enumerator") {
 #ifdef AJB_DEBUG
         fprintf(stderr, "[AJB_STATE][%s] attempts=%lld success=%lld bans=%lld dedup=%lld hit_rate=%.4f peak_rss=%.1fMB\n",
                 tag, total_attempts, total_success, total_bans, dedup_collisions, last_hit_rate, peak_rss_mb);
+        yield_welford.dump_bp(tag);
 #endif
     }
     void reset() { total_attempts = total_success = total_bans = dedup_collisions = progress_dumps = 0;
-                    last_hit_rate = peak_rss_mb = 0.0; }
+                    last_hit_rate = peak_rss_mb = 0.0; yield_welford = AjbWelfordYield{}; }
 } ajb_enum_stats;
 
 // [AJB] M913: tuple hash for dedup detection
@@ -124,6 +152,13 @@ public:
         constexpr int AJB_PROGRESS_INTERVAL = 1000;
         long long ajb_last_progress_attempt = 0;
 
+        // [AJB] M1011: Welford epoch tracking — count successes per epoch of 10 iterations
+        // At the end of each epoch, feed the epoch's tuple yield count into the
+        // Welford accumulator to compute running mean/variance of throughput.
+        constexpr int AJB_YIELD_EPOCH_SIZE = 10;
+        int ajb_epoch_yield = 0;       // successes in current epoch
+        int ajb_epoch_iterations = 0;  // iterations in current epoch
+
 #ifdef AJB_DEBUG
         fprintf(stderr, "[AJB_BP][Enumerator] enumerate start: option=%d AGM=%lld\n",
                 option, access_tree.AGM);
@@ -135,7 +170,26 @@ public:
         while(bp.remaining()){
             cnt++;
             ajb_enum_stats.total_attempts++;
+            ajb_epoch_iterations++;
             s = bp.pick();
+
+            // [AJB] M1011: Welford epoch boundary — every 10 iterations, record
+            // the number of successful tuple yields and feed into Welford accumulator.
+            // This lets us detect throughput degradation or hot/cold phases.
+            if(ajb_epoch_iterations >= AJB_YIELD_EPOCH_SIZE) {
+                ajb_enum_stats.yield_welford.update((double)ajb_epoch_yield);
+                // [AJB_BP] summary every 10 epochs (100 iterations)
+                if(ajb_enum_stats.yield_welford.n % 10 == 0) {
+                    fprintf(stderr, "[AJB_BP][Enumerator] welford_epoch: n=%lld mean_yield=%.3f stddev=%.3f cv=%.3f epoch_yield=%d remaining=%lld\n",
+                            ajb_enum_stats.yield_welford.n,
+                            ajb_enum_stats.yield_welford.mean,
+                            ajb_enum_stats.yield_welford.stddev(),
+                            ajb_enum_stats.yield_welford.cv(),
+                            ajb_epoch_yield, bp.remaining());
+                }
+                ajb_epoch_yield = 0;
+                ajb_epoch_iterations = 0;
+            }
 
             // [AJB] M913: periodic progress dump
             if(ajb_enum_stats.total_attempts - ajb_last_progress_attempt >= AJB_PROGRESS_INTERVAL) {
@@ -167,6 +221,7 @@ public:
             if(res){
                 cntsuccess++;
                 ajb_enum_stats.total_success++;
+                ajb_epoch_yield++;  // M1011: count success in current epoch
 
                 // [AJB] M913: dedup detection via hash set
 #ifdef AJB_DEBUG
@@ -257,7 +312,19 @@ public:
         cout << "Total RRAccess Time: " << totalRRAccessTime << endl;
 
         // [AJB_TIMER] final summary: 成功数/尝试数/ban数/wall time
+        // [AJB] M1011: flush remaining partial epoch into Welford accumulator
+        if(ajb_epoch_iterations > 0) {
+            ajb_enum_stats.yield_welford.update((double)ajb_epoch_yield);
+        }
         ajb_enum_stats.last_hit_rate = cnt > 0 ? (double)cntsuccess / cnt : 0.0;
+        // [AJB_BP] M1011: final Welford yield statistics dump
+        fprintf(stderr, "[AJB_BP][Enumerator] FINAL welford_yield: epochs=%lld mean=%.4f stddev=%.4f cv=%.4f min=%.1f max=%.1f\n",
+                ajb_enum_stats.yield_welford.n,
+                ajb_enum_stats.yield_welford.mean,
+                ajb_enum_stats.yield_welford.stddev(),
+                ajb_enum_stats.yield_welford.cv(),
+                ajb_enum_stats.yield_welford.min_val,
+                ajb_enum_stats.yield_welford.max_val);
 #ifdef AJB_DEBUG
         fprintf(stderr, "[AJB_TIMER][Enumerator] done: success=%d attempts=%d hit_rate=%.6f cpu=%.3fs wall=%.3fs\n",
                 cntsuccess, cnt, ajb_enum_stats.last_hit_rate, elapsed, wall_sec);
