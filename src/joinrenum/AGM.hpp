@@ -16,11 +16,36 @@ static thread_local struct {
     long long lp_solves = 0;
     double    lp_total_ms = 0.0;
     long long shortcut_hits = 0;  // 走hardcoded公式而非LP
+    // [AJB_BP] M926: adjacency matrix density
+    long long adj_edges = 0;
+    long long adj_possible = 0;
+    // [AJB_BP] M927: LP solution vector tracking
+    long long lp_feasible = 0;
+    long long lp_infeasible = 0;
+    double    lp_min_obj = 1e18;
+    double    lp_max_obj = -1e18;
+    // [AJB_BP] M928: neighbor bitwise popcount stats
+    long long popcount_calls = 0;
+    long long popcount_total_bits = 0;
+    int       popcount_max = 0;
     void dump(const char* tag = "AGM") {
         fprintf(stderr, "[AJB_STATE][%s] calls=%lld lp_solves=%lld shortcut_hits=%lld lp_time=%.3fms\n",
                 tag, agm_calls, lp_solves, shortcut_hits, lp_total_ms);
+        fprintf(stderr, "[AJB_STATE][%s] adj: edges=%lld possible=%lld density=%.4f\n",
+                tag, adj_edges, adj_possible,
+                adj_possible > 0 ? (double)adj_edges / adj_possible : 0.0);
+        fprintf(stderr, "[AJB_STATE][%s] LP: feasible=%lld infeasible=%lld obj_range=[%.4f, %.4f]\n",
+                tag, lp_feasible, lp_infeasible, lp_min_obj, lp_max_obj);
+        fprintf(stderr, "[AJB_STATE][%s] popcount: calls=%lld total_bits=%lld max=%d avg=%.1f\n",
+                tag, popcount_calls, popcount_total_bits, popcount_max,
+                popcount_calls > 0 ? (double)popcount_total_bits / popcount_calls : 0.0);
     }
-    void reset() { agm_calls = lp_solves = shortcut_hits = 0; lp_total_ms = 0.0; }
+    void reset() {
+        agm_calls = lp_solves = shortcut_hits = 0; lp_total_ms = 0.0;
+        adj_edges = adj_possible = 0;
+        lp_feasible = lp_infeasible = 0; lp_min_obj = 1e18; lp_max_obj = -1e18;
+        popcount_calls = popcount_total_bits = 0; popcount_max = 0;
+    }
 } ajb_agm_stats;
 class Query{
     private:
@@ -48,6 +73,23 @@ class Query{
                     relsofVar[relations[i][j]].push_back(i);
                 }
             }
+            // [AJB_BP] M926: compute adjacency matrix density
+            // Two relations are adjacent if they share at least one variable
+            {
+                size_t nrels = relations.size();
+                size_t edges = 0;
+                for(size_t v = 0; v < relsofVar.size(); v++) {
+                    size_t k = relsofVar[v].size();
+                    edges += k * (k - 1) / 2;  // pairs of rels sharing variable v
+                }
+                ajb_agm_stats.adj_edges += (long long)edges;
+                size_t possible = nrels * (nrels - 1) / 2;
+                ajb_agm_stats.adj_possible += (long long)possible;
+                // Print for first query construction
+                fprintf(stderr, "[AJB_BP][AGM] initRels: %zu vars, %zu rels, adj_edges=%zu/%zu (density=%.4f)\n",
+                        relsofVar.size(), nrels, edges, possible,
+                        possible > 0 ? (double)edges / possible : 0.0);
+            }
         }
         
         void initLP(){
@@ -66,6 +108,14 @@ class Query{
             }
 
             glp_add_rows(lp, variables.size());
+            // [AJB_BP] M927: print LP constraint matrix structure (first construction only)
+            static thread_local int ajb_lp_init_count = 0;
+            ajb_lp_init_count++;
+            bool ajb_print_matrix = (ajb_lp_init_count <= 3);
+            if (ajb_print_matrix) {
+                fprintf(stderr, "[AJB_STATE][AGM] initLP #%d: %d cols (rels) x %zu rows (vars)\n",
+                        ajb_lp_init_count, nrels, variables.size());
+            }
             // AJB: VLA → vector (标准C++不允许VLA, upstream用gcc扩展)
             // 同时缓存relsofVar引用避免拷贝
             for(size_t i = 1; i <= variables.size(); i++){
@@ -79,6 +129,16 @@ class Query{
                     val[j + 1] = 1.0;
                 }
                 glp_set_mat_row(lp, i, rs.size(), ind.data(), val.data());
+                // [AJB_BP] M927: print each row's nonzero pattern
+                if (ajb_print_matrix) {
+                    fprintf(stderr, "[AJB_STATE][AGM]   row v%zu: %zu nonzeros [",
+                            i, rs.size());
+                    for(size_t j = 0; j < rs.size(); j++) {
+                        if(j) fprintf(stderr, ",");
+                        fprintf(stderr, "r%d", rs[j] + 1);
+                    }
+                    fprintf(stderr, "]\n");
+                }
             }
         }
 
@@ -218,7 +278,17 @@ class Query{
                     }
                 }
                 seen &= ~(uint64_t(1) << x);  // 清除自身位
-                neighborVec.reserve(__builtin_popcountll(seen));
+                int pc = __builtin_popcountll(seen);
+                // [AJB_BP] M928: popcount diagnostics
+                ajb_agm_stats.popcount_calls++;
+                ajb_agm_stats.popcount_total_bits += pc;
+                if (pc > ajb_agm_stats.popcount_max) ajb_agm_stats.popcount_max = pc;
+                // Print sparsity: how many of 64 bits are used
+                if (ajb_agm_stats.popcount_calls <= 10)
+                    fprintf(stderr, "[AJB_BP][AGM] getNeighborRels(R%d): popcount=%d/%zu sparsity=%.4f\n",
+                            x, pc, nrels - 1,
+                            nrels > 1 ? 1.0 - (double)pc / (nrels - 1) : 0.0);
+                neighborVec.reserve(pc);
                 for(int b = 0; b < 64 && seen; b++) {
                     if(seen & 1) neighborVec.push_back(b);
                     seen >>= 1;
@@ -365,6 +435,26 @@ class Query{
             // cout << x1 << " " << x2 << " " << x3 << " " << x4 << endl;
 
             double res = glp_get_obj_val(lp);
+
+            // [AJB_BP] M927: track LP solution details
+            int status = glp_get_status(lp);
+            if (status == GLP_OPT || status == GLP_FEAS) {
+                ajb_agm_stats.lp_feasible++;
+                if (res < ajb_agm_stats.lp_min_obj) ajb_agm_stats.lp_min_obj = res;
+                if (res > ajb_agm_stats.lp_max_obj) ajb_agm_stats.lp_max_obj = res;
+            } else {
+                ajb_agm_stats.lp_infeasible++;
+            }
+            // [AJB_BP] M927: print LP solution vector (first 5 solves)
+            if (ajb_agm_stats.lp_solves <= 5) {
+                fprintf(stderr, "[AJB_STATE][AGM] LP #%lld solution: obj=%.6f status=%d x=[",
+                        ajb_agm_stats.lp_solves, res, status);
+                for (int i = 1; i <= (int)relations.size(); i++) {
+                    if (i > 1) fprintf(stderr, ",");
+                    fprintf(stderr, "%.4f", glp_get_col_prim(lp, i));
+                }
+                fprintf(stderr, "]\n");
+            }
 
             glp_delete_prob(lp);
             auto ajb_lp_t1 = std::chrono::high_resolution_clock::now();

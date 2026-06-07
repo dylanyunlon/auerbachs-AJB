@@ -53,11 +53,83 @@ static thread_local struct {
     long long total_points_inserted = 0;
     long long total_query_results = 0;
     int max_dim = 0;
+    // [AJB_BP] M921: countInRange recursive depth tracking
+    long long count_range_calls = 0;
+    int       count_range_max_depth = 0;
+    long long count_range_leaf_hits = 0;
+    long long count_range_prune_left = 0;   // pruned right subtree
+    long long count_range_prune_right = 0;  // pruned left subtree
+    // [AJB_BP] M922: splitOnMid balance tracking
+    long long split_calls = 0;
+    long long split_bitvec_ones = 0;
+    long long split_bitvec_total = 0;
+    double    split_worst_balance = 1.0;    // min(nLeft,nRight)/max(nLeft,nRight)
+    // [AJB_BP] M923: binarySearch convergence
+    long long bsearch_geq_calls = 0;
+    long long bsearch_leq_calls = 0;
+    long long bsearch_total_steps = 0;
+    int       bsearch_max_steps = 0;
+    // [AJB_BP] M924: getAllPoints DFS depth
+    long long getall_calls = 0;
+    int       getall_max_stack = 0;
+    long long getall_total_collected = 0;
+    // [AJB_BP] M925: cycle-following permutation stats
+    long long cycle_rearrange_calls = 0;
+    long long cycle_total_swaps = 0;
+    int       cycle_max_len = 0;
+    long long cycle_movenext_calls = 0;
+    // [AJB_BP] M921-enhanced: pointsInRange tracking
+    long long pts_in_range_calls = 0;
+    long long pts_in_range_total_returned = 0;
+    int       pts_in_range_max_returned = 0;
+    // [AJB_BP] M921-enhanced: fractional cascade stats
+    long long frac_cascade_left_calls = 0;
+    long long frac_cascade_right_calls = 0;
+    long long frac_cascade_total_nodes = 0;
+    // [AJB_BP] M921-enhanced: canonical node decomposition stats
+    long long canonical_left_calls = 0;
+    long long canonical_right_calls = 0;
+    long long canonical_total_nodes = 0;
+    int       canonical_max_nodes = 0;
+    // [AJB_BP] M921-enhanced: cycle length distribution histogram (buckets: 1, 2-3, 4-7, 8-15, 16+)
+    long long cycle_hist[5] = {0,0,0,0,0};
     void dump(const char* tag = "RangeTree") {
         fprintf(stderr, "[AJB_STATE][%s] builds=%lld queries=%lld points_inserted=%lld query_results=%lld max_dim=%d\n",
                 tag, build_calls, query_calls, total_points_inserted, total_query_results, max_dim);
+        fprintf(stderr, "[AJB_STATE][%s] countInRange: calls=%lld max_depth=%d leaf_hits=%lld prune_L=%lld prune_R=%lld\n",
+                tag, count_range_calls, count_range_max_depth, count_range_leaf_hits,
+                count_range_prune_left, count_range_prune_right);
+        fprintf(stderr, "[AJB_STATE][%s] pointsInRange: calls=%lld total_returned=%lld max_returned=%d\n",
+                tag, pts_in_range_calls, pts_in_range_total_returned, pts_in_range_max_returned);
+        fprintf(stderr, "[AJB_STATE][%s] splitOnMid: calls=%lld worst_balance=%.4f bitvec_density=%.4f\n",
+                tag, split_calls, split_worst_balance,
+                split_bitvec_total > 0 ? (double)split_bitvec_ones / split_bitvec_total : 0.0);
+        fprintf(stderr, "[AJB_STATE][%s] binarySearch: geq=%lld leq=%lld total_steps=%lld max_steps=%d\n",
+                tag, bsearch_geq_calls, bsearch_leq_calls, bsearch_total_steps, bsearch_max_steps);
+        fprintf(stderr, "[AJB_STATE][%s] getAllPoints: calls=%lld max_stack=%d total_collected=%lld\n",
+                tag, getall_calls, getall_max_stack, getall_total_collected);
+        fprintf(stderr, "[AJB_STATE][%s] fracCascade: left=%lld right=%lld total_nodes=%lld\n",
+                tag, frac_cascade_left_calls, frac_cascade_right_calls, frac_cascade_total_nodes);
+        fprintf(stderr, "[AJB_STATE][%s] canonical: left=%lld right=%lld total=%lld max=%d\n",
+                tag, canonical_left_calls, canonical_right_calls, canonical_total_nodes, canonical_max_nodes);
+        fprintf(stderr, "[AJB_STATE][%s] cycle-follow: rearrange=%lld movenext=%lld total_swaps=%lld max_cycle=%d\n",
+                tag, cycle_rearrange_calls, cycle_movenext_calls, cycle_total_swaps, cycle_max_len);
+        fprintf(stderr, "[AJB_STATE][%s] cycle_hist: [1]=%lld [2-3]=%lld [4-7]=%lld [8-15]=%lld [16+]=%lld\n",
+                tag, cycle_hist[0], cycle_hist[1], cycle_hist[2], cycle_hist[3], cycle_hist[4]);
     }
-    void reset() { build_calls = query_calls = total_points_inserted = total_query_results = 0; max_dim = 0; }
+    void reset() {
+        build_calls = query_calls = total_points_inserted = total_query_results = 0; max_dim = 0;
+        count_range_calls = count_range_leaf_hits = count_range_prune_left = count_range_prune_right = 0;
+        count_range_max_depth = 0;
+        pts_in_range_calls = pts_in_range_total_returned = 0; pts_in_range_max_returned = 0;
+        split_calls = split_bitvec_ones = split_bitvec_total = 0; split_worst_balance = 1.0;
+        bsearch_geq_calls = bsearch_leq_calls = bsearch_total_steps = 0; bsearch_max_steps = 0;
+        getall_calls = 0; getall_max_stack = 0; getall_total_collected = 0;
+        frac_cascade_left_calls = frac_cascade_right_calls = frac_cascade_total_nodes = 0;
+        canonical_left_calls = canonical_right_calls = canonical_total_nodes = 0; canonical_max_nodes = 0;
+        cycle_rearrange_calls = cycle_total_swaps = cycle_movenext_calls = 0; cycle_max_len = 0;
+        for (int i = 0; i < 5; i++) cycle_hist[i] = 0;
+    }
 } ajb_rt_stats;
 
 namespace RangeTree {
@@ -344,12 +416,31 @@ namespace RangeTree {
             // This visits each element exactly once with O(1) extra space
             // (we take order by value since we mutate it as visited marker).
             int n = points.size();
+            ajb_rt_stats.cycle_rearrange_calls++;
             for (int i = 0; i < n; i++) {
                 // Follow the cycle starting at i
+                int cycle_len = 0;  // [AJB_BP] M925: track this cycle's length
                 while (order[i] != i) {
                     int target = order[i];
                     std::swap(points[i], points[target]);
                     std::swap(order[i], order[target]);
+                    cycle_len++;
+                    ajb_rt_stats.cycle_total_swaps++;
+                }
+                if (cycle_len > ajb_rt_stats.cycle_max_len) {
+                    ajb_rt_stats.cycle_max_len = cycle_len;
+                    // [AJB_BP] M925: print when new max cycle discovered (first 10 times)
+                    if (ajb_rt_stats.cycle_rearrange_calls <= 10)
+                        fprintf(stderr, "[AJB_BP][RangeTree] rearrange: new max_cycle_len=%d at call #%lld\n",
+                                cycle_len, ajb_rt_stats.cycle_rearrange_calls);
+                }
+                // [AJB_BP] M925-enhanced: cycle length histogram
+                if (cycle_len > 0) {
+                    if (cycle_len == 1) ajb_rt_stats.cycle_hist[0]++;
+                    else if (cycle_len <= 3) ajb_rt_stats.cycle_hist[1]++;
+                    else if (cycle_len <= 7) ajb_rt_stats.cycle_hist[2]++;
+                    else if (cycle_len <= 15) ajb_rt_stats.cycle_hist[3]++;
+                    else ajb_rt_stats.cycle_hist[4]++;
                 }
             }
         }
@@ -416,19 +507,31 @@ namespace RangeTree {
                 throw std::logic_error("Already at max dimension, cannot move to next.");
             }
             currentDim++;
+            ajb_rt_stats.cycle_movenext_calls++;
             if (pointsSortedByCurrentDim.size() > MAX_POINTS_BEFORE_SWITCH) {
                 // In-place permutation using cycle-following.
                 // Upstream copies the entire vector then permutes from copy.
                 int n = pointsSortedByCurrentDim.size();
                 std::vector<int> perm = redirectionTable[0];  // take a mutable copy
+                int local_max_cycle = 0;  // [AJB_BP] M925
                 for (int i = 0; i < n; i++) {
+                    int cycle_len = 0;
                     while (perm[i] != i) {
                         int target = perm[i];
                         std::swap(pointsSortedByCurrentDim[i],
                                   pointsSortedByCurrentDim[target]);
                         std::swap(perm[i], perm[target]);
+                        cycle_len++;
+                        ajb_rt_stats.cycle_total_swaps++;
                     }
+                    if (cycle_len > local_max_cycle) local_max_cycle = cycle_len;
                 }
+                if (local_max_cycle > ajb_rt_stats.cycle_max_len)
+                    ajb_rt_stats.cycle_max_len = local_max_cycle;
+                // [AJB_BP] M925: print moveToNext cycle stats (first 10 calls)
+                if (ajb_rt_stats.cycle_movenext_calls <= 10)
+                    fprintf(stderr, "[AJB_BP][RangeTree] moveToNextDim(%d→%d): n=%d max_cycle=%d\n",
+                            currentDim - 1, currentDim, n, local_max_cycle);
                 redirectionTable.pop_front();
             } else {
                 sort(pointsSortedByCurrentDim, currentDim);
@@ -460,9 +563,20 @@ namespace RangeTree {
             if (n == 1) {
                 throw std::logic_error("Cannot split on mid when there is only one point.");
             }
+            ajb_rt_stats.split_calls++;
 
             int mid = (n - 1) / 2;
             int nLeft = mid + 1, nRight = n - nLeft;
+            // [AJB_BP] M922: balance ratio tracking
+            {
+                double balance = (double)std::min(nLeft, nRight) / std::max(nLeft, nRight);
+                if (balance < ajb_rt_stats.split_worst_balance)
+                    ajb_rt_stats.split_worst_balance = balance;
+                // Print first 10 splits or severely unbalanced ones
+                if (ajb_rt_stats.split_calls <= 10 || balance < 0.1)
+                    fprintf(stderr, "[AJB_BP][RangeTree] splitOnMid #%lld: n=%d nL=%d nR=%d balance=%.4f dim=%d\n",
+                            ajb_rt_stats.split_calls, n, nLeft, nRight, balance, currentDim);
+            }
             // Use iterator-range copy instead of element-by-element loop
             std::vector<Point<T, S>*> sortedPointsLeft(
                 pointsSortedByCurrentDim.begin(),
@@ -480,9 +594,14 @@ namespace RangeTree {
                 // Use uint8_t bitvector instead of vector<bool> to avoid the
                 // proxy-reference overhead of vector<bool>::operator[].
                 std::vector<uint8_t> onLeft(n);
+                long long local_ones = 0;  // [AJB_BP] M922: bitvec density
                 for (int i = 0; i < n; i++) {
                     onLeft[i] = (i <= mid) ? 1 : 0;
+                    if (onLeft[i]) local_ones++;
                 }
+                // [AJB_BP] M922: accumulate bitvector stats
+                ajb_rt_stats.split_bitvec_ones += local_ones;
+                ajb_rt_stats.split_bitvec_total += n;
 
                 std::deque<std::vector<int> > redirectionTableLeft(redirectionTable.size(),
                                                                    std::vector<int>(nLeft));
@@ -644,6 +763,8 @@ namespace RangeTree {
         int binarySearchFirstGeq(T needle, int lo, int hi) const {
             // Iterative binary search replacing the recursive version.
             // Avoids stack frames on deep trees with many sorted points.
+            ajb_rt_stats.bsearch_geq_calls++;
+            int steps = 0;  // [AJB_BP] M923: convergence tracking
             while (lo < hi) {
                 int mid = lo + (hi - lo) / 2;  // overflow-safe midpoint
                 if (needle <= pointsLastDimSorted[mid]) {
@@ -651,6 +772,15 @@ namespace RangeTree {
                 } else {
                     lo = mid + 1;
                 }
+                steps++;
+            }
+            // [AJB_BP] M923: accumulate search steps
+            ajb_rt_stats.bsearch_total_steps += steps;
+            if (steps > ajb_rt_stats.bsearch_max_steps) {
+                ajb_rt_stats.bsearch_max_steps = steps;
+                if (ajb_rt_stats.bsearch_geq_calls <= 10)
+                    fprintf(stderr, "[AJB_BP][RangeTree] bsGeq: new max_steps=%d needle=%g range=[%d,%d]\n",
+                            steps, (double)needle, lo, hi);
             }
             // lo == hi: check if the element at lo satisfies >= needle
             if (lo < (int)pointsLastDimSorted.size() && needle <= pointsLastDimSorted[lo]) {
@@ -661,6 +791,8 @@ namespace RangeTree {
 
         int binarySearchFirstLeq(T needle, int lo, int hi) const {
             // Iterative binary search replacing the recursive version.
+            ajb_rt_stats.bsearch_leq_calls++;
+            int steps = 0;  // [AJB_BP] M923
             while (lo < hi) {
                 int mid = lo + (hi - lo + 1) / 2;  // upper-mid for leq search
                 if (needle >= pointsLastDimSorted[mid]) {
@@ -668,6 +800,15 @@ namespace RangeTree {
                 } else {
                     hi = mid - 1;
                 }
+                steps++;
+            }
+            ajb_rt_stats.bsearch_total_steps += steps;
+            if (steps > ajb_rt_stats.bsearch_max_steps) {
+                ajb_rt_stats.bsearch_max_steps = steps;
+                // [AJB_BP] M923-enhanced: print leq max too
+                if (ajb_rt_stats.bsearch_leq_calls <= 10)
+                    fprintf(stderr, "[AJB_BP][RangeTree] bsLeq: new max_steps=%d needle=%g range=[%d,%d]\n",
+                            steps, (double)needle, lo, hi);
             }
             if (lo >= 0 && lo < (int)pointsLastDimSorted.size() &&
                 needle >= pointsLastDimSorted[lo]) {
@@ -704,11 +845,16 @@ namespace RangeTree {
         std::vector<Point<T,S> > getAllPoints() const {
             // Iterative DFS with explicit stack — avoids recursion depth issues
             // on heavily unbalanced trees and eliminates per-level vector copies.
+            ajb_rt_stats.getall_calls++;
             std::vector<Point<T,S> > result;
             result.reserve(pointCountSum);  // exact pre-allocation
             std::vector<const RangeTreeNode<T,S>*> stack;
             stack.push_back(this);
+            int local_max_stack = 0;  // [AJB_BP] M924
             while (!stack.empty()) {
+                // [AJB_BP] M924: track max stack depth
+                if ((int)stack.size() > local_max_stack)
+                    local_max_stack = (int)stack.size();
                 const RangeTreeNode<T,S>* cur = stack.back();
                 stack.pop_back();
                 if (cur->isLeaf) {
@@ -718,6 +864,14 @@ namespace RangeTree {
                     if (cur->right) stack.push_back(cur->right.get());
                     if (cur->left)  stack.push_back(cur->left.get());
                 }
+            }
+            // [AJB_BP] M924: update global max and log
+            ajb_rt_stats.getall_total_collected += result.size();
+            if (local_max_stack > ajb_rt_stats.getall_max_stack) {
+                ajb_rt_stats.getall_max_stack = local_max_stack;
+                if (ajb_rt_stats.getall_calls <= 10)
+                    fprintf(stderr, "[AJB_BP][RangeTree] getAllPoints: max_stack=%d collected=%zu at call #%lld\n",
+                            local_max_stack, result.size(), ajb_rt_stats.getall_calls);
             }
             return result;
         }
@@ -765,7 +919,10 @@ namespace RangeTree {
         */
         int countInRange(const std::vector<T>& lower,
                          const std::vector<T>& upper) const {
+            // [AJB_BP] M921: track recursive depth via iterative counting
+            ajb_rt_stats.count_range_calls++;
             if (isLeaf) {
+                ajb_rt_stats.count_range_leaf_hits++;
                 if (pointInRange(*point, lower, upper)) {
                     return totalPoints();
                 } else {
@@ -775,9 +932,11 @@ namespace RangeTree {
             int compareInd = pointOrdering.getCompareStartIndex();
 
             if ((*point)[compareInd] > upper[compareInd]) {
+                ajb_rt_stats.count_range_prune_right++;  // [AJB_BP] pruned right
                 return left->countInRange(lower, upper);
             }
             if ((*point)[compareInd] < lower[compareInd]) {
+                ajb_rt_stats.count_range_prune_left++;  // [AJB_BP] pruned left
                 return right->countInRange(lower, upper);
             }
 
@@ -855,6 +1014,8 @@ namespace RangeTree {
         */
         std::vector<Point<T,S> > pointsInRange(const std::vector<T>& lower,
                                                const std::vector<T>& upper) const {
+            // [AJB_BP] M921-enhanced: track pointsInRange calls
+            ajb_rt_stats.pts_in_range_calls++;
             std::vector<Point<T,S> > pointsToReturn = {};
             if (isLeaf) {
                 if (pointInRange(*point, lower, upper)) {
@@ -936,6 +1097,19 @@ namespace RangeTree {
                             std::make_move_iterator(subResult.end()));
                     }
                 }
+                // [AJB_BP] M921-enhanced: track canonical node decomposition in pointsInRange
+                {
+                    int cn = (int)canonicalNodes.size();
+                    ajb_rt_stats.canonical_total_nodes += cn;
+                    if (cn > ajb_rt_stats.canonical_max_nodes) ajb_rt_stats.canonical_max_nodes = cn;
+                }
+                // [AJB_BP] M921-enhanced: track result size
+                {
+                    int nr = (int)pointsToReturn.size();
+                    ajb_rt_stats.pts_in_range_total_returned += nr;
+                    if (nr > ajb_rt_stats.pts_in_range_max_returned)
+                        ajb_rt_stats.pts_in_range_max_returned = nr;
+                }
                 return pointsToReturn;
             }
         }
@@ -945,6 +1119,9 @@ namespace RangeTree {
                                   int leqInd,
                                   std::vector<RangeTreeNode<T,S>* >& nodes,
                                   std::vector<std::pair<int,int> >& inds) {
+            // [AJB_BP] M921-enhanced: fractional cascade left tracking
+            ajb_rt_stats.frac_cascade_left_calls++;
+            size_t nodes_before = nodes.size();
             // Iterative version: the recursion always follows exactly one child
             // (either left or right), so it's a linear chain — perfect for a loop.
             RangeTreeNode<T,S>* cur = this;
@@ -990,6 +1167,8 @@ namespace RangeTree {
                                    int leqInd,
                                    std::vector<RangeTreeNode<T,S>* >& nodes,
                                    std::vector<std::pair<int,int> >& inds) {
+            // [AJB_BP] M921-enhanced: fractional cascade right tracking
+            ajb_rt_stats.frac_cascade_right_calls++;
             // Iterative: same tail-recursion elimination as leftFractionalCascade.
             RangeTreeNode<T,S>* cur = this;
             int g = geqInd, l = leqInd;
@@ -1038,6 +1217,8 @@ namespace RangeTree {
         // [AJB] Canonical nodes: 找到覆盖查询区间的最少节点集合
         void leftCanonicalNodes(const std::vector<T>& lower,
                                 std::vector<std::shared_ptr<RangeTreeNode<T,S> > >& nodes) {
+            // [AJB_BP] M921-enhanced: canonical left decomposition
+            ajb_rt_stats.canonical_left_calls++;
             if (isLeaf) {
                 throw std::logic_error("Should never have a leaf deciding if its canonical.");
             }
@@ -1066,6 +1247,8 @@ namespace RangeTree {
         */
         void rightCanonicalNodes(const std::vector<T>& upper,
                                  std::vector<std::shared_ptr<RangeTreeNode<T,S> > >& nodes) {
+            // [AJB_BP] M921-enhanced: canonical right decomposition
+            ajb_rt_stats.canonical_right_calls++;
             if (isLeaf) {
                 throw std::logic_error("Should never have a leaf deciding if its canonical.");
             }
@@ -1217,6 +1400,11 @@ namespace RangeTree {
             ajb_rt_stats.build_calls++;
             ajb_rt_stats.total_points_inserted += points.size();
             if(dim > ajb_rt_stats.max_dim) ajb_rt_stats.max_dim = dim;
+            // [AJB_BP] M921: detailed build entry
+            if (ajb_rt_stats.build_calls <= 10) {
+                fprintf(stderr, "[AJB_TIMER][RangeTree] build #%lld: %zu points, dim=%d\n",
+                        ajb_rt_stats.build_calls, points.size(), dim);
+            }
             // Single-pass simultaneous min/max across all dimensions.
             // Upstream used nested loop: outer over points, inner over dims.
             // Here we accumulate all dims per-point in one pass — same O(n*d) but
@@ -1308,6 +1496,16 @@ namespace RangeTree {
             ajb_rt_stats.query_calls++;
             int ajb_result2 = root->countInRange(lower, upper);
             ajb_rt_stats.total_query_results += ajb_result2;
+            // [AJB_BP] M921: print query details for first 10 queries or every 1000th
+            if (ajb_rt_stats.query_calls <= 10 || ajb_rt_stats.query_calls % 1000 == 0) {
+                fprintf(stderr, "[AJB_BP][RangeTree] query #%lld: dim=%zu hits=%d range=[",
+                        ajb_rt_stats.query_calls, lower.size(), ajb_result2);
+                for (size_t d = 0; d < lower.size(); d++) {
+                    if (d) fprintf(stderr, ",");
+                    fprintf(stderr, "%g:%g", (double)lower[d], (double)upper[d]);
+                }
+                fprintf(stderr, "]\n");
+            }
             return ajb_result2;
         }
 

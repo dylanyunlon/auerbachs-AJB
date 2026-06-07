@@ -195,6 +195,11 @@ public:
      * 4. Sorts the points vector.
      */
     CountOracle(vector<Point<T> > &points) {
+        // [AJB_BP] M940: guard against empty points (segfault fix)
+        if (points.empty()) {
+            fprintf(stderr, "[AJB_BP][CountOracle] WARNING: empty points vector, constructing null oracle\n");
+            return;
+        }
         const size_t ndim = points[0].dim();
         const size_t npts = points.size();
         // AJB: 单pass计算bounds + 累计统计, 替代upstream的双层循环

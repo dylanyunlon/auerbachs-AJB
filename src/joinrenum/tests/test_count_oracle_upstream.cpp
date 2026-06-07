@@ -107,6 +107,18 @@ static long long rangeVolume(const pair<Point<int>, Point<int> >& r) {
 int main(){
     vector<Point<int> > points;
     readDataFromFile(points);
+    // [AJB_BP] M940: synthetic data fallback if file missing or empty
+    if (points.empty()) {
+        fprintf(stderr, "[AJB_BP][test_count_oracle_upstream] no data.txt, generating synthetic data\n");
+        srand(42);
+        const int synth_n = 200, synth_dim = 3;
+        for (int i = 0; i < synth_n; i++) {
+            vector<int> v(synth_dim);
+            for (int d = 0; d < synth_dim; d++) v[d] = rand() % 1000;
+            points.push_back(Point<int>(v));
+        }
+        printf("[AJB] Generated %d synthetic %d-D points\n", synth_n, synth_dim);
+    }
     clock_t start, end;
     start = clock();
     CountOracle<int> tree(points);

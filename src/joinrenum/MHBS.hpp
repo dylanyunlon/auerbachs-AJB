@@ -17,12 +17,28 @@ static thread_local struct {
     long long iterations = 0;     // while循环总轮数
     long long early_returns = 0;  // 单元素range直接返回的次数
     int       max_rels = 0;       // 见过的最大rels.size()
+    // [AJB_BP] M929: per-iteration range reduction tracking
+    long long total_range_before = 0;
+    long long total_range_after = 0;
+    long long early_exit_all_converged = 0;  // early exit因所有range都收敛
+    long long mini_updates = 0;   // 更新mini bound的次数
+    long long maxi_updates = 0;   // 更新maxi bound的次数
     void dump(const char* tag = "MHBS") {
         fprintf(stderr, "[AJB_STATE][%s] calls=%lld iters=%lld early_ret=%lld max_rels=%d avg_iters=%.1f\n",
                 tag, calls, iterations, early_returns, max_rels,
                 calls > 0 ? (double)iterations / calls : 0.0);
+        fprintf(stderr, "[AJB_STATE][%s] range_reduction: before=%lld after=%lld ratio=%.4f early_exit_converge=%lld\n",
+                tag, total_range_before, total_range_after,
+                total_range_before > 0 ? (double)total_range_after / total_range_before : 0.0,
+                early_exit_all_converged);
+        fprintf(stderr, "[AJB_STATE][%s] bound_updates: mini=%lld maxi=%lld\n",
+                tag, mini_updates, maxi_updates);
     }
-    void reset() { calls = iterations = early_returns = 0; max_rels = 0; }
+    void reset() {
+        calls = iterations = early_returns = 0; max_rels = 0;
+        total_range_before = total_range_after = early_exit_all_converged = 0;
+        mini_updates = maxi_updates = 0;
+    }
 } ajb_mhbs_stats;
 
 void getpos(const vector<pair<vector<int>::iterator, vector<int>::iterator> > &iters, const vector<pair<vector<int>::iterator, vector<int>::iterator> > &bounds, const vector<bool> &flag, const int t, vector<int> &pos) {
@@ -70,6 +86,12 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
         }
     }
     if(ajb_mhbs_stats.calls <= 10) fprintf(stderr, "]\n");
+    // [AJB_BP] M929: measure initial search range
+    long long ajb_init_range = 0;
+    for (int i = 0; i < (int)iters.size(); i++)
+        ajb_init_range += (iters[i].second - iters[i].first);
+    ajb_mhbs_stats.total_range_before += ajb_init_range;
+
     int loop_iters = 0;
     while(cnt < (int)iters.size()) {
         loop_iters++;
@@ -85,7 +107,14 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
             for(size_t i : rels) {
                 if(bounds[i].second - bounds[i].first > 1) { all_converged = false; break; }
             }
-            if(all_converged) break;
+            if(all_converged) {
+                ajb_mhbs_stats.early_exit_all_converged++;
+                // [AJB_BP] M929: print early exit trigger reason
+                if(ajb_mhbs_stats.early_exit_all_converged <= 10)
+                    fprintf(stderr, "[AJB_BP][MHBS] early_exit: all_converged after %d iters, remaining_rels=%zu\n",
+                            loop_iters, rels.size());
+                break;
+            }
         }
         mini = -1, maxi = -1;
         for(size_t i : rels){
@@ -96,6 +125,7 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
         res = q.AGM(pos);
         upp = ajb_safe_ceil(res);
         if(upp <= target) {
+            ajb_mhbs_stats.mini_updates++;
             bounds[mini].first = itermid[mini];
             if(bounds[mini].second - bounds[mini].first <= 1) {
                 if(*bounds[mini].first == *bounds[mini].second) return *bounds[mini].first;
@@ -112,6 +142,7 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
             }
         }
         else {
+            ajb_mhbs_stats.maxi_updates++;
             bounds[maxi].second = itermid[maxi];
             if(bounds[maxi].second - bounds[maxi].first <= 1) {
                 if(*bounds[maxi].first == *bounds[maxi].second) return *bounds[maxi].first;
@@ -131,6 +162,21 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
     int ans = 2147483647;
     for(int i = 0; i < iters.size(); i++) {
         if(bounds[i].second != iters[i].second) ans = min(ans, *bounds[i].second);
+    }
+    // [AJB_BP] M929: measure final search range reduction
+    {
+        long long ajb_final_range = 0;
+        for (int i = 0; i < (int)iters.size(); i++)
+            ajb_final_range += (bounds[i].second - bounds[i].first);
+        ajb_mhbs_stats.total_range_after += ajb_final_range;
+        // Print reduction rate for first 10 calls or slow convergence
+        if (loop_iters > 50 || ajb_mhbs_stats.calls <= 10) {
+            double reduction = ajb_init_range > 0
+                ? 1.0 - (double)ajb_final_range / ajb_init_range : 1.0;
+            fprintf(stderr, "[AJB_BP][MHBS] #%lld range_reduction: %lld→%lld (%.2f%% reduced) iters=%d\n",
+                    ajb_mhbs_stats.calls, ajb_init_range, ajb_final_range,
+                    reduction * 100.0, loop_iters);
+        }
     }
     // [AJB_TRACE] MHBS converged: 轮数多说明值域跨度大
     if(loop_iters > 50 || ajb_mhbs_stats.calls <= 10)

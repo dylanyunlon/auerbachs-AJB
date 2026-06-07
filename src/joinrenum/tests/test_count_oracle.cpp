@@ -139,6 +139,19 @@ int main(int argc, char* argv[]) {
         ScopedTimer t("read_data");
         readDataFromFile(points, dataFile);
     }
+    // [AJB_BP] M940: synthetic data fallback if file missing or empty
+    if (points.empty()) {
+        fprintf(stderr, "[AJB_BP][test_count_oracle] no data loaded from '%s', generating synthetic data\n",
+                dataFile.c_str());
+        srand(42);
+        const int synth_n = 200, synth_dim = 3;
+        for (int i = 0; i < synth_n; i++) {
+            vector<int> v(synth_dim);
+            for (int d = 0; d < synth_dim; d++) v[d] = rand() % 1000;
+            points.push_back(Point<int>(v));
+        }
+        printf("[AJB] Generated %d synthetic %d-D points (data.txt fallback)\n", synth_n, synth_dim);
+    }
     printf("[AJB] Loaded %zu points, dim=%d\n",
            points.size(), points.empty() ? 0 : points[0].dim());
 

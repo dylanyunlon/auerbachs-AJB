@@ -17,13 +17,40 @@ static thread_local struct {
     long long replace_calls = 0;
     long long replace_self_calls = 0;
     int max_dim_seen = 0;
+    // [AJB_BP] M930: volume tracking
+    double total_volume_before = 0.0;
+    double total_volume_after = 0.0;
+    double min_child_volume = 1e18;
+    double max_child_volume = 0.0;
+    long long volume_measurements = 0;
+    // [AJB_BP] M931: splitDim dimension frequency histogram (up to 16 dims)
+    long long dim_freq[16] = {};
+    // [AJB_BP] M932: replaceSelf dim-change tracking
+    long long dim_change_count = 0;
     void dump(const char* tag = "SplitBucket") {
         fprintf(stderr, "[AJB_STATE][%s] calls=%lld children=%lld avg=%.2f replace=%lld replace_self=%lld max_dim=%d\n",
                 tag, split_calls, children_total,
                 split_calls > 0 ? (double)children_total / split_calls : 0.0,
                 replace_calls, replace_self_calls, max_dim_seen);
+        fprintf(stderr, "[AJB_STATE][%s] volume: measurements=%lld before=%.1f after=%.1f ratio=%.4f\n",
+                tag, volume_measurements, total_volume_before, total_volume_after,
+                total_volume_before > 0 ? total_volume_after / total_volume_before : 0.0);
+        fprintf(stderr, "[AJB_STATE][%s] child_volume: min=%.1f max=%.1f\n",
+                tag, min_child_volume, max_child_volume);
+        fprintf(stderr, "[AJB_STATE][%s] dim_freq: [", tag);
+        for(int d = 0; d < 16 && d <= max_dim_seen; d++) {
+            if(d) fprintf(stderr, ",");
+            fprintf(stderr, "d%d=%lld", d, dim_freq[d]);
+        }
+        fprintf(stderr, "] dim_changes=%lld\n", dim_change_count);
     }
-    void reset() { split_calls = children_total = replace_calls = replace_self_calls = 0; max_dim_seen = 0; }
+    void reset() {
+        split_calls = children_total = replace_calls = replace_self_calls = 0; max_dim_seen = 0;
+        total_volume_before = total_volume_after = 0.0;
+        min_child_volume = 1e18; max_child_volume = 0.0; volume_measurements = 0;
+        for(int i = 0; i < 16; i++) dim_freq[i] = 0;
+        dim_change_count = 0;
+    }
 } ajb_split_stats;
 
 #include<iostream>
@@ -57,10 +84,34 @@ class Bucket {
             // AJB-algo: move semantics to avoid copy when rvalue
             this->lowerBound = std::move(lowerBound);
             this->upperBound = std::move(upperBound);
-            while(splitDim < lowerBound.size() && lowerBound[splitDim] == upperBound[splitDim])splitDim++;
+            while(splitDim < this->lowerBound.size() && this->lowerBound[splitDim] == this->upperBound[splitDim])splitDim++;
             // [AJB_TRACE] Bucket ctor: scan dimensions for first non-degenerate
-            if((int)lowerBound.size() > ajb_split_stats.max_dim_seen)
-                ajb_split_stats.max_dim_seen = lowerBound.size();
+            if((int)this->lowerBound.size() > ajb_split_stats.max_dim_seen)
+                ajb_split_stats.max_dim_seen = this->lowerBound.size();
+            // [AJB_BP] M930: compute bucket volume
+            {
+                double vol = 1.0;
+                for(size_t d = 0; d < this->lowerBound.size(); d++) {
+                    vol *= (double)(this->upperBound[d] - this->lowerBound[d] + 1);
+                    if(vol > 1e15) { vol = 1e15; break; }
+                }
+                ajb_split_stats.volume_measurements++;
+                ajb_split_stats.total_volume_after += vol;
+                if(vol < ajb_split_stats.min_child_volume) ajb_split_stats.min_child_volume = vol;
+                if(vol > ajb_split_stats.max_child_volume) ajb_split_stats.max_child_volume = vol;
+            }
+            // [AJB_BP] M931: splitDim frequency
+            if(splitDim < 16) ajb_split_stats.dim_freq[splitDim]++;
+            // [AJB_BP] M931: log first 10 constructions
+            if(ajb_split_stats.volume_measurements <= 10) {
+                fprintf(stderr, "[AJB_BP][Bucket] ctor: dim=%zu splitDim=%d bounds=[",
+                        this->lowerBound.size(), splitDim);
+                for(size_t d = 0; d < this->lowerBound.size(); d++) {
+                    if(d) fprintf(stderr, ",");
+                    fprintf(stderr, "%d:%d", this->lowerBound[d], this->upperBound[d]);
+                }
+                fprintf(stderr, "]\n");
+            }
         }
 
         const vector<int>& getLowerBound() const {
@@ -91,13 +142,31 @@ class Bucket {
         void replaceSelf(int lower, int upper){
             ajb_split_stats.replace_self_calls++;
             int old_splitDim = splitDim;
+            // [AJB_BP] M930: compute volume before replacement
+            double vol_before = 1.0;
+            for(size_t d = 0; d < lowerBound.size(); d++) {
+                vol_before *= (double)(upperBound[d] - lowerBound[d] + 1);
+                if(vol_before > 1e15) { vol_before = 1e15; break; }
+            }
+            ajb_split_stats.total_volume_before += vol_before;
+
             lowerBound[splitDim] = lower;
             upperBound[splitDim] = upper;
             while(splitDim < lowerBound.size() && lowerBound[splitDim] == upperBound[splitDim])splitDim++;
+
+            // [AJB_BP] M930: compute volume after replacement
+            double vol_after = 1.0;
+            for(size_t d = 0; d < lowerBound.size(); d++) {
+                vol_after *= (double)(upperBound[d] - lowerBound[d] + 1);
+                if(vol_after > 1e15) { vol_after = 1e15; break; }
+            }
+            ajb_split_stats.total_volume_after += vol_after;
+
             // [AJB_TRACE] replaceSelf: dim %d→%d on range [%d,%d]
             if(old_splitDim != splitDim) {
-                fprintf(stderr, "[AJB_TRACE][Bucket] replaceSelf: splitDim %d→%d (range [%d,%d])\n",
-                        old_splitDim, (int)splitDim, lower, upper);
+                ajb_split_stats.dim_change_count++;
+                fprintf(stderr, "[AJB_TRACE][Bucket] replaceSelf: splitDim %d→%d (range [%d,%d]) vol %.0f→%.0f\n",
+                        old_splitDim, (int)splitDim, lower, upper, vol_before, vol_after);
             }
             return;
         }

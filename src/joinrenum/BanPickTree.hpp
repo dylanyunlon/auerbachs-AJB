@@ -12,11 +12,37 @@ static thread_local struct {
     long long ban_calls  = 0;
     long long ban_overlap = 0;  // ban时与已有区间重叠的次数
     long long total_banned = 0; // ban掉的总元素数
+    // [AJB_BP] M933: tree structure tracking
+    int       max_tree_height = 0;
+    long long leaf_count = 0;    // nodes without children
+    long long internal_count = 0; // nodes with at least one child
+    // [AJB_BP] M934: ban reason tracking — empty range, clipped, actual
+    long long ban_empty = 0;
+    long long ban_clipped = 0;
+    long long ban_merged = 0;    // merged with adjacent node
+    // [AJB_BP] M935: pick distribution (how uniform is G()?)
+    long long pick_min = 0;
+    long long pick_max = 0;
+    double    pick_sum = 0.0;
     void dump(const char* tag = "BanPickTree") {
         fprintf(stderr, "[AJB_STATE][%s] picks=%lld bans=%lld overlaps=%lld total_banned=%lld\n",
                 tag, pick_calls, ban_calls, ban_overlap, total_banned);
+        fprintf(stderr, "[AJB_STATE][%s] tree: max_height=%d leaf=%lld internal=%lld ratio=%.2f\n",
+                tag, max_tree_height, leaf_count, internal_count,
+                (leaf_count + internal_count) > 0
+                    ? (double)leaf_count / (leaf_count + internal_count) : 0.0);
+        fprintf(stderr, "[AJB_STATE][%s] ban_types: empty=%lld clipped=%lld merged=%lld\n",
+                tag, ban_empty, ban_clipped, ban_merged);
+        fprintf(stderr, "[AJB_STATE][%s] pick_range: min=%lld max=%lld avg=%.1f\n",
+                tag, pick_min, pick_max,
+                pick_calls > 0 ? pick_sum / pick_calls : 0.0);
     }
-    void reset() { pick_calls = ban_calls = ban_overlap = total_banned = 0; }
+    void reset() {
+        pick_calls = ban_calls = ban_overlap = total_banned = 0;
+        max_tree_height = 0; leaf_count = internal_count = 0;
+        ban_empty = ban_clipped = ban_merged = 0;
+        pick_min = 0; pick_max = 0; pick_sum = 0.0;
+    }
 } ajb_bpt_stats;
 
 #include <bits/stdc++.h>
@@ -170,16 +196,33 @@ public:
 
     void ban(long long low, long long high) {
         ajb_bpt_stats.ban_calls++;
-        if (low > high) return;
+        if (low > high) {
+            ajb_bpt_stats.ban_empty++;
+            return;
+        }
+        long long orig_low = low, orig_high = high;
         low = std::max(low, 1LL); high = std::min(high, H);
-        if (low > high) return;
+        if (low > high) {
+            ajb_bpt_stats.ban_empty++;
+            return;
+        }
+        // [AJB_BP] M934: detect clipping
+        if (low != orig_low || high != orig_high)
+            ajb_bpt_stats.ban_clipped++;
         long long before_remaining = remaining();
         if (before_remaining <= 0) return;
         if (pool.size() == pool.capacity())
             pool.reserve(pool.capacity() < 16 ? 16 : pool.capacity() * 2);
+        size_t pool_before = pool.size();
         if (root == -1) {
             pool.emplace_back(low, high);
             root = pool.size() - 1;
+            // [AJB_BP] M933: first node is leaf
+            ajb_bpt_stats.leaf_count++;
+            // [AJB_BP] M934: print first 10 bans
+            if (ajb_bpt_stats.ban_calls <= 10)
+                fprintf(stderr, "[AJB_BP][BanPickTree] ban #%lld: [%lld,%lld] (first node)\n",
+                        ajb_bpt_stats.ban_calls, low, high);
             return;
         }
         pool.emplace_back(low, high);
@@ -187,16 +230,57 @@ public:
         long long actually_banned = before_remaining - remaining();
         ajb_bpt_stats.total_banned += actually_banned;
         if(actually_banned < (high - low + 1)) ajb_bpt_stats.ban_overlap++;
+        // [AJB_BP] M934: detect merges (pool didn't grow = node was merged)
+        if (pool.size() <= pool_before)
+            ajb_bpt_stats.ban_merged++;
+        // [AJB_BP] M933: track tree height after insertion
+        if (root != -1) {
+            int h = pool[root].height;
+            if (h > ajb_bpt_stats.max_tree_height) {
+                ajb_bpt_stats.max_tree_height = h;
+                if (h <= 10 || ajb_bpt_stats.ban_calls <= 10)
+                    fprintf(stderr, "[AJB_BP][BanPickTree] new max_height=%d at ban #%lld pool_size=%zu\n",
+                            h, ajb_bpt_stats.ban_calls, pool.size());
+            }
+            // [AJB_BP] M933: update leaf/internal counts periodically
+            if (ajb_bpt_stats.ban_calls % 1000 == 0 || ajb_bpt_stats.ban_calls <= 10) {
+                long long l = 0, n = 0;
+                for(size_t i = 0; i < pool.size(); i++) {
+                    if(pool[i].left == -1 && pool[i].right == -1) l++;
+                    else n++;
+                }
+                ajb_bpt_stats.leaf_count = l;
+                ajb_bpt_stats.internal_count = n;
+            }
+        }
+        // [AJB_BP] M934: print significant bans (first 10 or every 1000th)
+        if (ajb_bpt_stats.ban_calls <= 10 || ajb_bpt_stats.ban_calls % 1000 == 0)
+            fprintf(stderr, "[AJB_BP][BanPickTree] ban #%lld: [%lld,%lld] banned=%lld remaining=%lld\n",
+                    ajb_bpt_stats.ban_calls, low, high, actually_banned, remaining());
     }
 
     long long pick() {
+        ajb_bpt_stats.pick_calls++;
         long long rem = remaining();
         if (rem <= 0) return 0;
         long long result = G();
+        // [AJB_BP] M935: track pick distribution
+        ajb_bpt_stats.pick_sum += (double)result;
+        if (ajb_bpt_stats.pick_calls == 1) {
+            ajb_bpt_stats.pick_min = result;
+            ajb_bpt_stats.pick_max = result;
+        } else {
+            if (result < ajb_bpt_stats.pick_min) ajb_bpt_stats.pick_min = result;
+            if (result > ajb_bpt_stats.pick_max) ajb_bpt_stats.pick_max = result;
+        }
         // [AJB_BP] invariant: picked value must be available
         if (result < 1 || result > H) {
             fprintf(stderr, "[AJB_BP][BanPickTree::pick] OOB result=%lld H=%lld\n", result, H);
         }
+        // [AJB_BP] M935: log first 10 picks and every 1000th
+        if (ajb_bpt_stats.pick_calls <= 10 || ajb_bpt_stats.pick_calls % 1000 == 0)
+            fprintf(stderr, "[AJB_BP][BanPickTree] pick #%lld: result=%lld remaining=%lld range=[%lld,%lld]\n",
+                    ajb_bpt_stats.pick_calls, result, rem, ajb_bpt_stats.pick_min, ajb_bpt_stats.pick_max);
         return result;
     }
 
