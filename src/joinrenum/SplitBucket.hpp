@@ -25,10 +25,6 @@
 #include <numeric>
 
 // [AJB] Split诊断 — 扩展: 带per-dim统计
-// [AJB] M1016: split point quality entropy metric
-// When a bucket is split (replaceSelf), compute the entropy of the
-// child-size ratio: H = -p*log(p) - (1-p)*log(1-p) where p = child_range / parent_range.
-// Perfect 50/50 split → H=ln(2)≈0.693; degenerate split → H→0.
 static thread_local struct {
     long long split_calls = 0;
     long long children_total = 0;
@@ -45,22 +41,30 @@ static thread_local struct {
     long long dim_freq[16] = {};
     // [AJB_BP] M932: replaceSelf dim-change tracking
     long long dim_change_count = 0;
-    // [AJB_STATE] M1016: split entropy accumulator (Welford on entropy values)
-    long long entropy_n = 0;
-    double entropy_mean = 0.0;
-    double entropy_m2 = 0.0;
-    double entropy_min = 1e18;
-    double entropy_max = -1e18;
-    void entropy_update(double h) {
-        entropy_n++;
-        double delta = h - entropy_mean;
-        entropy_mean += delta / entropy_n;
-        double delta2 = h - entropy_mean;
-        entropy_m2 += delta * delta2;
-        if(h < entropy_min) entropy_min = h;
-        if(h > entropy_max) entropy_max = h;
+
+    // M1016: split quality entropy — 追踪子桶大小比的Shannon entropy
+    // entropy = -sum(p_i * log2(p_i)) where p_i = child_volume / parent_volume
+    // H_max = log2(n_children) for n children; H/H_max = 1 is balanced, 0 is degenerate
+    double entropy_sum = 0.0;    // cumulative entropy across all splits
+    long long entropy_count = 0; // number of splits with valid entropy
+
+    void record_split_entropy(double parent_vol, const std::vector<double>& child_vols) {
+        if(parent_vol <= 0.0 || child_vols.empty()) return;
+        double h = 0.0;
+        for(double cv : child_vols) {
+            double p = cv / parent_vol;
+            if(p > 0.0) h -= p * log2(p);
+        }
+        entropy_sum += h;
+        entropy_count++;
+        // M1016: emit high-entropy (well-balanced) and low-entropy (skewed) splits
+        double h_max = log2((double)child_vols.size());
+        double h_norm = h_max > 0 ? h / h_max : 0.0;
+        if(entropy_count <= 5 || entropy_count % 500 == 0)
+            fprintf(stderr, "[AJB_STATE][SplitBucket] split_entropy #%lld: H=%.4f H_max=%.4f norm=%.4f n_children=%zu\n",
+                    entropy_count, h, h_max, h_norm, child_vols.size());
     }
-    double entropy_stddev() const { return entropy_n < 2 ? 0.0 : std::sqrt(entropy_m2 / (entropy_n - 1)); }
+
     void dump(const char* tag = "SplitBucket") {
         fprintf(stderr, "[AJB_STATE][%s] calls=%lld children=%lld avg=%.2f replace=%lld replace_self=%lld max_dim=%d\n",
                 tag, split_calls, children_total,
@@ -77,9 +81,11 @@ static thread_local struct {
             fprintf(stderr, "d%d=%lld", d, dim_freq[d]);
         }
         fprintf(stderr, "] dim_changes=%lld\n", dim_change_count);
-        // M1016: split entropy dump
-        fprintf(stderr, "[AJB_STATE][%s] split_entropy: n=%lld mean=%.4f stddev=%.4f min=%.4f max=%.4f (ideal=0.6931)\n",
-                tag, entropy_n, entropy_mean, entropy_stddev(), entropy_min, entropy_max);
+        // M1016: entropy summary
+        if(entropy_count > 0) {
+            fprintf(stderr, "[AJB_BP][%s] split_entropy_avg=%.4f over %lld splits\n",
+                    tag, entropy_sum / entropy_count, entropy_count);
+        }
     }
     void reset() {
         split_calls = children_total = replace_calls = replace_self_calls = 0; max_dim_seen = 0;
@@ -87,8 +93,7 @@ static thread_local struct {
         min_child_volume = 1e18; max_child_volume = 0.0; volume_measurements = 0;
         for(int i = 0; i < 16; i++) dim_freq[i] = 0;
         dim_change_count = 0;
-        entropy_n = 0; entropy_mean = 0.0; entropy_m2 = 0.0;
-        entropy_min = 1e18; entropy_max = -1e18;
+        entropy_sum = 0.0; entropy_count = 0;
     }
 } ajb_split_stats;
 
@@ -239,25 +244,6 @@ class Bucket {
                 fprintf(stderr, "[AJB_TRACE][Bucket] replaceSelf: splitDim %d→%d (range [%d,%d]) vol %.0f→%.0f\n",
                         old_splitDim, (int)splitDim, lower, upper, vol_before, vol_after);
             }
-
-            // [AJB_STATE] M1016: split entropy — measure quality of the split point
-            // p = vol_after / vol_before is the fraction of parent volume retained
-            // Entropy H = -p*log(p) - (1-p)*log(1-p), max at p=0.5
-            if(vol_before > 0.0 && vol_after >= 0.0) {
-                double p = vol_after / vol_before;
-                if(p > 1.0) p = 1.0; // clamp
-                double h = 0.0;
-                if(p > 1e-15 && p < 1.0 - 1e-15) {
-                    h = -p * std::log(p) - (1.0 - p) * std::log(1.0 - p);
-                }
-                ajb_split_stats.entropy_update(h);
-                // [AJB_STATE] emit for first 10 or every 500th
-                if(ajb_split_stats.replace_self_calls <= 10 || ajb_split_stats.replace_self_calls % 500 == 0) {
-                    fprintf(stderr, "[AJB_STATE][Bucket] split_entropy: p=%.4f entropy=%.4f mean_entropy=%.4f n=%lld (ideal=0.6931)\n",
-                            p, h, ajb_split_stats.entropy_mean, ajb_split_stats.entropy_n);
-                }
-            }
-
             return;
         }
 
@@ -409,6 +395,18 @@ vector<vector<Bucket>> radix_partition(const vector<Bucket>& buckets, int bit_of
         var += diff * diff;
     }
     double stddev = NUM_SUB > 0 ? std::sqrt(var / NUM_SUB) : 0.0;
+
+    // M1016: split entropy for split quality measurement
+    {
+        double parent_vol = (double)buckets.size();
+        std::vector<double> child_vols;
+        child_vols.reserve(NUM_SUB);
+        for(int s = 0; s < NUM_SUB; s++)
+            if(!sub_buckets[s].empty()) child_vols.push_back((double)sub_buckets[s].size());
+        ajb_split_stats.split_calls++;
+        ajb_split_stats.children_total += (long long)child_vols.size();
+        ajb_split_stats.record_split_entropy(parent_vol, child_vols);
+    }
 
     fprintf(stderr, "[AJB_EXT][radix_partition] DONE: min=%zu max=%zu avg=%.2f stddev=%.2f empty=%d/%d skew=%.4f\n",
             min_sub, max_sub, avg_sub, stddev, empty_count, NUM_SUB,

@@ -14,19 +14,36 @@
 #include <functional>  // M914: for hash
 using namespace std;
 
-// [AJB] JoinTree诊断 + cache hit/miss ratio — 扩展: per-phase timing + cache stats
+// [AJB] JoinTree诊断 + M1013: Gini子树均衡度检测
 static thread_local struct {
     long long tree_upp_calls = 0;
-    long long tree_upp_zero = 0;   // treeUpp返回0的次数(空区间)
-    long long buildleaves_nodes = 0; // buildLeaves处理的叶子数
-    long long preproc_nodes = 0;     // preProcessing处理的内部节点数
-    long long cache_entries = 0;     // cache总条目数
-    long long bcache_hits = 0;       // M914: bound cache hits
-    long long bcache_misses = 0;     // M914: bound cache misses
+    long long tree_upp_zero = 0;
+    long long buildleaves_nodes = 0;
+    long long preproc_nodes = 0;
+    long long cache_entries = 0;
+    long long bcache_hits = 0;
+    long long bcache_misses = 0;
     double    build_ms = 0.0;
     double    buildleaves_ms = 0.0;
     double    preproc_ms = 0.0;
     double    bfs_ms = 0.0;
+
+    // M1013: Gini coefficient — 衡量子树大小分布的均匀程度
+    // Gini=0 完全均匀, Gini=1 极度不均衡(一棵子树包含所有节点)
+    std::vector<int> subtree_sizes;  // 收集每个内部节点的子树大小
+    void record_subtree_size(int sz) { subtree_sizes.push_back(sz); }
+    double gini_coefficient() const {
+        if(subtree_sizes.empty()) return 0.0;
+        auto v = subtree_sizes;
+        std::sort(v.begin(), v.end());
+        long long n = v.size(), s = 0, total = 0;
+        for(auto x : v) total += x;
+        if(total == 0) return 0.0;
+        for(long long i = 0; i < n; i++) s += (long long)v[i] * (i + 1);
+        // Gini = (2 * sum(rank * value) / (n * total)) - (n+1)/n
+        return (2.0 * s) / (n * total) - (double)(n + 1) / n;
+    }
+
     void dump(const char* tag = "JoinTree") {
 #ifdef AJB_DEBUG
         fprintf(stderr, "[AJB_STATE][%s] treeUpp_calls=%lld zero=%lld leaves=%lld preproc_nodes=%lld cache=%lld\n",
@@ -36,12 +53,21 @@ static thread_local struct {
                 (bcache_hits + bcache_misses) > 0 ? 100.0 * bcache_hits / (bcache_hits + bcache_misses) : 0.0);
         fprintf(stderr, "[AJB_TIMER][%s] total=%.3fms bfs=%.3fms leaves=%.3fms preproc=%.3fms\n",
                 tag, build_ms, bfs_ms, buildleaves_ms, preproc_ms);
+        // M1013: Gini balance output
+        if(!subtree_sizes.empty()) {
+            double g = gini_coefficient();
+            int mn = *std::min_element(subtree_sizes.begin(), subtree_sizes.end());
+            int mx = *std::max_element(subtree_sizes.begin(), subtree_sizes.end());
+            fprintf(stderr, "[AJB_STATE][%s] gini=%.4f (0=balanced,1=skewed) subtrees=%zu range=[%d,%d]\n",
+                    tag, g, subtree_sizes.size(), mn, mx);
+        }
 #endif
     }
     void reset() {
         tree_upp_calls = tree_upp_zero = buildleaves_nodes = preproc_nodes = cache_entries = 0;
         bcache_hits = bcache_misses = 0;
         build_ms = buildleaves_ms = preproc_ms = bfs_ms = 0.0;
+        subtree_sizes.clear();
     }
 } ajb_jt_stats;
 
@@ -61,26 +87,6 @@ private:
     // [AJB] M914: treeUpp bound cache — 缓存已计算的bound避免重复LP
     // key = (splitDim的活跃relation位图), value = 上次计算的treeUpp值
     // 用vector<uint8_t>作为key(比vector<bool>快, 无proxy问题)
-
-    // [AJB] M1013: Gini coefficient for subtree size balance detection
-    // After buildTree, compute the Gini index of children-counts across all
-    // internal nodes to measure how balanced the tree structure is.
-    // Gini=0 → perfectly balanced; Gini→1 → maximally unbalanced.
-    static double ajb_compute_gini(const std::vector<int>& sizes) {
-        if(sizes.empty() || sizes.size() == 1) return 0.0;
-        double sum = 0.0;
-        for(int s : sizes) sum += s;
-        if(sum == 0.0) return 0.0;
-        double n = (double)sizes.size();
-        double abs_diff_sum = 0.0;
-        for(size_t i = 0; i < sizes.size(); i++)
-            for(size_t j = i + 1; j < sizes.size(); j++)
-                abs_diff_sum += std::fabs((double)sizes[i] - (double)sizes[j]);
-        // Gini = (2 * sum of |xi - xj|) / (n * (n-1) * mean)
-        double mean = sum / n;
-        return abs_diff_sum / (n * (n - 1.0) * mean + 1e-15);
-    }
-
     struct BoundCacheHasher {
         size_t operator()(const vector<uint8_t>& v) const {
             size_t h = 0x9e3779b97f4a7c15ULL;
@@ -139,6 +145,9 @@ private:
     void preProcessing(int node, int fa = -1, int k = -1) {
         if(node < 0 || node >= (int)children.size() || children[node].size() == 0) return;
         ajb_jt_stats.preproc_nodes++;
+        // M1013: count subtree size for Gini calculation
+        int subtree_sz = 1 + (int)children[node].size();
+        ajb_jt_stats.record_subtree_size(subtree_sz);
         // AJB-algo: recurse children with per-child timing
         for(int i = 0; i < children[node].size(); i++) {
             preProcessing(children[node][i], node, i);
@@ -326,54 +335,6 @@ public:
         initCountRels(root);
         auto ajb_jt_t1 = std::chrono::high_resolution_clock::now();
         ajb_jt_stats.build_ms /* AJB-algo: chrono-based wall time */ = std::chrono::duration<double, std::milli>(ajb_jt_t1 - ajb_jt_t0).count();
-
-        // [AJB_STATE] M1013: compute Gini coefficient of subtree sizes
-        // Collect children count for each internal node, compute Gini index
-        // to measure structural balance of the join tree.
-        {
-            std::vector<int> subtree_sizes;
-            subtree_sizes.reserve(children.size());
-            // BFS to count subtree size (number of descendants) per node
-            std::vector<int> desc_count(children.size(), 0);
-            // post-order DFS via stack to compute subtree sizes
-            std::vector<int> order;
-            order.reserve(children.size());
-            {
-                std::vector<int> dfs_stk;
-                dfs_stk.push_back(root);
-                while(!dfs_stk.empty()) {
-                    int nd = dfs_stk.back(); dfs_stk.pop_back();
-                    order.push_back(nd);
-                    for(int c : children[nd]) dfs_stk.push_back(c);
-                }
-            }
-            // reverse post-order: leaves first
-            for(int i = (int)order.size() - 1; i >= 0; i--) {
-                int nd = order[i];
-                desc_count[nd] = 1; // count self
-                for(int c : children[nd]) desc_count[nd] += desc_count[c];
-            }
-            // Collect children subtree sizes for internal nodes
-            for(size_t nd = 0; nd < children.size(); nd++) {
-                if(!children[nd].empty()) {
-                    for(int c : children[nd]) {
-                        subtree_sizes.push_back(desc_count[c]);
-                    }
-                }
-            }
-            double gini = ajb_compute_gini(subtree_sizes);
-            fprintf(stderr, "[AJB_STATE][JoinTree] gini_balance: gini=%.4f subtree_samples=%zu (0=balanced, 1=max_skew)\n",
-                    gini, subtree_sizes.size());
-            // [AJB_STATE] full subtree size distribution dump
-            if(subtree_sizes.size() <= 20) {
-                fprintf(stderr, "[AJB_STATE][JoinTree] subtree_sizes=[");
-                for(size_t i = 0; i < subtree_sizes.size(); i++) {
-                    if(i) fprintf(stderr, ",");
-                    fprintf(stderr, "%d", subtree_sizes[i]);
-                }
-                fprintf(stderr, "]\n");
-            }
-        }
         // [AJB_STATE] countRels per variable — 哪些relation在哪个splitDim层级被count
 #ifdef AJB_DEBUG
         for(size_t v = 0; v < countRels.size(); v++){
@@ -407,6 +368,12 @@ public:
 #endif
         fprintf(stderr, "[AJB_TIMER][JoinTree] total build=%.3fms (bfs=%.3f leaves=%.3f preproc=%.3f)\n",
                 ajb_jt_stats.build_ms, ajb_jt_stats.bfs_ms, ajb_jt_stats.buildleaves_ms, ajb_jt_stats.preproc_ms);
+        // M1013: emit Gini balance after full build
+        if(!ajb_jt_stats.subtree_sizes.empty()) {
+            double g = ajb_jt_stats.gini_coefficient();
+            fprintf(stderr, "[AJB_STATE][JoinTree] gini_balance=%.4f (0=perfect,1=skewed) internal_nodes=%zu\n",
+                    g, ajb_jt_stats.subtree_sizes.size());
+        }
     }
 
     int treeUpp(int splitDim, const vector<pair<vector<Point<int> >::iterator, vector<Point<int> >::iterator> > iters) {
