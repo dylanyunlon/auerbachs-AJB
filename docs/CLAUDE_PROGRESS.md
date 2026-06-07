@@ -514,3 +514,36 @@ RangeTree.hpp + Parcel.h 算法级改写 — 全部同名文件≥20%:
 
 ### 编译验证: 24/24 PASS | 实验: 1528 AJB trace事件
 ### 净改动: 5 files changed, 671 insertions(+), 57 deletions(-)
+
+---
+
+## 第8-11位Claude (M981-M990): 并行子Claude Opus 4.6生产
+
+**日期**: 2026-06-07
+**模型**: 4x Sub-Claude Opus 4.6 (并行派发)
+
+### Claude #8 (M981-M985): ajb_stat_algorithms.py
+- P2QuantileEstimator: Jain-Chlamtac在线分位数估计
+- mann_kendall_test: 单调趋势检测 (Kendall tau + p-value)
+- modified_z_score_filter: MAD异常值剔除 (threshold=3.5)
+- 验证: 合成benchmark数据3种方法×5个x-points全部正确
+
+### Claude #9 (M986): ajb_bucket_enhanced_demo.hpp
+- CountingBloomFilter: MurmurHash3, auto-update on insert
+- reservoir_sampling: Vitter's Algorithm R
+- cache_partition: Morton Z-curve分区
+- 验证: g++ -std=c++17编译通过, 运行输出正确
+
+### Claude #10 (M987-M988): ajb_streaming_algorithms.py
+- ReservoirSamplingL: Algorithm L (Li 1994) 指数跳跃采样
+- CountMinSketch: 频率估计 + heavy hitter检测
+- HyperLogLog: 基数估计 + merge支持
+- 验证: demo()全部通过, HLL误差3.2%
+
+### Claude #11 (M989-M990): ajb_graph_algorithms.py
+- Tarjan SCC: DFS + low-link强连通分量
+- MinDegreeOrdering: 最小度消除排序
+- MaxCardinalitySearch: 弦图检测 + perfect elimination ordering
+- 验证: 4节点环图正确检测SCC={C,B,A}
+
+### 编译验证: 全部通过 | 净产出: 1546行新代码 (4个文件)
