@@ -18,6 +18,32 @@ vector<vector<int> > matrix;
 int cntLoop1 = 0, cntLoop2 = 0;
 int cntF1 = 0, cntF2 = 0;
 
+// AJB-M1051: search state tracking struct
+struct AjbSearchState {
+    int loop_count;
+    long long last_mid;
+    double convergence_ratio;
+
+    AjbSearchState() : loop_count(0), last_mid(0), convergence_ratio(1.0) {}
+
+    void reset() {
+        loop_count = 0;
+        last_mid = 0;
+        convergence_ratio = 1.0;
+    }
+
+    void dump(const char* tag) const {
+        fprintf(stderr,
+                "[AJB_STATE][SearchState] %s: loop_count=%d last_mid=%lld convergence_ratio=%.6f\n",
+                tag, loop_count, last_mid, convergence_ratio);
+    }
+};
+
+static AjbSearchState g_bs_state;
+static AjbSearchState g_mhbs_state;
+static int g_bs_call_count = 0;
+static int g_mhbs_call_count = 0;
+
 // AJB: counter reset + dump helper
 static void ajb_reset_counters() {
     cntLoop1 = cntLoop2 = cntF1 = cntF2 = 0;
@@ -100,11 +126,25 @@ int BinarySearch(const vector<pair<vector<int>::iterator, vector<int>::iterator>
         MAX = max(MAX, *(iters[i].second - 1));
     }
     long long l = MIN, r = MAX, mid, res;
+    long long initial_range = r - l;
     vector<int> pos(iters.size());
+
+    // AJB-M1051: reset per-call state
+    g_bs_state.reset();
+    g_bs_call_count++;
+
     while(l <= r) {
         cntLoop2++;
         mid = l + ((r - l) >> 1);  // AJB-algo: overflow-safe midpoint
-        // pos = 
+
+        // AJB-M1051: update search state tracking
+        g_bs_state.loop_count++;
+        g_bs_state.last_mid = mid;
+        long long current_range = r - l;
+        g_bs_state.convergence_ratio = (initial_range > 0)
+            ? static_cast<double>(current_range) / static_cast<double>(initial_range)
+            : 0.0;
+
         int ans = F(getpos(iters, mid));
         cntF2++;
         if(ans < target) {
@@ -115,6 +155,17 @@ int BinarySearch(const vector<pair<vector<int>::iterator, vector<int>::iterator>
             r = mid - 1;
         }
     }
+
+    // AJB-M1052: breakpoint every 100 calls
+    if (g_bs_call_count % 100 == 0) {
+        fprintf(stderr,
+                "[AJB_BP][BS] call#%d target=%d | loop_count=%d last_mid=%lld convergence_ratio=%.6f"
+                " | cntLoop2=%d cntF2=%d\n",
+                g_bs_call_count, target,
+                g_bs_state.loop_count, g_bs_state.last_mid, g_bs_state.convergence_ratio,
+                cntLoop2, cntF2);
+    }
+
     return res;
 }
 
@@ -130,6 +181,15 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
     }
     int mini, maxi, cnt = 0;
     double res;
+
+    // AJB-M1051: reset per-call state and compute initial total range
+    g_mhbs_state.reset();
+    g_mhbs_call_count++;
+    long long mhbs_initial_range = 0;
+    for (int i = 0; i < (int)iters.size(); i++) {
+        mhbs_initial_range += (iters[i].second - iters[i].first);
+    }
+
     while(cnt < iters.size()) {
         mini = -1, maxi = -1;
         for(int i = 0; i < iters.size(); i++){
@@ -137,6 +197,20 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
             if(mini == -1 || *itermid[i] < *itermid[mini]) mini = i;
             if(maxi == -1 || *itermid[i] > *itermid[maxi]) maxi = i;
         }
+
+        // AJB-M1051: update search state tracking
+        g_mhbs_state.loop_count++;
+        if (mini >= 0) {
+            g_mhbs_state.last_mid = *itermid[mini];
+        }
+        long long mhbs_current_range = 0;
+        for (int i = 0; i < (int)bounds.size(); i++) {
+            mhbs_current_range += (bounds[i].second - bounds[i].first);
+        }
+        g_mhbs_state.convergence_ratio = (mhbs_initial_range > 0)
+            ? static_cast<double>(mhbs_current_range) / static_cast<double>(mhbs_initial_range)
+            : 0.0;
+
         res = F(pos);
         if(res <= target) {
             bounds[mini].first = itermid[mini];
@@ -165,6 +239,17 @@ int MultiHeadBinarySearch(const vector<pair<vector<int>::iterator, vector<int>::
             }
         }
     }
+
+    // AJB-M1052: breakpoint every 100 calls
+    if (g_mhbs_call_count % 100 == 0) {
+        fprintf(stderr,
+                "[AJB_BP][MHBS] call#%d target=%d | loop_count=%d last_mid=%lld convergence_ratio=%.6f"
+                " | cntLoop1=%d cntF1=%d\n",
+                g_mhbs_call_count, target,
+                g_mhbs_state.loop_count, g_mhbs_state.last_mid, g_mhbs_state.convergence_ratio,
+                cntLoop1, cntF1);
+    }
+
     int ans = MAX_INT;
     for(int i = 0; i < iters.size(); i++) {
         if(bounds[i].second != iters[i].second) ans = min(ans, *bounds[i].second);
@@ -207,6 +292,7 @@ int main() {
 
     // --- MHBS benchmark ---
     ajb_reset_counters();
+    g_mhbs_call_count = 0;
     clock_t start, end;
     auto ajb_mhbs_t0 = std::chrono::high_resolution_clock::now();
     start = clock();
@@ -225,11 +311,13 @@ int main() {
     fprintf(stderr, "[AJB_TIMER][BinarySearch] MHBS: wall=%.3fms cpu=%.4fs\n",
             std::chrono::duration<double, std::milli>(ajb_mhbs_t1 - ajb_mhbs_t0).count(), duration_mhbs);
     ajb_dump_counters("MHBS");
+    g_mhbs_state.dump("MHBS-final");
     cout << "MHBS correct (first 100): " << correct_mhbs << "/100" << endl;
     cout << "Time: " << duration_mhbs << "s" << endl;
 
     // --- BS benchmark ---
     ajb_reset_counters();
+    g_bs_call_count = 0;
     auto ajb_bs_t0 = std::chrono::high_resolution_clock::now();
     start = clock();
     for(int i = 0; i < TestTimes; i++) {
@@ -241,6 +329,7 @@ int main() {
     fprintf(stderr, "[AJB_TIMER][BinarySearch] BS: wall=%.3fms cpu=%.4fs\n",
             std::chrono::duration<double, std::milli>(ajb_bs_t1 - ajb_bs_t0).count(), duration_bs);
     ajb_dump_counters("BS");
+    g_bs_state.dump("BS-final");
     cout << "Time: " << duration_bs << "s" << endl;
     cout << "#Calling F: " << cntF1 << " , " << cntF2 << endl;
     cout << "#Loop: " << cntLoop1 << " , " << cntLoop2 << endl;
