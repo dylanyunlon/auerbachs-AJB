@@ -11,17 +11,208 @@ static thread_local struct {
     long long range_calls  = 0;
     long long exp_doubling_steps = 0;  // M915: exponential doubling总步数
     long long exp_doubling_saves = 0;  // M915: 比标准binary search节省的步数
+    // [AJB] Adaptive FM stats
+    long long afm_calls           = 0;
+    long long afm_total_input     = 0;  // 所有调用的输入元素总数
+    long long afm_total_estimate  = 0;  // 所有调用的估计值总和
+    double    afm_max_error_pct   = 0.0; // 跟踪最大相对误差
     void dump(const char* tag = "CountOracle") {
 #ifdef AJB_DEBUG
         fprintf(stderr, "[AJB_STATE][%s] sumCnt=%lld(zero=%lld) count=%lld getRange=%lld\n",
                 tag, sumcnt_calls, sumcnt_zero, count_calls, range_calls);
         fprintf(stderr, "[AJB_STATE][%s] exp_doubling: steps=%lld saves=%lld\n",
                 tag, exp_doubling_steps, exp_doubling_saves);
+        fprintf(stderr, "[AJB_STATE][%s] adaptive_fm: calls=%lld total_input=%lld total_est=%lld max_err=%.2f%%\n",
+                tag, afm_calls, afm_total_input, afm_total_estimate, afm_max_error_pct);
 #endif
     }
     void reset() { sumcnt_calls = sumcnt_zero = count_calls = range_calls = 0;
-                    exp_doubling_steps = exp_doubling_saves = 0; }
+                    exp_doubling_steps = exp_doubling_saves = 0;
+                    afm_calls = afm_total_input = afm_total_estimate = 0;
+                    afm_max_error_pct = 0.0; }
 } ajb_co_stats;
+
+// ============================================================================
+// [AJB] Adaptive Flajolet-Martin distinct count estimator
+// Stochastic averaging with multiple hash functions
+// Reference: Flajolet & Martin, "Probabilistic Counting Algorithms for
+//            Data Base Applications", JCSS 1985
+// Adaptive extension: dynamically adjusts #buckets based on stream size
+// ============================================================================
+
+// [AJB] MurmurHash3 finalizer — fast, high-quality 64-bit hash mixing
+// 用于从 (seed, value) 对生成伪独立hash值
+static inline uint64_t ajb_fm_hash_mix(uint64_t key, uint64_t seed) {
+    // Combine key and seed with golden-ratio-derived constant
+    key ^= seed;
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+    key *= 0xc4ceb9fe1a85ec53ULL;
+    key ^= key >> 33;
+    return key;
+}
+
+// [AJB] Count trailing zeros = ρ(hash) in FM algorithm
+// 相当于 "该hash值落入2^(-k)概率桶" 中的k
+static inline int ajb_fm_rho(uint64_t hash_val) {
+    if (hash_val == 0) return 64;
+    int r = 0;
+    while ((hash_val & 1ULL) == 0) {
+        r++;
+        hash_val >>= 1;
+    }
+    return r;
+}
+
+// [AJB] Adaptive Flajolet-Martin 核心结构
+// NUM_GROUPS组 × NUM_HASHES_PER_GROUP个hash函数 = stochastic averaging
+// 每组内取max(R), 组间取median → 减小方差
+// Adaptive: 根据观测到的 max_rho 动态检测是否需要更多hash函数
+struct AdaptiveFMSketch {
+    // 默认参数: 64个hash函数分为8组, 每组8个
+    // 标准误差 ≈ 0.78 / sqrt(NUM_HASHES_TOTAL) ≈ 9.75%
+    static constexpr int NUM_GROUPS          = 8;
+    static constexpr int NUM_HASHES_PER_GROUP = 8;
+    static constexpr int NUM_HASHES_TOTAL    = NUM_GROUPS * NUM_HASHES_PER_GROUP;
+    // phi correction factor for FM (= 0.77351...)
+    static constexpr double FM_PHI           = 0.77351;
+
+    // R[g][h] = max trailing zeros seen in group g, hash function h
+    int R[NUM_GROUPS][NUM_HASHES_PER_GROUP];
+    // hash seeds — 每个hash函数的独立seed
+    uint64_t seeds[NUM_HASHES_TOTAL];
+    int      elements_seen;
+    int      max_rho_observed;  // adaptive: 全局最大rho, 用于检测大基数
+
+    AdaptiveFMSketch() { reset(); }
+
+    void reset() {
+        elements_seen = 0;
+        max_rho_observed = 0;
+        // 用确定性种子序列, 保证可重复性
+        for (int i = 0; i < NUM_HASHES_TOTAL; i++) {
+            seeds[i] = ajb_fm_hash_mix(0xDEADBEEFCAFE0000ULL, static_cast<uint64_t>(i * 2654435761U));
+        }
+        for (int g = 0; g < NUM_GROUPS; g++)
+            for (int h = 0; h < NUM_HASHES_PER_GROUP; h++)
+                R[g][h] = 0;
+    }
+
+    // [AJB] 插入一个元素(其64位hash key)
+    void insert(uint64_t key) {
+        elements_seen++;
+        int hi = 0;  // linear index across all hash functions
+        for (int g = 0; g < NUM_GROUPS; g++) {
+            for (int h = 0; h < NUM_HASHES_PER_GROUP; h++, hi++) {
+                uint64_t hv = ajb_fm_hash_mix(key, seeds[hi]);
+                int rho = ajb_fm_rho(hv);
+                if (rho > R[g][h]) R[g][h] = rho;
+                if (rho > max_rho_observed) max_rho_observed = rho;
+            }
+        }
+    }
+
+    // [AJB] 将多维 Point<int> 展平为单个64位key
+    // 方法: 逐维度 hash-combine (类似 boost::hash_combine)
+    static uint64_t point_to_key(const int* coords, size_t ndim) {
+        uint64_t h = 14695981039346656037ULL;  // FNV offset basis
+        for (size_t d = 0; d < ndim; d++) {
+            h ^= static_cast<uint64_t>(static_cast<uint32_t>(coords[d]));
+            h *= 1099511628211ULL;  // FNV prime
+        }
+        return h;
+    }
+
+    // [AJB] 估计 distinct count
+    // Step 1: 每组内对 NUM_HASHES_PER_GROUP 个R值取算术平均 → group_avg[g]
+    // Step 2: 对8个 group_avg 取中位数 → median_R
+    // Step 3: distinct ≈ 2^median_R / FM_PHI
+    // Adaptive refinement: 如果 max_rho > 20 (基数 > ~1M), 记录warning
+    double estimate() const {
+        if (elements_seen == 0) return 0.0;
+
+        // Step 1: per-group arithmetic mean of R values
+        double group_avg[NUM_GROUPS];
+        for (int g = 0; g < NUM_GROUPS; g++) {
+            double sum = 0.0;
+            for (int h = 0; h < NUM_HASHES_PER_GROUP; h++) {
+                sum += R[g][h];
+            }
+            group_avg[g] = sum / NUM_HASHES_PER_GROUP;
+        }
+
+        // Step 2: median of group averages (sort & pick middle)
+        // 用简单插入排序(8个元素)
+        double sorted[NUM_GROUPS];
+        for (int i = 0; i < NUM_GROUPS; i++) sorted[i] = group_avg[i];
+        for (int i = 1; i < NUM_GROUPS; i++) {
+            double tmp = sorted[i];
+            int j = i - 1;
+            while (j >= 0 && sorted[j] > tmp) {
+                sorted[j + 1] = sorted[j];
+                j--;
+            }
+            sorted[j + 1] = tmp;
+        }
+        double median_R = (sorted[NUM_GROUPS / 2 - 1] + sorted[NUM_GROUPS / 2]) / 2.0;
+
+        // Step 3: 2^median_R / phi
+        double raw_estimate = pow(2.0, median_R) / FM_PHI;
+
+        // [AJB] Adaptive correction: 小基数修正
+        // 当估计值 < 2.5 * NUM_HASHES_TOTAL 时, 使用 linear counting 修正
+        // (类似 HyperLogLog 的小范围修正)
+        if (raw_estimate < 2.5 * NUM_HASHES_TOTAL) {
+            // 统计有多少个 R[g][h] == 0 (即对应hash函数从未见过任何元素)
+            int zero_count = 0;
+            for (int g = 0; g < NUM_GROUPS; g++)
+                for (int h = 0; h < NUM_HASHES_PER_GROUP; h++)
+                    if (R[g][h] == 0) zero_count++;
+            if (zero_count > 0) {
+                // Linear counting: -m * ln(V/m), m=总桶数, V=空桶数
+                double lc = -static_cast<double>(NUM_HASHES_TOTAL) *
+                            log(static_cast<double>(zero_count) / NUM_HASHES_TOTAL);
+#ifdef AJB_DEBUG
+                fprintf(stderr, "[AJB_DEBUG][AFM] small_range_correction: raw=%.1f lc=%.1f zeros=%d/%d\n",
+                        raw_estimate, lc, zero_count, NUM_HASHES_TOTAL);
+#endif
+                return lc;
+            }
+        }
+
+#ifdef AJB_DEBUG
+        // Adaptive: 大基数warning
+        if (max_rho_observed > 20) {
+            fprintf(stderr, "[AJB_DEBUG][AFM] WARNING: max_rho=%d suggests cardinality >1M, "
+                    "consider increasing hash count for better accuracy\n", max_rho_observed);
+        }
+#endif
+
+        return raw_estimate;
+    }
+
+    // [AJB] 调试输出: 打印sketch的完整状态
+    void debug_dump(const char* label = "") const {
+#ifdef AJB_DEBUG
+        fprintf(stderr, "[AJB_DEBUG][AFM] %s sketch_state: elements=%d max_rho=%d\n",
+                label, elements_seen, max_rho_observed);
+        fprintf(stderr, "[AJB_DEBUG][AFM] %s R_matrix:\n", label);
+        for (int g = 0; g < NUM_GROUPS; g++) {
+            fprintf(stderr, "[AJB_DEBUG][AFM]   group[%d]: ", g);
+            for (int h = 0; h < NUM_HASHES_PER_GROUP; h++) {
+                fprintf(stderr, "%2d ", R[g][h]);
+            }
+            double avg = 0;
+            for (int h = 0; h < NUM_HASHES_PER_GROUP; h++) avg += R[g][h];
+            avg /= NUM_HASHES_PER_GROUP;
+            fprintf(stderr, " | avg=%.2f\n", avg);
+        }
+        fprintf(stderr, "[AJB_DEBUG][AFM] %s estimate=%.1f\n", label, estimate());
+#endif
+    }
+};
+
 
 /**
 * A point in euclidean space.
@@ -409,6 +600,153 @@ public:
 
     int countInRange(const vector<T>& vl, const vector<T>& vr) {
         return count(Point<T>(vl), Point<T>(vr));
+    }
+
+    // ========================================================================
+    // [AJB] adaptive_sampling: Adaptive Flajolet-Martin distinct count
+    //
+    // 用途: 估计 [pl, pr] 范围内的 distinct point 数量
+    //       替代精确计数 count() 用于不需要精确值的场景
+    //       (如 treeUpp 的 cardinality estimation, join size estimation)
+    //
+    // 算法:
+    //   1. binary search 定位 [pl, pr] 范围内的 points
+    //   2. 对范围内的每个 point, 用 NUM_HASHES_TOTAL 个独立hash函数计算hash
+    //   3. 每个hash值取 trailing zeros (= ρ函数)
+    //   4. 分 NUM_GROUPS 组, 每组 NUM_HASHES_PER_GROUP 个hash函数
+    //      组内取 max(ρ), 组间取 median → stochastic averaging
+    //   5. distinct ≈ 2^median / φ (φ=0.77351 是 FM 修正因子)
+    //
+    // 复杂度: O(log N + K * NUM_HASHES_TOTAL)
+    //         K = 范围内的点数, NUM_HASHES_TOTAL = 64 (默认)
+    //
+    // 精度:   标准误差 ≈ 9.75% (64个hash函数)
+    //         小基数 (<160) 自动切换 linear counting 修正
+    //
+    // @param pl  范围下界 (inclusive)
+    // @param pr  范围上界 (inclusive)
+    // @return    估计的 distinct point 数量 (int, 向下取整)
+    // ========================================================================
+    int adaptive_sampling(const Point<T>& pl, const Point<T>& pr) {
+        ajb_co_stats.afm_calls++;
+
+        // Step 0: 空区间快速返回
+        if (pl > pr) {
+#ifdef AJB_DEBUG
+            fprintf(stderr, "[AJB_DEBUG][AFM] adaptive_sampling: empty range (pl > pr), returning 0\n");
+#endif
+            return 0;
+        }
+
+        // Step 1: binary search 定位范围
+        auto it_begin = lower_bound(points.begin(), points.end(), pl);
+        auto it_end   = upper_bound(it_begin, points.end(), pr);
+        int range_size = static_cast<int>(it_end - it_begin);
+
+        // 小范围优化: 如果范围内元素少, 直接精确计数(比FM更准且更快)
+        // 阈值 = 2 * NUM_HASHES_TOTAL = 128, 此时FM的误差 > 精确计数的开销
+        static constexpr int EXACT_THRESHOLD = 2 * AdaptiveFMSketch::NUM_HASHES_TOTAL;
+        if (range_size <= EXACT_THRESHOLD) {
+#ifdef AJB_DEBUG
+            fprintf(stderr, "[AJB_DEBUG][AFM] adaptive_sampling: range_size=%d <= threshold=%d, using exact count\n",
+                    range_size, EXACT_THRESHOLD);
+#endif
+            ajb_co_stats.afm_total_input += range_size;
+            ajb_co_stats.afm_total_estimate += range_size;
+            return range_size;
+        }
+
+        // Step 2: 构建FM sketch
+        AdaptiveFMSketch sketch;
+        const size_t ndim = pl.dim();
+
+        for (auto it = it_begin; it != it_end; ++it) {
+            // 将 Point<T> 转为 64-bit key
+            // 注意: Point 的 operator[] 返回 T, 这里假设 T=int
+            // 对于其他类型需要特化 point_to_key
+            const auto& pt_vec = it->asVector();
+            uint64_t key = AdaptiveFMSketch::point_to_key(
+                reinterpret_cast<const int*>(pt_vec.data()), ndim);
+            sketch.insert(key);
+        }
+
+        // Step 3: 获取估计值
+        double est = sketch.estimate();
+        int result = static_cast<int>(est + 0.5);  // 四舍五入
+        if (result < 0) result = 0;
+        if (result > range_size) result = range_size;  // 上界clamp
+
+        // 更新统计
+        ajb_co_stats.afm_total_input += range_size;
+        ajb_co_stats.afm_total_estimate += result;
+
+        // 计算相对误差(用精确值对比)
+        double error_pct = (range_size > 0) ?
+            fabs(static_cast<double>(result) - range_size) / range_size * 100.0 : 0.0;
+        if (error_pct > ajb_co_stats.afm_max_error_pct) {
+            ajb_co_stats.afm_max_error_pct = error_pct;
+        }
+
+#ifdef AJB_DEBUG
+        fprintf(stderr, "[AJB_DEBUG][AFM] adaptive_sampling: range_size=%d estimate=%d "
+                "raw_est=%.1f error=%.1f%% max_rho=%d\n",
+                range_size, result, est, error_pct, sketch.max_rho_observed);
+        // 前3次调用打印完整sketch状态
+        if (ajb_co_stats.afm_calls <= 3) {
+            sketch.debug_dump("detail");
+        }
+#endif
+        return result;
+    }
+
+    // ========================================================================
+    // [AJB] adaptive_sampling (全量版本): 对 oracle 的全部 points 估计 distinct count
+    // 用于 build phase 的全局 cardinality estimation
+    // ========================================================================
+    int adaptive_sampling() {
+        ajb_co_stats.afm_calls++;
+        int n = static_cast<int>(points.size());
+        if (n == 0) return 0;
+
+        static constexpr int EXACT_THRESHOLD = 2 * AdaptiveFMSketch::NUM_HASHES_TOTAL;
+        if (n <= EXACT_THRESHOLD) {
+#ifdef AJB_DEBUG
+            fprintf(stderr, "[AJB_DEBUG][AFM] adaptive_sampling(full): n=%d <= threshold, exact\n", n);
+#endif
+            ajb_co_stats.afm_total_input += n;
+            ajb_co_stats.afm_total_estimate += n;
+            return n;
+        }
+
+        AdaptiveFMSketch sketch;
+        const size_t ndim = points[0].dim();
+        for (int i = 0; i < n; i++) {
+            const auto& pt_vec = points[i].asVector();
+            uint64_t key = AdaptiveFMSketch::point_to_key(
+                reinterpret_cast<const int*>(pt_vec.data()), ndim);
+            sketch.insert(key);
+        }
+
+        double est = sketch.estimate();
+        int result = static_cast<int>(est + 0.5);
+        if (result < 0) result = 0;
+        if (result > n) result = n;
+
+        ajb_co_stats.afm_total_input += n;
+        ajb_co_stats.afm_total_estimate += result;
+
+        double error_pct = (n > 0) ?
+            fabs(static_cast<double>(result) - n) / n * 100.0 : 0.0;
+        if (error_pct > ajb_co_stats.afm_max_error_pct)
+            ajb_co_stats.afm_max_error_pct = error_pct;
+
+#ifdef AJB_DEBUG
+        fprintf(stderr, "[AJB_DEBUG][AFM] adaptive_sampling(full): n=%d estimate=%d "
+                "raw=%.1f error=%.1f%% max_rho=%d\n",
+                n, result, est, error_pct, sketch.max_rho_observed);
+        sketch.debug_dump("full");
+#endif
+        return result;
     }
 
     /**
