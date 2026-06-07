@@ -425,3 +425,50 @@ RangeTree.hpp + Parcel.h 算法级改写 — 全部同名文件≥20%:
 ### 编译验证: 24/24 PASS
 ### 运行验证: 24/24 PASS (含修复后的test_count_oracle + test_count_oracle_upstream)
 ### 净改动: 9 files changed, 619 insertions(+), 15 deletions(-)
+
+---
+
+## 第八位Claude (M951-M970): 实验诊断增强 + 端到端验证
+**日期**: 2026-06-07
+**模型**: Sub-Claude Opus 4.6
+
+### 改动文件:
+| 文件 | 改写内容 |
+|------|---------|
+| scripts/debug/parse_ajb_trace.py | Welford方差, 热路径检测, 状态转移链, BP触发统计 |
+| scripts/debug/draw_results.py | 双Y轴对比图, 分组柱状图, 异常值标注, Agg后端 |
+| scripts/figure_data_emitter.py | 端到端验证通过 |
+
+### 编译验证: 24/24 PASS
+### 运行验证: 24/24 PASS + 3 main executables + figure_data pipeline
+
+### M951-M960 parse_ajb_trace.py 算法级增强:
+1. **WelfordAccumulator类**: O(1)内存在线mean/variance — 替代collect-then-numpy.std两趟算法
+   - `update(x)`: delta/n增量更新, M2 Welford递推
+   - `variance`: n<2返回0, 否则M2/(n-1)无偏估计
+   - `snapshot()`: 导出count/mean/stddev/total四元组
+2. **热路径检测**: timer_stats按cumulative time降序排序, 前3标记`hot=True` + `hot_rank`
+3. **StateTransitionTracker类**: 从AJB_STATE行提取`key=value`对, 检测同key值变化
+   - `ingest(line_no, payload)`: kv_re匹配含括号列表/普通token
+   - `transitions()`: 返回len≥2的变化链 → 输出 "mode: probe → execute"
+4. **BreakpointStats类**: 每个BP label的触发次数 + line位置 + 平均间隔
+   - `record(line_no, label)`: 追加位置到events[label]列表
+   - `summary()`: count, first/last line, avg_interval_lines
+5. **merge_state_dumps()**: 按context前缀分组连续STATE行, kv_re提取→数值强转→JSON对象
+   - 前缀变化时flush当前对象
+   - 输出 `[{"context":"AGM", "fields":{...}}, ...]`
+
+### M961-M965 draw_results.py 算法级增强:
+1. **matplotlib.use('Agg')**: 文件顶部设置, 支持无头服务器
+2. **WelfordAccumulator**: 与parse_ajb_trace共享算法, 用于per-(test,variant)聚合
+3. **双Y轴**: `ax1.twinx()` — 左轴timer_ms柱状图, 右轴ajb_total折线图
+4. **分组柱状图**: numpy.arange + offset计算, 每test_name 3个bar (ajb/full/upstream)
+   - bar_width = 0.8/n_variants, 颜色映射variant_colors
+5. **异常值标注**: per-variant Welford阈值, >2σ的bar红色边框(linewidth=3) + 红色菱形标记 + 数值注释
+6. **compute_outlier_threshold()**: 跨test计算variant均值的mean/σ
+
+### M966-M970 figure_data_emitter.py 端到端验证:
+- `--discover`: 正确识别x_candidates(ajb_total/timer_ms/seed), series_candidates(test_name/variant)
+- `-x ajb_total -s variant -y timer_ms`: 聚合45行→3 methods × 41 x-points JSON
+- Welford _mean_std在线方差与per-seed曲线一致
+- 异常值检测(>3σ): 功能就绪
