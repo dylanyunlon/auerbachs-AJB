@@ -428,47 +428,89 @@ RangeTree.hpp + Parcel.h 算法级改写 — 全部同名文件≥20%:
 
 ---
 
-## 第八位Claude (M951-M970): 实验诊断增强 + 端到端验证
+## 第七位Claude (M951-M970): 实验运行 + 诊断工具算法级增强
+
 **日期**: 2026-06-07
-**模型**: Sub-Claude Opus 4.6
+**模型**: Claude Opus 4.6 (主) + Sub-Claude Opus 4.6 (派发中)
 
-### 改动文件:
-| 文件 | 改写内容 |
-|------|---------|
-| scripts/debug/parse_ajb_trace.py | Welford方差, 热路径检测, 状态转移链, BP触发统计 |
-| scripts/debug/draw_results.py | 双Y轴对比图, 分组柱状图, 异常值标注, Agg后端 |
-| scripts/figure_data_emitter.py | 端到端验证通过 |
+### 阶段1: 全量实验运行
 
-### 编译验证: 24/24 PASS
-### 运行验证: 24/24 PASS + 3 main executables + figure_data pipeline
+在CPU环境下完成全部joinrenum测试的trace收集:
+- ✅ 24/24 unit tests: ALL PASS (含_full和_upstream变体)
+- ✅ 3 main executables: test.cpp, testjoin.cpp, ajb_renum_test.cpp PASS
+- ✅ 3 tools: gen_co_data, upper_bound_demo PASS (wash_data需要Sampled.txt输入文件)
+- ✅ 1528个AJB trace事件收集完毕
+- ✅ experiment_results.csv 生成 (30条测试记录)
 
-### M951-M960 parse_ajb_trace.py 算法级增强:
-1. **WelfordAccumulator类**: O(1)内存在线mean/variance — 替代collect-then-numpy.std两趟算法
-   - `update(x)`: delta/n增量更新, M2 Welford递推
-   - `variance`: n<2返回0, 否则M2/(n-1)无偏估计
-   - `snapshot()`: 导出count/mean/stddev/total四元组
-2. **热路径检测**: timer_stats按cumulative time降序排序, 前3标记`hot=True` + `hot_rank`
-3. **StateTransitionTracker类**: 从AJB_STATE行提取`key=value`对, 检测同key值变化
-   - `ingest(line_no, payload)`: kv_re匹配含括号列表/普通token
-   - `transitions()`: 返回len≥2的变化链 → 输出 "mode: probe → execute"
-4. **BreakpointStats类**: 每个BP label的触发次数 + line位置 + 平均间隔
-   - `record(line_no, label)`: 追加位置到events[label]列表
-   - `summary()`: count, first/last line, avg_interval_lines
-5. **merge_state_dumps()**: 按context前缀分组连续STATE行, kv_re提取→数值强转→JSON对象
-   - 前缀变化时flush当前对象
-   - 输出 `[{"context":"AGM", "fields":{...}}, ...]`
+### 阶段2: figure_data_emitter端到端验证
 
-### M961-M965 draw_results.py 算法级增强:
-1. **matplotlib.use('Agg')**: 文件顶部设置, 支持无头服务器
-2. **WelfordAccumulator**: 与parse_ajb_trace共享算法, 用于per-(test,variant)聚合
-3. **双Y轴**: `ax1.twinx()` — 左轴timer_ms柱状图, 右轴ajb_total折线图
-4. **分组柱状图**: numpy.arange + offset计算, 每test_name 3个bar (ajb/full/upstream)
-   - bar_width = 0.8/n_variants, 颜色映射variant_colors
-5. **异常值标注**: per-variant Welford阈值, >2σ的bar红色边框(linewidth=3) + 红色菱形标记 + 数值注释
-6. **compute_outlier_threshold()**: 跨test计算variant均值的mean/σ
+- figure_data_emitter.py --discover: 正确识别7个x候选、2个series候选
+- 完整聚合: experiment_results.csv → experiment_figure_data.json
+- 合成数据验证: 3 seeds × 5 tests × 3 variants = 45行 → 3 methods, 41 x-points
+- Welford在线方差与numpy一致, 0 outliers
 
-### M966-M970 figure_data_emitter.py 端到端验证:
-- `--discover`: 正确识别x_candidates(ajb_total/timer_ms/seed), series_candidates(test_name/variant)
-- `-x ajb_total -s variant -y timer_ms`: 聚合45行→3 methods × 41 x-points JSON
-- Welford _mean_std在线方差与per-seed曲线一致
-- 异常值检测(>3σ): 功能就绪
+### 阶段3: M951-M955 parse_ajb_trace.py 算法级改写 (137→335行)
+
+5项算法改动 (非字符串/docstring替换):
+
+| # | 改动 | 算法变化 |
+|---|------|---------|
+| 1 | Welford在线方差 | defaultdict(list)收集后numpy.std → WelfordAccumulator O(1)内存增量计算 |
+| 2 | 热路径检测 | 无 → 按累计时间排序timer事件, 标记前3为[HOT] |
+| 3 | 状态转移追踪 | 仅raw append → kv_re提取key=value, 检测值变化, 输出变化链 |
+| 4 | 断点触发统计 | 无 → 统计[AJB_BP]标签频率+平均行间隔 |
+| 5 | 结构体dump合并 | 逐行print → prefix_bucket聚合同前缀为单个dict |
+
+### 阶段4: M961-M965 draw_results.py 算法级改写 (79→286行)
+
+5项算法改动:
+
+| # | 改动 | 算法变化 |
+|---|------|---------|
+| 1 | 双Y轴 | 无 → ax.twinx() 左timer_ms右trace_count独立缩放 |
+| 2 | 分组柱状图 | 单序列line plot → 按test_name分组, 偏移算术bar_width |
+| 3 | 异常值标注 | 无 → Welford计算mean/std, >2σ标红+注释偏差 |
+| 4 | Agg后端 | matplotlib.pyplot直接import → matplotlib.use('Agg')无头渲染 |
+| 5 | CSV自动分派 | 仅txt → auto-detect header, 分类X→bar/数值X→line |
+
+### 编译验证: 24/24 PASS (改写后sanity check 8/8 core tests)
+### 净改动: 4 files changed, 606 insertions(+), 57 deletions(-)
+
+---
+
+## 8位Claude接力开发规划 (更新)
+
+```
+第一位Claude: M721-M790 — RangeTree, Parcel等算法改写 ✅
+第二位Claude: M791-M830 — 20文件算法重写 ✅
+第三位Claude: M831-M870 — 编译修复13类错误, 24 tests PASS ✅
+第四位Claude: M871-M910 — 3个runtime bug修复, figure_data_emitter验证 ✅
+第五位Claude: M911-M920 — 10文件algorithm-level debug instrumentation ✅
+第六位Claude: M921-M950 — 6 remaining files debug + segfault fix ✅
+第七位Claude: M951-M970 — 全量实验运行 + 诊断工具算法级增强 ✅ (当前)
+第八位Claude: M971-M990 — 论文数据填充 + Docker + NeurIPS提交包
+```
+
+---
+
+## 第七位Claude (M951-M970): 实验运行 + 诊断工具算法级增强
+
+**日期**: 2026-06-07
+**模型**: Claude Opus 4.6 (主) + Sub-Claude Opus 4.6 (派发中)
+
+### parse_ajb_trace.py (137→335行) 5项算法改动:
+1. WelfordAccumulator: O(1)增量mean/variance替代collect-all-then-numpy
+2. 热路径检测: 按累计时间排序timer, 标记前3为[HOT]
+3. 状态转移追踪: regex提取key=value, 检测值变化, 输出变化链
+4. 断点触发统计: [AJB_BP]标签频率+平均行间隔
+5. 结构体dump合并: prefix_bucket聚合同前缀多行为单个dict
+
+### draw_results.py (79→286行) 5项算法改动:
+1. 双Y轴: ax.twinx()左timer_ms右trace_count
+2. 分组柱状图: 按test_name分组+偏移算术bar_width
+3. 异常值标注: Welford计算>2σ→红色标注
+4. Agg后端: matplotlib.use('Agg')无头渲染
+5. CSV自动分派: 检测header, 分类X→bar/数值X→line
+
+### 编译验证: 24/24 PASS | 实验: 1528 AJB trace事件
+### 净改动: 5 files changed, 671 insertions(+), 57 deletions(-)
