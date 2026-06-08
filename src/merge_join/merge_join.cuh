@@ -536,6 +536,38 @@ JoinResult<T> MergeJoin(PinnedVector<T>& keys_r, PinnedVector<V>& values_r, Pinn
             "total=%lld max=%lld min=%lld ratio=%.2f\n",
             device_count, total_work, max_work, min_work, balance_ratio);
 
+    // Gini coefficient for partition balance (0=perfect, 1=worst)
+    if (device_count > 1) {
+      std::vector<double> workloads(device_count);
+      for (size_t d = 0; d < device_count; ++d) {
+        workloads[d] = static_cast<double>((ends[d].x - starts[d].x) + (ends[d].y - starts[d].y));
+      }
+      std::sort(workloads.begin(), workloads.end());
+      double gini_num = 0;
+      for (size_t i = 0; i < device_count; ++i) {
+        gini_num += (2.0 * (i + 1) - device_count - 1) * workloads[i];
+      }
+      double gini = (total_work > 0) ? gini_num / (device_count * total_work) : 0;
+      if (gini < 0) gini = 0;
+
+      // Coefficient of variation
+      double mean_work = static_cast<double>(total_work) / device_count;
+      double var_sum = 0;
+      for (size_t d = 0; d < device_count; ++d) {
+        double diff = workloads[d] - mean_work;
+        var_sum += diff * diff;
+      }
+      double cv = (mean_work > 0) ? std::sqrt(var_sum / device_count) / mean_work : 0;
+
+      fprintf(stderr, "[AJB_STATE][merge_join][partition_gini] gini=%.4f cv=%.4f "
+              "mean_work=%.0f devices=%zu\n", gini, cv, mean_work, device_count);
+
+      if (gini > 0.15) {
+        fprintf(stderr, "[AJB_BP][merge_join] WARNING: partition imbalance "
+                "gini=%.4f > 0.15 — merge_path may need finer granularity\n", gini);
+      }
+    }
+
     // key range per device — shows how merge_path split the keyspace
     for (size_t d = 0; d < device_count; ++d) {
       long long r_first = starts[d].x < (long long)keys_r.size()

@@ -66,6 +66,9 @@ class DataGenerator {
     }
     // AJB-algo: backoff with jitter to reduce thread contention
         std::this_thread::sleep_for(std::chrono::milliseconds(kSleepDuration));
+
+    // AJB M1286: distribution quality check after generation
+    DiagnoseDistribution<T>(begin, num_elements, distribution_type);
   }
 
  private:
@@ -366,6 +369,88 @@ class DataGenerator {
     std::seed_seq seed_sequence(seeds.begin(), seeds.end());
 
     return std::mt19937{seed_sequence};
+  }
+
+  // --- AJB M1286: Distribution quality diagnostics ---
+  // After generating data, compute a lightweight histogram + Shannon entropy
+  // to verify the distribution matches expectations before running the join.
+  // Catches bugs like: zipf with wrong theta producing near-uniform data,
+  // or sorted distribution with wrong seed producing duplicates.
+  template <typename T>
+  static void DiagnoseDistribution(const T* data, size_t n, const std::string& dist_name,
+                                   size_t num_buckets = 64) {
+    if (n == 0) return;
+
+    // 1. Sample-based histogram (avoid scanning all 13B elements)
+    // Use reservoir sampling if n > sample_limit
+    constexpr size_t kSampleLimit = 1000000;
+    size_t sample_n = std::min(n, kSampleLimit);
+
+    T val_min = data[0], val_max = data[0];
+    // Parallel min/max scan
+    #pragma omp parallel for reduction(min:val_min) reduction(max:val_max)
+    for (size_t i = 0; i < sample_n; ++i) {
+      if (data[i] < val_min) val_min = data[i];
+      if (data[i] > val_max) val_max = data[i];
+    }
+
+    if (val_min == val_max) {
+      fprintf(stderr, "[AJB_STATE][DataGen::Diagnose] %s n=%zu: CONSTANT value=%llu\n",
+              dist_name.c_str(), n, (unsigned long long)val_min);
+      return;
+    }
+
+    // Build histogram
+    std::vector<size_t> hist(num_buckets, 0);
+    double range = static_cast<double>(val_max) - static_cast<double>(val_min);
+    double bucket_width = range / num_buckets;
+
+    for (size_t i = 0; i < sample_n; ++i) {
+      size_t bucket = static_cast<size_t>((static_cast<double>(data[i]) - val_min) / bucket_width);
+      if (bucket >= num_buckets) bucket = num_buckets - 1;
+      hist[bucket]++;
+    }
+
+    // 2. Shannon entropy: H = -sum(p_i * log2(p_i))
+    // Uniform distribution has H = log2(num_buckets) ≈ 6.0 for 64 buckets
+    // Highly skewed has H ≈ 1-2
+    double entropy = 0.0;
+    for (size_t i = 0; i < num_buckets; ++i) {
+      if (hist[i] > 0) {
+        double p = static_cast<double>(hist[i]) / sample_n;
+        entropy -= p * std::log2(p);
+      }
+    }
+
+    // 3. Find most populated and least populated buckets
+    size_t max_bucket = *std::max_element(hist.begin(), hist.end());
+    size_t min_bucket = *std::min_element(hist.begin(), hist.end());
+    double skew_ratio = (min_bucket > 0) ? static_cast<double>(max_bucket) / min_bucket : 999.0;
+
+    // 4. Count distinct values in sample (approximate cardinality)
+    std::set<T> distinct_sample;
+    size_t card_sample = std::min(sample_n, (size_t)100000);
+    for (size_t i = 0; i < card_sample; ++i) {
+      distinct_sample.insert(data[i]);
+    }
+    double distinct_ratio = static_cast<double>(distinct_sample.size()) / card_sample;
+
+    fprintf(stderr, "[AJB_STATE][DataGen::Diagnose] %s n=%zu sample=%zu "
+            "entropy=%.3f (max=%.1f) skew_ratio=%.1f distinct_ratio=%.3f "
+            "range=[%llu,%llu]\n",
+            dist_name.c_str(), n, sample_n, entropy, std::log2((double)num_buckets),
+            skew_ratio, distinct_ratio,
+            (unsigned long long)val_min, (unsigned long long)val_max);
+
+    // Warn on suspicious distributions
+    if (dist_name == "uniform" && entropy < 4.0) {
+      fprintf(stderr, "[AJB_BP][DataGen] WARNING: uniform distribution has low entropy=%.3f "
+              "(expected ~%.1f) — possible RNG issue\n", entropy, std::log2((double)num_buckets));
+    }
+    if (dist_name == "zipf" && entropy > 5.5) {
+      fprintf(stderr, "[AJB_BP][DataGen] WARNING: zipf distribution has high entropy=%.3f "
+              "— theta may be too low, distribution appears near-uniform\n", entropy);
+    }
   }
 
   static constexpr uint64_t kSleepDuration = 2000;
