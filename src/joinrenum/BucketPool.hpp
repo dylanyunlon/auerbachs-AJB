@@ -192,6 +192,23 @@ class BucketPool {
         return best;
     }
 
+    // [AJB] M1231: unconditional one-line diagnostic — always prints,
+    // so experiment runs give real-time feedback without recompiling
+    void ajb_summary_line(const char* phase = "done") const {
+        int active_count = 0;
+        long long max_agm = 0;
+        for(size_t i = 0; i < pool.size(); i++) {
+            if(i < ban_status.size() && ban_status[i] != 0) continue;
+            active_count++;
+            if(pool[i].AGM > max_agm) max_agm = pool[i].AGM;
+        }
+        fprintf(stderr, "[AJB_BP][%s] pool=%zu active=%d maxAGM=%lld allocs=%lld reuse=%.0f%% bans=%lld\n",
+                phase, pool.size(), active_count, max_agm,
+                ajb_bp_stats.allocs,
+                ajb_bp_stats.allocs > 0 ? 100.0 * ajb_bp_stats.reuses / ajb_bp_stats.allocs : 0.0,
+                ajb_bp_stats.ban_count);
+    }
+
     // [AJB] M912: 导出当前pool状态给外部调试代码
     // 增加: 总bucket数、平均volume、最大depth
     void ajb_dump_state() const {

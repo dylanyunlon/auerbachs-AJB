@@ -414,9 +414,17 @@ public:
                 ajb_enum_stats.progress_dumps,
                 ajb_seen_tuples.size());
 #else
+        // [AJB] M1231: unconditional final diagnostics — always visible in experiment logs
         fprintf(stderr, "[AJB_TIMER][Enumerator] done: success=%d attempts=%d hit_rate=%.6f cpu=%.3fs wall=%.3fs\n",
                 cntsuccess, cnt, ajb_enum_stats.last_hit_rate, elapsed, wall_sec);
+        fprintf(stderr, "[AJB_STATE][Enumerator] bans=%lld yield_mean=%.1f yield_cv=%.4f progress_intervals=%lld\n",
+                ajb_enum_stats.total_bans,
+                ajb_enum_stats.yield_tracker.mean,
+                ajb_enum_stats.yield_tracker.cv(),
+                ajb_enum_stats.yield_tracker.n);
 #endif
+        // [AJB] M1231: always-on BucketPool summary (enables real-time experiment monitoring)
+        access_tree.pool.ajb_summary_line("enum_done");
     }
 
 };
