@@ -1058,3 +1058,29 @@ OS: Ubuntu 22.04, kernel 5.15
   - 全部claim vs 实测数据交叉校验
 第十七位Claude: M1381-M1410 (Docker + CI + 最终验证)
 ```
+
+## 子Claude Opus 4.6 验证: M1261-M1290 ✅
+
+### 调度方式
+- 第十二位Claude(我) 通过 claude.hk.cn API 向 Opus 4.6 发送任务
+- 子Claude独立执行: git clone → apt install → 编译 → 运行 → 汇报
+
+### 验证结果: 11/11 CPU tests ALL PASS
+```
+test_bucket_pool      PASS  46.5µs   alloc/free/reuse tracking
+test_count_oracle     PASS  73ms     100K queries, 0.19µs/query
+test_unordered_map    PASS  645ms    1.7M lookups, 8.0 Mops/s
+test_join_tree        PASS  <1ms     BFS 0.009ms, gini=0.0000
+test_index            PASS  ~2s      MHBS 3.5M ops, 2.7 Mops/s
+test_rr_access_tree   PASS  <1ms     avg 0.8µs/access
+test_enumerator       PASS  ~1s      hit_rate > 0, AGM/LP/BFS all OK
+test_join_baseline    PASS  60ms     9.9 Mprobes/s
+test_join_triangle    PASS  88ms     correct 0 triangles on 4-row data
+test_renum_baseline   PASS  38s      high collision (expected on tiny data)
+test_sample_baseline  PASS  <1s      sorted-vector dedup OK
+```
+
+### 子Claude结论
+- 代码处于可工作状态 (CPU joinrenum)
+- test_renum_baseline 38s 最慢 (小数据集碰撞率0.99, 大数据集会快得多)
+- 下一步: GPU benchmark (A6000/H100)
