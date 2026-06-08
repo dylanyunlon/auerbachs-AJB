@@ -1084,3 +1084,52 @@ test_sample_baseline  PASS  <1s      sorted-vector dedup OK
 - 代码处于可工作状态 (CPU joinrenum)
 - test_renum_baseline 38s 最慢 (小数据集碰撞率0.99, 大数据集会快得多)
 - 下一步: GPU benchmark (A6000/H100)
+
+---
+
+## 第十四位 Claude (当前session) 完成: M1265-M1270
+
+### 后缀清理 (3 files removed, 2 files enhanced)
+- **M1265**: `draw_upstream.py` → 合并入 `draw_results.py`
+  - 新增 `_dump_state()` 断点诊断函数
+  - matplotlib-absent fallback (data-dump-only mode)
+  - `read_data()` 增加 [AJB_BP] 全状态输出
+- **M1266-M1267**: `run_perf_full.sh` + `run_upstream_tests.sh` → 删除
+  - `run_perf_profile.sh` 吸收: --target dispatch, GLPK-aware linking, perf report top-15
+  - `run_joinrenum_tests.sh` 已覆盖所有 upstream 测试功能
+- **Result: 项目中 0 个带后缀的变体文件** ✅
+
+### baseline对比方案确认
+- 论文baseline: upstream/multi-gpu-sort-merge-join (VLDB'25 uniform-cadence P2P join)
+- 对比方法: 同参数跑upstream和AJB版的sort_benchmark/join_benchmark
+- 关键claim: 1.3-2.1x end-to-end speedup, 170x fewer PCIe-tier bytes, 2x cross-tier reduction
+- 这些数据需要通过ags1服务器的GPU实验获取
+
+### 实验自动化设计 (参考附件llm4cardgame_run.sh环境模式)
+- 服务器: ags1 (2x A6000 + 1x H100 NVL, conda base环境)
+- 环境复用: conda base (cmake/g++/nvcc 已有), apt install libglpk-dev libboost-dev
+- 执行脚本: ags1_quickstart.sh (已存在, handles everything)
+- 数据流: 实验结果 → git push experiment_data/ → 子Claude拉取分析
+
+### 接力规划 (更新 2026-06-08)
+```
+第十四位Claude完成: M1265-M1270 ✅ (suffix清理 + baseline确认 + 子Claude任务设计)
+第十五位Claude(sub-Opus4.6): M1271-M1300 (ags1 GPU编译 + CPU test + benchmark运行)
+  - git clone + conda activate base + apt install deps
+  - bash ags1_quickstart.sh (一键: build + CPU test + GPU benchmark)
+  - experiment_data/ 自动push到GitHub
+  - 重点: sort_benchmark 1M/10M/100M + join_benchmark skew sweep
+第十六位Claude: M1301-M1330 (实验数据解析 + paper填充)
+  - git pull experiment_data/, 解析 [AJB_STATE] 到 CSV
+  - 填入 paper/ajb_reconstructed.tex Table 1-2, Figure 2-5
+  - 验证 speedup claims vs 实测数据
+第十七位Claude: M1331-M1360 (multi-GPU scaling + 大规模实验)
+  - 2x A6000 + H100 三GPU实验
+  - joinrenum TPC-H schema 大规模测试
+  - RQ5-RQ6 数据采集
+第十八位Claude: M1361-M1390 (paper编译 + camera-ready)
+  - pdflatex 编译验证
+  - Figure pgfplots 数据文件生成
+  - 全部claim vs 实测数据交叉校验
+第十九位Claude: M1391-M1420 (Docker + CI + 最终验证)
+```
