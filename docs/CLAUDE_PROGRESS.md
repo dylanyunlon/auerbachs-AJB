@@ -1224,3 +1224,29 @@ Completed: M1-M1280 (15 Claudes)
 19th Claude: M1371-M1400 — Docker reproducibility + CI
 20th Claude: M1401-M1420 — final review + submission prep
 ```
+
+## 15th Claude Continuation — Build Infrastructure Fix
+
+### 关键发现: 代码从未在GPU上编译运行过
+- `third_party/` 在 `.gitignore` 中, 8个依赖(thrust, moderngpu等)从未被下载
+- `.gitmodules` 存在但submodule refs从未被commit
+- 没有nvcc的环境无法编译任何.cu文件
+- paper中的Tables 1-2数据(170x, 1.3-2.1x)是占位数字, 无实验支撑
+
+### M1301: 修复build基础设施
+- 删除broken `.gitmodules`
+- `scripts/ags1_build_from_scratch.sh`: 自动clone全部8个依赖
+- CUDA版本检测: 11.5只支持sm_80, H100需CUDA 12+
+- cmake + make流程验证
+
+### ags1服务器编译障碍
+- CUDA 11.5 不原生支持 A6000 (sm_86) 和 H100 (sm_90)
+- 需要升级到 CUDA 12.x: `conda install -c nvidia cuda-toolkit=12.6`
+- A6000可通过PTX兼容运行sm_80编译的代码
+- H100完全不能在CUDA 11.5上工作
+
+### 下一步 (需要人工操作)
+1. 在ags1上升级CUDA到12.x
+2. 运行 `bash scripts/ags1_build_from_scratch.sh`
+3. 确认GPU kernel实际执行 (nvidia-smi看利用率)
+4. 用真实数据替换paper中的占位数字
