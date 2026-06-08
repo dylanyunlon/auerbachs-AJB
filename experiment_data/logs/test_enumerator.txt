@@ -1,0 +1,209 @@
+[AJB_BP] === test_enumerator_full start ===
+[AJB_WARN] Cannot open res/result.txt
+[AJB_TRACE][ReadConfig] filename: R1 -> db/Ra.csv
+[AJB_TRACE][ReadConfig] filename: R2 -> db/Rb.csv
+[AJB_TRACE][ReadConfig] filename: R3 -> db/Rc.csv
+[AJB_STATE][ReadConfig] loaded 3 filename mappings from db/filenames.txt
+[AJB_STATE][ReadConfig] file extensions: .csv 
+[AJB_TRACE][ReadConfig] numlines: R1 = 4
+[AJB_TRACE][ReadConfig] numlines: R2 = 4
+[AJB_TRACE][ReadConfig] numlines: R3 = 4
+[AJB_STATE][ReadConfig] loaded 3 numlines from db/numlines.txt (0 need auto-count)
+[AJB_STATE][ReadConfig] rows: total=12 min=4 max=4 avg=4
+[AJB_TRACE][ReadConfig] relation R1: arity=2 attrs=[A,B]
+[AJB_TRACE][ReadConfig] relation R2: arity=2 attrs=[B,C]
+[AJB_TRACE][ReadConfig] relation R3: arity=2 attrs=[A,C]
+[AJB_STATE][ReadConfig] loaded 3 relations from db/relations.txt
+[AJB_STATE][ReadConfig] attribute frequency map (3 distinct attrs):
+[AJB_TRACE][ReadConfig]   attr 'B' appears in 2 relations (JOIN ATTR)
+[AJB_TRACE][ReadConfig]   attr 'C' appears in 2 relations (JOIN ATTR)
+[AJB_TRACE][ReadConfig]   attr 'A' appears in 2 relations (JOIN ATTR)
+[AJB_STATE][ReadConfig] join graph: 3 shared (join) attrs, 0 unique attrs
+[AJB_STATE][ReadConfig] files=3 numlines=3 relations=3
+[AJB_STATE][ReadConfig] total_attrs=6 arity_range=[2,2] avg_arity=2.0
+[AJB_STATE][ReadConfig] total_rows=12 auto_count=0 malformed=0
+[AJB_STATE] relations=3
+[AJB_STATE] --- Strategy REnum_B(batch) (option=3) ---
+[AJB_BP][AGM] initRels: 3 vars, 3 rels, adj_edges=3/3 (density=1.0000)
+[AJB_STATE][AGM] initLP #1: 3 cols (rels) x 3 rows (vars)
+[AJB_STATE][AGM]   row v1: 2 nonzeros [r1,r3]
+[AJB_STATE][AGM]   row v2: 2 nonzeros [r1,r2]
+[AJB_STATE][AGM]   row v3: 2 nonzeros [r2,r3]
+[AJB_BP][Query] constructed: 3 relations, 3 variables
+[AJB_STATE][Query]   R0(R1): arity=2 vars=[x0,x1]
+[AJB_STATE][Query]   R1(R2): arity=2 vars=[x1,x2]
+[AJB_STATE][Query]   R2(R3): arity=2 vars=[x0,x2]
+[AJB_STATE][Query]   x0(A) in 2 rels: [R0,R2]
+[AJB_STATE][Query]   x1(B) in 2 rels: [R0,R1]
+[AJB_STATE][Query]   x2(C) in 2 rels: [R1,R2]
+[AJB_BP][Index] preProcessing start: 3 relations
+[AJB_BP][Table] db/Ra.csv: 4 lines → 4 unique
+[AJB_STATE][Table]   col[0]: min=1 median=3 max=4 distinct=4
+[AJB_STATE][Table]   col[1]: min=1652041910 median=1652041910 max=1652041910 distinct=4
+[AJB_TIMER][Table] loadFromFile total=0.02ms (io=0.02 dedup=0.00 co=0.00)
+[AJB_TIMER][Index] preProcessing: 0.0ms, 1 tables built
+[AJB_STATE][Index] varnum=3 relations=0 FB.AGM=-1
+[AJB_BP][Index] preProcessing start: 3 relations
+[AJB_BP][Table] db/Rb.csv: 4 lines → 3 unique
+[AJB_STATE][Table]   col[0]: min=1 median=3 max=4 distinct=3
+[AJB_STATE][Table]   col[1]: min=1652041910 median=1652041910 max=1652041910 distinct=3
+[AJB_TIMER][Table] loadFromFile total=0.01ms (io=0.02 dedup=0.00 co=0.00)
+[AJB_TIMER][Index] preProcessing: 0.0ms, 2 tables built
+[AJB_STATE][Index] varnum=3 relations=0 FB.AGM=-1
+[AJB_BP][Index] preProcessing start: 3 relations
+[AJB_BP][Table] db/Rc.csv: 4 lines → 3 unique
+[AJB_STATE][Table]   col[0]: min=2 median=3 max=4 distinct=3
+[AJB_STATE][Table]   col[1]: min=1652041910 median=1652041910 max=1652041910 distinct=3
+[AJB_TIMER][Table] loadFromFile total=0.01ms (io=0.03 dedup=0.00 co=0.00)
+[AJB_TIMER][Index] preProcessing: 0.0ms, 3 tables built
+[AJB_STATE][Index] varnum=3 relations=0 FB.AGM=-1
+[AJB_BP][JoinTree] BFS start: root=R0, 3 relations, 3 variables
+[AJB_BP][AGM] getNeighborRels(R0): popcount=2/2 sparsity=0.0000
+[AJB_BP][Query] neighbors(R0,k=0): 2 rels, density=1.00
+[AJB_BP][AGM] getNeighborRels(R1): popcount=1/2 sparsity=0.5000
+[AJB_BP][Query] neighbors(R1,k=1): 1 rels, density=0.50
+[AJB_BP][AGM] getNeighborRels(R2): popcount=1/2 sparsity=0.5000
+[AJB_BP][Query] neighbors(R2,k=1): 1 rels, density=0.50
+[AJB_BP][AGM] getNeighborRels(R1): popcount=2/2 sparsity=0.0000
+[AJB_BP][Query] neighbors(R1,k=0): 2 rels, density=1.00
+[AJB_BP][AGM] getNeighborRels(R2): popcount=2/2 sparsity=0.0000
+[AJB_BP][Query] neighbors(R2,k=0): 2 rels, density=1.00
+[AJB_STATE][JoinTree] BFS done: 1 tree edges in 0.013ms
+[AJB_TIMER][JoinTree] buildLeaves=0.002ms (4 leaves)
+[AJB_TIMER][JoinTree] preProcessing=0.001ms (1 internal nodes)
+[AJB_TIMER][JoinTree] total build=0.026ms (bfs=0.013 leaves=0.002 preproc=0.001)
+[AJB_STATE][JoinTree] gini_balance=0.0000 (0=perfect,1=skewed) internal_nodes=1
+[AJB_BP][Index] output line 1
+[AJB_BP][RRAccessTree] ready: AGM=0 rels=3 cache_depth=20
+[AJB_BP][BanPickTree] built: H=0
+[AJB_BP][B&B] best=1000000000000000000.00 pruned=0/0 (0.00%) evaluated=0
+[AJB_BP][AdaptiveMemo] entries=0 max=65536 evictions=0
+[AJB_TIMER][Enumerator] done: success=0 attempts=0 hit_rate=0.000000 cpu=0.000s wall=0.000s
+[AJB_STATE][Enumerator] bans=0 yield_mean=0.0 yield_cv=0.0000 progress_intervals=0
+[AJB_BP][enum_done] pool=1 active=1 maxAGM=0 allocs=0 reuse=0% bans=0
+[AJB_STATE] === REnum_B(batch) Performance (Amdahl order) ===
+[AJB_STATE]            AGM: 0.000000s (  0.0%)
+[AJB_STATE]    CountOracle: 0.000000s (  0.0%)
+[AJB_STATE]          Split: 0.000000s (  0.0%)
+[AJB_STATE]       CacheHit: 0.000000s (  0.0%)
+[AJB_STATE]   BoundPrepare: 0.000000s (  0.0%)
+[AJB_STATE] cache_hit=0.000 (0/0) splits=0 BS=0
+[AJB_TIMER] REnum_B(batch): 0.0ms success=0 attempts=0
+[AJB_STATE] --- Strategy REnum(base) (option=0) ---
+[AJB_BP][AGM] initRels: 3 vars, 3 rels, adj_edges=3/3 (density=1.0000)
+[AJB_STATE][AGM] initLP #2: 3 cols (rels) x 3 rows (vars)
+[AJB_STATE][AGM]   row v1: 2 nonzeros [r1,r3]
+[AJB_STATE][AGM]   row v2: 2 nonzeros [r1,r2]
+[AJB_STATE][AGM]   row v3: 2 nonzeros [r2,r3]
+[AJB_BP][Query] constructed: 3 relations, 3 variables
+[AJB_STATE][Query]   R0(R1): arity=2 vars=[x0,x1]
+[AJB_STATE][Query]   R1(R2): arity=2 vars=[x1,x2]
+[AJB_STATE][Query]   R2(R3): arity=2 vars=[x0,x2]
+[AJB_STATE][Query]   x0(A) in 2 rels: [R0,R2]
+[AJB_STATE][Query]   x1(B) in 2 rels: [R0,R1]
+[AJB_STATE][Query]   x2(C) in 2 rels: [R1,R2]
+[AJB_BP][Index] preProcessing start: 3 relations
+[AJB_BP][Table] db/Ra.csv: 4 lines → 4 unique
+[AJB_STATE][Table]   col[0]: min=1 median=3 max=4 distinct=4
+[AJB_STATE][Table]   col[1]: min=1652041910 median=1652041910 max=1652041910 distinct=4
+[AJB_TIMER][Table] loadFromFile total=0.01ms (io=0.04 dedup=0.01 co=0.00)
+[AJB_TIMER][Index] preProcessing: 0.0ms, 1 tables built
+[AJB_STATE][Index] varnum=3 relations=0 FB.AGM=-1
+[AJB_BP][Index] preProcessing start: 3 relations
+[AJB_BP][Table] db/Rb.csv: 4 lines → 3 unique
+[AJB_STATE][Table]   col[0]: min=1 median=3 max=4 distinct=3
+[AJB_STATE][Table]   col[1]: min=1652041910 median=1652041910 max=1652041910 distinct=3
+[AJB_TIMER][Table] loadFromFile total=0.01ms (io=0.05 dedup=0.01 co=0.00)
+[AJB_TIMER][Index] preProcessing: 0.0ms, 2 tables built
+[AJB_STATE][Index] varnum=3 relations=0 FB.AGM=-1
+[AJB_BP][Index] preProcessing start: 3 relations
+[AJB_BP][Table] db/Rc.csv: 4 lines → 3 unique
+[AJB_STATE][Table]   col[0]: min=2 median=3 max=4 distinct=3
+[AJB_STATE][Table]   col[1]: min=1652041910 median=1652041910 max=1652041910 distinct=3
+[AJB_TIMER][Table] loadFromFile total=0.01ms (io=0.06 dedup=0.01 co=0.01)
+[AJB_TIMER][Index] preProcessing: 0.0ms, 3 tables built
+[AJB_STATE][Index] varnum=3 relations=0 FB.AGM=-1
+[AJB_BP][JoinTree] BFS start: root=R0, 3 relations, 3 variables
+[AJB_BP][AGM] getNeighborRels(R0): popcount=2/2 sparsity=0.0000
+[AJB_BP][Query] neighbors(R0,k=0): 2 rels, density=1.00
+[AJB_BP][AGM] getNeighborRels(R1): popcount=1/2 sparsity=0.5000
+[AJB_BP][Query] neighbors(R1,k=1): 1 rels, density=0.50
+[AJB_BP][AGM] getNeighborRels(R2): popcount=1/2 sparsity=0.5000
+[AJB_BP][Query] neighbors(R2,k=1): 1 rels, density=0.50
+[AJB_BP][AGM] getNeighborRels(R1): popcount=2/2 sparsity=0.0000
+[AJB_BP][Query] neighbors(R1,k=0): 2 rels, density=1.00
+[AJB_BP][AGM] getNeighborRels(R2): popcount=2/2 sparsity=0.0000
+[AJB_BP][Query] neighbors(R2,k=0): 2 rels, density=1.00
+[AJB_STATE][JoinTree] BFS done: 1 tree edges in 0.017ms
+[AJB_TIMER][JoinTree] buildLeaves=0.001ms (8 leaves)
+[AJB_TIMER][JoinTree] preProcessing=0.001ms (2 internal nodes)
+[AJB_TIMER][JoinTree] total build=0.022ms (bfs=0.017 leaves=0.001 preproc=0.001)
+[AJB_STATE][JoinTree] gini_balance=0.0000 (0=perfect,1=skewed) internal_nodes=2
+[AJB_BP][Index] output line 1
+[AJB_BP][RRAccessTree] ready: AGM=0 rels=3 cache_depth=20
+[AJB_BP][BanPickTree] built: H=0
+[AJB_BP][B&B] best=1000000000000000000.00 pruned=0/0 (0.00%) evaluated=0
+[AJB_BP][AdaptiveMemo] entries=0 max=65536 evictions=0
+[AJB_TIMER][Enumerator] done: success=0 attempts=0 hit_rate=0.000000 cpu=0.000s wall=0.000s
+[AJB_STATE][Enumerator] bans=0 yield_mean=0.0 yield_cv=0.0000 progress_intervals=0
+[AJB_BP][enum_done] pool=1 active=1 maxAGM=0 allocs=0 reuse=0% bans=0
+[AJB_STATE] === REnum(base) Performance (Amdahl order) ===
+[AJB_STATE]            AGM: 0.000000s (  0.0%)
+[AJB_STATE]    CountOracle: 0.000000s (  0.0%)
+[AJB_STATE]          Split: 0.000000s (  0.0%)
+[AJB_STATE]       CacheHit: 0.000000s (  0.0%)
+[AJB_STATE]   BoundPrepare: 0.000000s (  0.0%)
+[AJB_STATE] cache_hit=0.000 (0/0) splits=0 BS=0
+[AJB_TIMER] REnum(base): 0.0ms success=0 attempts=0
+[AJB_STATE] === Strategy Comparison ===
+[AJB_STATE] REnum_B(batch): 0.0ms  REnum(base): 0.0ms  speedup=0.82x
+[AJB_STATE] cache_rate: REnum_B(batch)=0.000  REnum(base)=0.000
+[AJB_BP][AGM] initRels: 3 vars, 3 rels, adj_edges=3/3 (density=1.0000)
+[AJB_STATE][AGM] initLP #3: 3 cols (rels) x 3 rows (vars)
+[AJB_STATE][AGM]   row v1: 2 nonzeros [r1,r3]
+[AJB_STATE][AGM]   row v2: 2 nonzeros [r1,r2]
+[AJB_STATE][AGM]   row v3: 2 nonzeros [r2,r3]
+[AJB_BP][Query] constructed: 3 relations, 3 variables
+[AJB_STATE][Query]   R0(R1): arity=2 vars=[x0,x1]
+[AJB_STATE][Query]   R1(R2): arity=2 vars=[x1,x2]
+[AJB_STATE][Query]   R2(R3): arity=2 vars=[x0,x2]
+[AJB_STATE][Query]   x0(A) in 2 rels: [R0,R2]
+[AJB_STATE][Query]   x1(B) in 2 rels: [R0,R1]
+[AJB_STATE][Query]   x2(C) in 2 rels: [R1,R2]
+[AJB_BP][Index] preProcessing start: 3 relations
+[AJB_BP][Table] db/Ra.csv: 4 lines → 4 unique
+[AJB_STATE][Table]   col[0]: min=1 median=3 max=4 distinct=4
+[AJB_STATE][Table]   col[1]: min=1652041910 median=1652041910 max=1652041910 distinct=4
+[AJB_TIMER][Table] loadFromFile total=0.01ms (io=0.07 dedup=0.01 co=0.01)
+[AJB_TIMER][Index] preProcessing: 0.0ms, 1 tables built
+[AJB_STATE][Index] varnum=3 relations=0 FB.AGM=-1
+[AJB_BP][Index] preProcessing start: 3 relations
+[AJB_BP][Table] db/Rb.csv: 4 lines → 3 unique
+[AJB_STATE][Table]   col[0]: min=1 median=3 max=4 distinct=3
+[AJB_STATE][Table]   col[1]: min=1652041910 median=1652041910 max=1652041910 distinct=3
+[AJB_TIMER][Table] loadFromFile total=0.01ms (io=0.07 dedup=0.01 co=0.01)
+[AJB_TIMER][Index] preProcessing: 0.0ms, 2 tables built
+[AJB_STATE][Index] varnum=3 relations=0 FB.AGM=-1
+[AJB_BP][Index] preProcessing start: 3 relations
+[AJB_BP][Table] db/Rc.csv: 4 lines → 3 unique
+[AJB_STATE][Table]   col[0]: min=2 median=3 max=4 distinct=3
+[AJB_STATE][Table]   col[1]: min=1652041910 median=1652041910 max=1652041910 distinct=3
+[AJB_TIMER][Table] loadFromFile total=0.01ms (io=0.08 dedup=0.01 co=0.01)
+[AJB_TIMER][Index] preProcessing: 0.0ms, 3 tables built
+[AJB_STATE][Index] varnum=3 relations=0 FB.AGM=-1
+[AJB_BP][JoinTree] BFS start: root=R0, 3 relations, 3 variables
+[AJB_BP][Query] neighbors(R0,k=0): 2 rels, density=1.00
+[AJB_BP][Query] neighbors(R1,k=1): 1 rels, density=0.50
+[AJB_BP][Query] neighbors(R2,k=1): 1 rels, density=0.50
+[AJB_BP][Query] neighbors(R1,k=0): 2 rels, density=1.00
+[AJB_BP][Query] neighbors(R2,k=0): 2 rels, density=1.00
+[AJB_STATE][JoinTree] BFS done: 1 tree edges in 0.008ms
+[AJB_TIMER][JoinTree] buildLeaves=0.001ms (12 leaves)
+[AJB_TIMER][JoinTree] preProcessing=0.001ms (3 internal nodes)
+[AJB_TIMER][JoinTree] total build=0.013ms (bfs=0.008 leaves=0.001 preproc=0.001)
+[AJB_STATE][JoinTree] gini_balance=0.0000 (0=perfect,1=skewed) internal_nodes=3
+[AJB_BP][Index] output line 1
+[AJB_BP][RRAccessTree] ready: AGM=6 rels=3 cache_depth=20
+[AJB_BP][GreedyDim] split_call=1: mismatch_dim=0 -> greedy_dim=1 (ratio=550680636.67)
+[AJB_STATE] reverse verification: 6/6 ranks checked
+[AJB_BP] === test_enumerator_full done ===

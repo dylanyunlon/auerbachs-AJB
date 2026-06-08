@@ -1,0 +1,9 @@
+[AJB_BP] === test_unordered_map_full start ===
+[AJB_STATE] insert: 1700000 entries in 1134.5ms, buckets=2938679 load=0.578
+[AJB_STATE] avg_chain=0.58 max_chain=7
+Found: 1700000
+Time taken: 1.6478 seconds
+[AJB_STATE] lookup: found=1700000/1700000 in 513.3ms (3.3 Mops/s)
+[AJB_STATE] flat_vector baseline: found=1700000/1700000 in 301.6ms (5.6 Mops/s)
+[AJB_STATE] speedup: hash=513.3ms flat=301.6ms ratio=1.70x
+[AJB_BP] === test_unordered_map_full done ===

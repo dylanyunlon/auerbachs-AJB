@@ -1,0 +1,9 @@
+[AJB_BP] === test_count_oracle_full start ===
+[AJB_STATE] loaded 1000 points, dim=3, parse=0.0ms
+Time used: 0.14 ms
+Memory usage: 4004 KB
+[AJB_STATE] build=0.1ms rss_delta=548 KB
+Time used: 0.0002908 ms
+[AJB_STATE] monotonicity: 500/100000 checked, 0 violations
+[AJB_STATE] queries=100000 total=16939106 min=0 max=997 avg=169.4 us/q=0.29
+[AJB_BP] === test_count_oracle_full done ===

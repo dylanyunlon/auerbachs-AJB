@@ -1,0 +1,10 @@
+[AJB_STATE] Data loaded: lines=4 pairs=4 memory=103MB
+[AJB_STATE] Join complete:
+  unique_triangles=0
+  total_probes=4
+  time=4.14e-07s
+  memory=103MB
+Time taken: 4.14e-07 seconds
+Memory peak: 103MB
+Unique triangles: 0
+Total probes: 4

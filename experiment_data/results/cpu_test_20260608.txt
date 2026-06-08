@@ -1,0 +1,26 @@
+# AJB CPU Test Results
+# Environment: Claude sandbox (Ubuntu 24, no GPU)
+# Compiler: g++ -std=c++17 -O2 -I. -lglpk
+# Dependencies: libglpk-dev, libboost-dev
+# Date: 2026-06-08T11:17:10+00:00
+# Milestone: M1271-M1300
+
+test_name|status|time
+---|---|---
+test_bucket_pool|PASS|5ms
+test_count_oracle|PASS|112ms
+test_unordered_map|PASS|2585ms
+test_join_tree|PASS|5ms
+test_index|PASS|2063ms
+test_rr_access_tree|PASS|5ms
+test_enumerator|PASS|5ms
+test_join_baseline|PASS|80ms
+test_join_triangle|PASS|353ms
+test_renum_baseline|PASS|5ms
+test_sample_baseline|PASS|66724ms
+
+# Summary: 11/11 PASS, 0 FAIL
+# Total wall time: ~72s (test_sample_baseline dominates at 66.7s)
+# Notes:
+#   - test_sample_baseline runs long due to high collision rate on small dataset
+#   - All AJB trace systems verified: [AJB_STATE], [AJB_TIMER], [AJB_BP], [AJB_DEBUG]
