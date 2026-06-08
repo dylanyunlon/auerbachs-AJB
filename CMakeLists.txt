@@ -303,10 +303,32 @@ if(GLPK_LIBRARY)
     set_target_properties(ajb_${tool_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
   endforeach()
 
+  # --- M1141-M1170: baseline algorithm tests (Claude-9) ---
+  #   test_join_triangle: FNV-1a hash, flat sorted index, strtol parser
+  #   test_renum_baseline: xoshiro256** PRNG, EMA convergence tracking
+  #   test_sample_baseline: sorted-vector dedup, collision rate EMA
+  set(AJB_RENUM_TESTS_M1141
+    test_join_triangle
+    test_renum_baseline
+    test_sample_baseline
+  )
+
+  foreach(test_name ${AJB_RENUM_TESTS_M1141})
+    add_executable(ajb_${test_name} "src/joinrenum/tests/${test_name}.cpp")
+    target_include_directories(ajb_${test_name} PRIVATE ${AJB_RENUM_INCLUDE_DIRS})
+    target_compile_features(ajb_${test_name} PRIVATE cxx_std_17)
+    set_target_properties(ajb_${test_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+    # triangle join doesn't need GLPK; renum/sample need it via Index
+    if(NOT ${test_name} STREQUAL "test_join_triangle")
+      target_link_libraries(ajb_${test_name} PRIVATE ${GLPK_LIBRARY})
+    endif()
+  endforeach()
+
   # Convenience targets
   add_custom_target(ajb_joinrenum_tests)       # original tests
   add_custom_target(ajb_joinrenum_tests_full)   # _full tests + baseline
   add_custom_target(ajb_joinrenum_tests_upstream)  # _upstream tests
+  add_custom_target(ajb_joinrenum_tests_m1141)  # M1141 baseline tests
   add_custom_target(ajb_joinrenum_all)          # everything
 
   foreach(test_name ${AJB_RENUM_TESTS})
@@ -336,6 +358,12 @@ if(GLPK_LIBRARY)
   foreach(tool_name ${AJB_RENUM_TOOLS_UPSTREAM})
     add_dependencies(ajb_joinrenum_tests_upstream ajb_${tool_name})
     add_dependencies(ajb_joinrenum_all ajb_${tool_name})
+  endforeach()
+
+  # M1141 baseline tests
+  foreach(test_name ${AJB_RENUM_TESTS_M1141})
+    add_dependencies(ajb_joinrenum_tests_m1141 ajb_${test_name})
+    add_dependencies(ajb_joinrenum_all ajb_${test_name})
   endforeach()
 
 else()
