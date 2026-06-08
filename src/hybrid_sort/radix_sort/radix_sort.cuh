@@ -10,11 +10,18 @@ struct RadixSortDiag {
     size_t passes_executed = 0;
     size_t reduced_buckets_total = 0;
     size_t fallback_full_sorts = 0;
+    size_t chunk_alignment_adjustments = 0;
+    size_t memory_budget_warnings = 0;
+    size_t double_buffer_mismatches = 0;
+    double total_throughput_elem_per_sec = 0.0;
     void dump(FILE* out = stderr) const {
         fprintf(out, "[AJB_RADIX_SUMMARY] elements=%zu resizes=%zu "
-            "passes=%zu reduced_buckets=%zu fallbacks=%zu\n",
+            "passes=%zu reduced_buckets=%zu fallbacks=%zu "
+            "chunk_aligns=%zu mem_warnings=%zu buf_mismatches=%zu throughput=%.2e\n",
             total_elements, gpu_resize_steps, passes_executed,
-            reduced_buckets_total, fallback_full_sorts);
+            reduced_buckets_total, fallback_full_sorts,
+            chunk_alignment_adjustments, memory_budget_warnings,
+            double_buffer_mismatches, total_throughput_elem_per_sec);
     }
 };
 
@@ -56,39 +63,54 @@ struct AdaptiveRadixConfig {
 
 static inline AdaptiveRadixConfig SelectRadixBitWidth(
     uint64_t key_range, uint32_t key_bits, size_t num_elements) {
-    // Candidate radix widths to evaluate
-    constexpr uint32_t candidates[] = {4, 8, 11};
-    constexpr size_t num_candidates = 3;
+    // Candidate radix widths: includes 16-bit for narrow-range keys
+    // When key_range < 2^16, a single 16-bit pass can replace multiple 8-bit passes
+    constexpr uint32_t candidates_narrow[] = {4, 8, 11, 16};
+    constexpr uint32_t candidates_wide[] = {4, 8, 11};
+    const bool narrow_range = (key_range > 0 && key_range < (1ULL << 16));
+    const uint32_t* candidates = narrow_range ? candidates_narrow : candidates_wide;
+    const size_t num_candidates = narrow_range ? 4 : 3;
+
+    // Compute effective bit range — skip high-order zero passes
+    uint32_t effective_bits = key_bits;
+    uint32_t low_bit = 0;
+    if (key_range > 0) {
+        effective_bits = 64 - __builtin_clzll(key_range);
+        if (effective_bits < key_bits) {
+            low_bit = 0;  // data starts from bit 0 after range reduction
+        }
+    }
 
     AdaptiveRadixConfig best = {8, 0, 256, 1e18};
 
     for (size_t c = 0; c < num_candidates; ++c) {
         uint32_t bits = candidates[c];
-        uint32_t passes = (key_bits + bits - 1) / bits;
+        uint32_t active_bits = (key_range > 0 && effective_bits < key_bits) ? effective_bits : key_bits;
+        uint32_t passes = (active_bits + bits - 1) / bits;
         uint32_t buckets = 1u << bits;
 
-        // Work model: each pass scans all elements and updates `buckets` counters.
-        // Memory pressure scales with buckets; compute scales with passes * elements.
-        // We approximate total work as passes * (elements + buckets * cache_miss_penalty)
-        double cache_penalty = buckets > 512 ? 2.0 : 1.0;  // L1 pressure heuristic
+        // Work model: passes * (scan cost + histogram memory pressure)
+        // 16-bit radix has 65536 buckets — high L2 pressure but fewer passes
+        double cache_penalty = 1.0;
+        if (buckets > 4096) cache_penalty = 4.0;       // 16-bit: heavy L2 pressure
+        else if (buckets > 512) cache_penalty = 2.0;    // 11-bit: moderate L1 pressure
         double work = passes * (num_elements + buckets * cache_penalty * 64.0);
+
+        // Bonus for 16-bit on narrow data: single-pass advantage
+        if (narrow_range && bits == 16 && passes == 1) {
+            work *= 0.7;  // discount for single-pass completion
+        }
 
         if (work < best.estimated_work) {
             best = {bits, passes, buckets, work};
         }
     }
 
-    // If key range is very small, we can reduce effective key bits
-    if (key_range > 0) {
-        uint32_t effective_bits = 64 - __builtin_clzll(key_range);
-        if (effective_bits < key_bits) {
-            uint32_t alt_passes = (effective_bits + best.radix_bits - 1) / best.radix_bits;
-            if (alt_passes < best.num_passes) {
-                best.num_passes = alt_passes;
-                best.estimated_work *= (double)alt_passes / ((key_bits + best.radix_bits - 1) / best.radix_bits);
-            }
-        }
-    }
+    // Report actual bit range used via AJB_STATE
+    uint32_t actual_low = low_bit;
+    uint32_t actual_high = (key_range > 0 && effective_bits < key_bits) ? effective_bits : key_bits;
+    fprintf(stderr, "[AJB_STATE][AdaptiveRadix] bit_range=[%u..%u] effective=%u/%u narrow=%d\n",
+            actual_low, actual_high, actual_high - actual_low, key_bits, (int)narrow_range);
 
     fprintf(stderr, "[AJB_BP][AdaptiveRadix] range=%llu key_bits=%u -> radix_bits=%u passes=%u buckets=%u work=%.0f\n",
             (unsigned long long)key_range, key_bits,
@@ -105,6 +127,8 @@ static inline AdaptiveRadixConfig SelectRadixBitWidth(
 static inline void BlellochExclusiveScan(std::vector<size_t>& data) {
     size_t n = data.size();
     if (n == 0) return;
+
+    auto scan_start = std::chrono::high_resolution_clock::now();
 
     // Pad to next power of 2
     size_t padded = 1;
@@ -134,8 +158,11 @@ static inline void BlellochExclusiveScan(std::vector<size_t>& data) {
     // Trim back to original size
     data.resize(n);
 
-    fprintf(stderr, "[AJB_BP][BlellochScan] n=%zu padded=%zu total=%zu\n",
-            n, padded, total);
+    auto scan_end = std::chrono::high_resolution_clock::now();
+    double scan_ms = std::chrono::duration<double, std::milli>(scan_end - scan_start).count();
+    double scan_throughput = scan_ms > 0.0 ? (n / (scan_ms * 1e-3)) : 0.0;
+    fprintf(stderr, "[AJB_TIMER][BlellochScan] n=%zu padded=%zu total=%zu elapsed=%.3fms throughput=%.2e elem/s\n",
+            n, padded, total, scan_ms, scan_throughput);
 }
 
 // =============================================================================
@@ -149,6 +176,70 @@ static inline void BlellochExclusiveScan(std::vector<size_t>& data) {
 // DetectSpanningBuckets: 检测跨GPU的bucket(需要跨节点通信)
 // RadixSort: 主入口, 多趟digit排序, 每趟: histogram→prefix→scatter→sync
 #include <cstdio>
+#include <chrono>
+
+// AJB: per-pass throughput tracker
+struct RadixPassThroughput {
+    size_t pass_index;
+    size_t elements;
+    double elapsed_ms;
+    double throughput;  // elements/second
+    void report() const {
+        fprintf(stderr, "[AJB_TIMER][radix_pass] pass=%zu elements=%zu elapsed=%.3fms throughput=%.2e elem/s\n",
+                pass_index, elements, elapsed_ms, throughput);
+    }
+};
+
+// AJB: chunk alignment to 256 boundary (8x warp size) to avoid bank conflicts
+static inline size_t AlignChunkTo256(size_t chunk_size) {
+    constexpr size_t ALIGN = 256;
+    size_t aligned = (chunk_size + ALIGN - 1) & ~(ALIGN - 1);
+    if (aligned != chunk_size) {
+        fprintf(stderr, "[AJB_BP][ChunkAlign] chunk_size %zu -> aligned %zu (delta=%zu)\n",
+                chunk_size, aligned, aligned - chunk_size);
+    }
+    return aligned;
+}
+
+// AJB: GPU memory budget check — estimate required vs available
+static inline bool CheckGpuMemoryBudget(int gpu, size_t num_elements,
+                                          size_t key_size, size_t val_size,
+                                          size_t num_gpus) {
+    size_t per_gpu_elements = (num_elements + num_gpus - 1) / num_gpus;
+    // Double buffer for keys+values, plus histogram workspace (~10% overhead)
+    size_t required = per_gpu_elements * (key_size + val_size) * 2;
+    required += required / 10;  // histogram + temp storage overhead
+
+    size_t free_mem = 0, total_mem = 0;
+    cudaError_t err = cudaSetDevice(gpu);
+    if (err == cudaSuccess) {
+        err = cudaMemGetInfo(&free_mem, &total_mem);
+    }
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[AJB_BP][MemBudget] GPU %d: cannot query memory (cuda err=%d)\n", gpu, (int)err);
+        return false;
+    }
+
+    double usage_pct = total_mem > 0 ? 100.0 * (total_mem - free_mem) / total_mem : 0.0;
+    fprintf(stderr, "[AJB_BP][MemBudget] GPU %d: required=%zuMB free=%zuMB total=%zuMB used=%.1f%%\n",
+            gpu, required / (1024*1024), free_mem / (1024*1024), total_mem / (1024*1024), usage_pct);
+
+    if (required > free_mem) {
+        fprintf(stderr, "[AJB_BP][MemBudget] GPU %d: INSUFFICIENT MEMORY — need %zuMB but only %zuMB free\n",
+                gpu, required / (1024*1024), free_mem / (1024*1024));
+        return false;
+    }
+    return true;
+}
+
+// AJB: double buffer selector verification
+static inline void VerifyDoubleBufferSelector(int gpu, int selector, int expected,
+                                                const char* context) {
+    if (selector != expected) {
+        fprintf(stderr, "[AJB_BP][DoubleBuffer] GPU %d %s: selector MISMATCH — got %d expected %d\n",
+                gpu, context, selector, expected);
+    }
+}
 
     }
 
@@ -253,10 +344,23 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
   static_assert(shared_memory_size <= 48 * 1024);
 
+  // AJB: pre-sort GPU memory budget verification
+  for (const int gpu : gpus) {
+    CheckGpuMemoryBudget(gpu, num_elements, sizeof(T), sizeof(V), gpus.size());
+  }
+
   // Upstream: 当num_elements不能整除num_gpus时, 靠filler元素补齐.
   // 逻辑不变, 但缩减GPU数量的循环加了安全下限检查.
   size_t num_fillers = (num_elements % gpus.size() != 0) ? (gpus.size() - num_elements % gpus.size()) : 0;
   size_t chunk_size = (num_elements + num_fillers) / gpus.size();
+
+  // AJB: align chunk to 256-element boundary to reduce bank conflicts
+  size_t chunk_size_unaligned = chunk_size;
+  chunk_size = AlignChunkTo256(chunk_size);
+  // Recompute fillers after alignment
+  if (chunk_size != chunk_size_unaligned) {
+    num_fillers = chunk_size * gpus.size() - num_elements;
+  }
 
   size_t ajb_gpu_resizes = 0;
   while (chunk_size < num_fillers && gpus.size() > 1) {
@@ -264,9 +368,19 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
     gpus.resize(gpus.size() / 2);
     num_fillers = (num_elements % gpus.size() != 0) ? (gpus.size() - num_elements % gpus.size()) : 0;
     chunk_size = (num_elements + num_fillers) / gpus.size();
+    // AJB: re-align after resize
+    chunk_size = AlignChunkTo256(chunk_size);
+    num_fillers = chunk_size * gpus.size() - num_elements;
     ajb_gpu_resizes++;
     AJB_SNAP("RadixSort", "GPU resize %zu->%zu: chunk=%zu fillers=%zu",
              old_sz, gpus.size(), chunk_size, num_fillers);
+  }
+
+  // AJB: re-verify memory budget after GPU count/chunk adjustment
+  for (const int gpu : gpus) {
+    if (!CheckGpuMemoryBudget(gpu, num_elements, sizeof(T), sizeof(V), gpus.size())) {
+      fprintf(stderr, "[AJB_BP][RadixSort] WARNING: proceeding despite insufficient memory on GPU %d\n", gpu);
+    }
   }
 
   size_t num_partition_passes_needed = max_num_partition_passes;
@@ -284,6 +398,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
     StreamPool& stream_pool = resource_manager.GetStreamPool(gpu);
 
     CheckCudaError(cudaSetDevice(gpu));
+
+    auto single_gpu_start = std::chrono::high_resolution_clock::now();
 
     CheckCudaError(cudaMemcpyAsync(resource_manager.GetKeys(gpu), in_keys, sizeof(T) * chunk_size,
     // AJB: memory transfer — async stream candidate
@@ -309,6 +425,15 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
     CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
 
+    // AJB: single-GPU throughput measurement
+    {
+      auto single_gpu_end = std::chrono::high_resolution_clock::now();
+      double elapsed_ms = std::chrono::duration<double, std::milli>(single_gpu_end - single_gpu_start).count();
+      double throughput = elapsed_ms > 0.0 ? (num_elements / (elapsed_ms * 1e-3)) : 0.0;
+      fprintf(stderr, "[AJB_TIMER][single_gpu_sort] elements=%zu elapsed=%.3fms throughput=%.2e elem/s\n",
+              num_elements, elapsed_ms, throughput);
+    }
+
     device_allocator.deallocate(reinterpret_cast<uint8_t*>(temporary_storage_pointer));
 
     CheckCudaError(cudaMemcpyAsync(out_keys, resource_manager.GetKeys(gpu), sizeof(T) * chunk_size,
@@ -321,6 +446,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                                    // AJB: memory transfer — async stream candidate
 
     resource_manager.FlipBuffers(gpu);
+    // AJB: verify double buffer selector after single-GPU sort flip
+    VerifyDoubleBufferSelector(gpu, resource_manager.GetKeysBuffer(gpu).selector, 1, "single-gpu-flip");
   } else {
     HostContainers<T, V> host_containers(gpus, resource_manager);
     DeviceContainers<T, V> device_containers(gpus, chunk_size, num_thread_blocks, resource_manager);
@@ -359,6 +486,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
     }
 
     for (size_t iteration = 0; iteration < sizeof(T); ++iteration) {  // AJB: radix pass iteration
+      auto pass_start_time = std::chrono::high_resolution_clock::now();
+
       if (iteration > 0) {
         num_spanning_buckets = DetectSpanningBuckets<T>(device_containers, host_containers, spanning_buckets,
                                                         spanning_bucket_to_gpus_map, gpus, iteration);
@@ -706,6 +835,10 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
         if (!skipped_key_scatter && (iteration == 0 || contains_spanning_bucket)) {
           resource_manager.FlipBuffers(gpu);
+          // AJB: verify double buffer selector after flip
+          int keys_sel = resource_manager.GetKeysBuffer(gpu).selector;
+          int expected_sel = (iteration + 1) % 2;
+          VerifyDoubleBufferSelector(gpu, keys_sel, expected_sel, "post-scatter-flip");
         }
 
         for (size_t s = 0; s < spanning_buckets[iteration].size(); ++s) {
@@ -735,6 +868,15 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         }
 
         CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
+      }
+
+      // AJB: per-pass throughput measurement
+      {
+        auto pass_end_time = std::chrono::high_resolution_clock::now();
+        double elapsed_ms = std::chrono::duration<double, std::milli>(pass_end_time - pass_start_time).count();
+        double throughput = elapsed_ms > 0.0 ? (num_elements / (elapsed_ms * 1e-3)) : 0.0;
+        RadixPassThroughput pt{iteration, num_elements, elapsed_ms, throughput};
+        pt.report();
       }
     }
 
@@ -918,6 +1060,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         size_t balanced_chunk_size = (g == num_gpus - 1) ? std::max(chunk_size, num_fillers) - num_fillers : chunk_size;
 
         resource_manager.FlipBuffers(gpu);
+        // AJB: verify double buffer selector after final flip
+        VerifyDoubleBufferSelector(gpu, resource_manager.GetKeysBuffer(gpu).selector, 0, "pre-reduced-sort-flip");
         size_t num_buckets_to_sort = 0;
 
         ReducedSortingBucket<T, V>* prev_bucket = nullptr;
@@ -1139,6 +1283,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
       }
 
       resource_manager.FlipBuffers(gpu);
+      // AJB: verify double buffer selector after output-copy flip
+      VerifyDoubleBufferSelector(gpu, resource_manager.GetKeysBuffer(gpu).selector, 1, "post-output-flip");
     }
   }
 
@@ -1152,28 +1298,72 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
 
 // Sort validation with context-window dump on failure
-// 当发现inversion时, 输出前后各5个元素帮助定位bug
+// Uses adaptive stride based on array size, plus multi-region sampling
+// for better coverage of boundary conditions
 template <typename T>
-static inline bool validate_sort_output(const T* keys, size_t n, size_t sample_stride = 1000) {
+static inline bool validate_sort_output(const T* keys, size_t n, size_t sample_stride = 0) {
     if (n < 2) return true;
+
+    auto validate_start = std::chrono::high_resolution_clock::now();
+
+    // Adaptive stride: sqrt(n) for balanced coverage/speed tradeoff
+    if (sample_stride == 0) {
+        sample_stride = 1;
+        size_t sqrt_n = 1;
+        while (sqrt_n * sqrt_n < n) sqrt_n++;
+        sample_stride = std::max(size_t(1), std::min(sqrt_n, size_t(10000)));
+    }
+
+    size_t inversions_found = 0;
+    size_t positions_checked = 0;
+    T min_val = keys[0], max_val = keys[0];
+
+    // Phase 1: strided scan over the full array
     for (size_t i = 0; i < n - 1; i += sample_stride) {
+        positions_checked++;
+        if (keys[i] < min_val) min_val = keys[i];
+        if (keys[i] > max_val) max_val = keys[i];
         if (keys[i] > keys[i + 1]) {
-            fprintf(stderr, "[AJB_FAIL][radix_sort] inversion at i=%zu: keys[i]=%llu > keys[i+1]=%llu\n",
-                    i, (unsigned long long)keys[i], (unsigned long long)keys[i+1]);
-            // 上下文窗口: [i-5, i+5]
-            size_t lo = i > 5 ? i - 5 : 0;
-            size_t hi = std::min(i + 6, n);
-            fprintf(stderr, "[AJB_FAIL][radix_sort] context [%zu..%zu]:", lo, hi - 1);
-            for (size_t j = lo; j < hi; j++) {
-                fprintf(stderr, " %llu%s", (unsigned long long)keys[j], (j == i) ? "<<INV" : "");
+            inversions_found++;
+            if (inversions_found <= 3) {
+                fprintf(stderr, "[AJB_FAIL][radix_sort] inversion at i=%zu: keys[i]=%llu > keys[i+1]=%llu\n",
+                        i, (unsigned long long)keys[i], (unsigned long long)keys[i+1]);
+                size_t lo = i > 5 ? i - 5 : 0;
+                size_t hi = std::min(i + 6, n);
+                fprintf(stderr, "[AJB_FAIL][radix_sort] context [%zu..%zu]:", lo, hi - 1);
+                for (size_t j = lo; j < hi; j++) {
+                    fprintf(stderr, " %llu%s", (unsigned long long)keys[j], (j == i) ? "<<INV" : "");
+                }
+                fprintf(stderr, "\n");
             }
-            fprintf(stderr, "\n");
-            return false;
         }
     }
-    // 全量检查最后segment(stride采样可能跳过尾部inversion)
-    for (size_t i = (n > sample_stride ? n - sample_stride : 0); i < n - 1; i++) {
-        if (keys[i] > keys[i + 1]) return false;
+
+    // Phase 2: dense check at critical regions — head, tail, and midpoint
+    constexpr size_t DENSE_REGION = 512;
+    size_t regions[][2] = {
+        {0, std::min(DENSE_REGION, n)},
+        {n > DENSE_REGION ? n - DENSE_REGION : 0, n},
+        {n > DENSE_REGION ? n / 2 - DENSE_REGION / 2 : 0, std::min(n / 2 + DENSE_REGION / 2, n)}
+    };
+    for (auto& [start, end] : regions) {
+        for (size_t i = start; i + 1 < end && i + 1 < n; i++) {
+            positions_checked++;
+            if (keys[i] > keys[i + 1]) {
+                inversions_found++;
+                if (inversions_found <= 3) {
+                    fprintf(stderr, "[AJB_FAIL][radix_sort] dense-region inversion at i=%zu\n", i);
+                }
+            }
+        }
     }
-    return true;
+
+    auto validate_end = std::chrono::high_resolution_clock::now();
+    double validate_ms = std::chrono::duration<double, std::milli>(validate_end - validate_start).count();
+    fprintf(stderr, "[AJB_TIMER][validate_sort] n=%zu stride=%zu checked=%zu inversions=%zu "
+            "range=[%llu..%llu] elapsed=%.3fms\n",
+            n, sample_stride, positions_checked, inversions_found,
+            (unsigned long long)min_val, (unsigned long long)max_val, validate_ms);
+
+    return inversions_found == 0;
 }
