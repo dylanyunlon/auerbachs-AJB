@@ -119,6 +119,103 @@ public:
     RRAccessTree access_tree;
     BanPickTree bp;
 
+    // --- M1126: Branch-and-bound pruning state ---
+    // Tracks the best known result cost.  When a partial enumeration
+    // path exceeds best_known * pruning_factor, we prune that branch
+    // entirely.  This dramatically reduces the search space for
+    // large join queries where most paths are suboptimal.
+    struct BranchAndBound {
+        double best_known_cost = 1e18;    // best complete plan cost seen so far
+        double pruning_factor  = 1.5;     // prune when partial > best * factor
+        long long pruned_count = 0;       // branches pruned
+        long long evaluated_count = 0;    // branches fully evaluated
+        long long total_branches = 0;     // total branches encountered
+
+        // Check if a partial plan should be pruned
+        bool shouldPrune(double partial_cost) {
+            total_branches++;
+            if (partial_cost > best_known_cost * pruning_factor) {
+                pruned_count++;
+                return true;
+            }
+            return false;
+        }
+
+        // Update best known cost after completing a plan
+        void updateBest(double cost) {
+            evaluated_count++;
+            if (cost < best_known_cost) {
+                best_known_cost = cost;
+                fprintf(stderr, "[AJB_BP][B&B] new best_cost=%.2f (eval=%lld pruned=%lld rate=%.2f%%)\n",
+                        cost, evaluated_count, pruned_count,
+                        total_branches > 0 ? 100.0 * pruned_count / total_branches : 0.0);
+            }
+        }
+
+        double pruningRate() const {
+            return total_branches > 0 ? (double)pruned_count / total_branches : 0.0;
+        }
+
+        void dump() const {
+            fprintf(stderr, "[AJB_BP][B&B] best=%.2f pruned=%lld/%lld (%.2f%%) evaluated=%lld\n",
+                    best_known_cost, pruned_count, total_branches,
+                    pruningRate() * 100.0, evaluated_count);
+        }
+    } bnb_state;
+
+    // --- M1127: Adaptive DP memoization table ---
+    // The memoization table for subplan costs starts small and grows
+    // as more subproblems are encountered.  When memory pressure is
+    // high (table > threshold), we evict entries with highest cost
+    // (least useful for pruning).
+    struct AdaptiveMemo {
+        std::unordered_map<size_t, double> table;
+        size_t max_entries = 1 << 16;   // initial cap: 64K entries
+        size_t evictions = 0;
+
+        bool lookup(size_t key, double& cost) const {
+            auto it = table.find(key);
+            if (it != table.end()) {
+                cost = it->second;
+                return true;
+            }
+            return false;
+        }
+
+        void insert(size_t key, double cost) {
+            if (table.size() >= max_entries) {
+                evict_worst();
+            }
+            table[key] = cost;
+        }
+
+        // Evict entries with highest cost (they provide least pruning benefit)
+        void evict_worst() {
+            if (table.empty()) return;
+            // Find and remove the entry with maximum cost
+            auto worst = table.begin();
+            for (auto it = table.begin(); it != table.end(); ++it) {
+                if (it->second > worst->second) worst = it;
+            }
+            table.erase(worst);
+            evictions++;
+        }
+
+        // Grow the table when pruning rate is high (table is effective)
+        void adaptSize(double pruning_rate) {
+            if (pruning_rate > 0.3 && max_entries < (1ULL << 24)) {
+                max_entries *= 2;
+                fprintf(stderr, "[AJB_BP][AdaptiveMemo] grew to max=%zu (pruning_rate=%.2f)\n",
+                        max_entries, pruning_rate);
+            }
+        }
+
+        void dump() const {
+            fprintf(stderr, "[AJB_BP][AdaptiveMemo] entries=%zu max=%zu evictions=%zu\n",
+                    table.size(), max_entries, evictions);
+        }
+    } memo;
+
     // [AJB] M913: dedup hash set — 只在AJB_DEBUG模式下启用
     // 用于检测算法正确性: 如果同一个元组被enumerate两次说明有bug
 #ifdef AJB_DEBUG
@@ -303,6 +400,11 @@ public:
 
         // [AJB_TIMER] final summary: 成功数/尝试数/ban数/wall time
         ajb_enum_stats.last_hit_rate = cnt > 0 ? (double)cntsuccess / cnt : 0.0;
+        // M1126: Branch-and-bound summary
+        bnb_state.dump();
+        memo.dump();
+        // Adapt memo size based on pruning effectiveness
+        memo.adaptSize(bnb_state.pruningRate());
 #ifdef AJB_DEBUG
         fprintf(stderr, "[AJB_TIMER][Enumerator] done: success=%d attempts=%d hit_rate=%.6f cpu=%.3fs wall=%.3fs\n",
                 cntsuccess, cnt, ajb_enum_stats.last_hit_rate, elapsed, wall_sec);

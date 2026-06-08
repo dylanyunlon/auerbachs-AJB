@@ -41,6 +41,103 @@ static inline void AjbBatchDealloc(DeviceAllocator& alloc,
     ptrs.clear();
 }
 
+// --- M1116: Adaptive radix bit-width selection ---
+// Traditional radix sort uses a fixed 8-bit radix (256 buckets).
+// For narrow-range keys (e.g., join keys from small-domain columns),
+// fewer bits per pass reduce the number of buckets and histogram memory.
+// For wide-range keys, 11-bit radix (2048 buckets) reduces pass count.
+// This function inspects the data range and returns the optimal radix bits.
+struct AdaptiveRadixConfig {
+    uint32_t radix_bits;       // bits per radix pass
+    uint32_t num_passes;       // total passes needed for key_bits
+    uint32_t num_buckets;      // 2^radix_bits
+    double   estimated_work;   // relative work estimate (passes * buckets)
+};
+
+static inline AdaptiveRadixConfig SelectRadixBitWidth(
+    uint64_t key_range, uint32_t key_bits, size_t num_elements) {
+    // Candidate radix widths to evaluate
+    constexpr uint32_t candidates[] = {4, 8, 11};
+    constexpr size_t num_candidates = 3;
+
+    AdaptiveRadixConfig best = {8, 0, 256, 1e18};
+
+    for (size_t c = 0; c < num_candidates; ++c) {
+        uint32_t bits = candidates[c];
+        uint32_t passes = (key_bits + bits - 1) / bits;
+        uint32_t buckets = 1u << bits;
+
+        // Work model: each pass scans all elements and updates `buckets` counters.
+        // Memory pressure scales with buckets; compute scales with passes * elements.
+        // We approximate total work as passes * (elements + buckets * cache_miss_penalty)
+        double cache_penalty = buckets > 512 ? 2.0 : 1.0;  // L1 pressure heuristic
+        double work = passes * (num_elements + buckets * cache_penalty * 64.0);
+
+        if (work < best.estimated_work) {
+            best = {bits, passes, buckets, work};
+        }
+    }
+
+    // If key range is very small, we can reduce effective key bits
+    if (key_range > 0) {
+        uint32_t effective_bits = 64 - __builtin_clzll(key_range);
+        if (effective_bits < key_bits) {
+            uint32_t alt_passes = (effective_bits + best.radix_bits - 1) / best.radix_bits;
+            if (alt_passes < best.num_passes) {
+                best.num_passes = alt_passes;
+                best.estimated_work *= (double)alt_passes / ((key_bits + best.radix_bits - 1) / best.radix_bits);
+            }
+        }
+    }
+
+    fprintf(stderr, "[AJB_BP][AdaptiveRadix] range=%llu key_bits=%u -> radix_bits=%u passes=%u buckets=%u work=%.0f\n",
+            (unsigned long long)key_range, key_bits,
+            best.radix_bits, best.num_passes, best.num_buckets, best.estimated_work);
+    return best;
+}
+
+// --- M1117: Blelloch exclusive prefix-sum (scan) ---
+// The upstream code uses a sequential scan for histogram prefix sums.
+// Blelloch's work-efficient parallel scan has two phases:
+//   1. Up-sweep (reduce): build partial sums in a balanced binary tree
+//   2. Down-sweep: propagate prefix sums using the tree
+// This CPU-side implementation processes histogram arrays before GPU dispatch.
+static inline void BlellochExclusiveScan(std::vector<size_t>& data) {
+    size_t n = data.size();
+    if (n == 0) return;
+
+    // Pad to next power of 2
+    size_t padded = 1;
+    while (padded < n) padded <<= 1;
+    data.resize(padded, 0);
+
+    // Up-sweep (reduce phase)
+    for (size_t stride = 1; stride < padded; stride <<= 1) {
+        for (size_t i = 0; i < padded; i += stride * 2) {
+            data[i + stride * 2 - 1] += data[i + stride - 1];
+        }
+    }
+
+    // Set root to zero (exclusive scan identity)
+    size_t total = data[padded - 1];
+    data[padded - 1] = 0;
+
+    // Down-sweep phase
+    for (size_t stride = padded >> 1; stride >= 1; stride >>= 1) {
+        for (size_t i = 0; i < padded; i += stride * 2) {
+            size_t temp = data[i + stride - 1];
+            data[i + stride - 1] = data[i + stride * 2 - 1];
+            data[i + stride * 2 - 1] += temp;
+        }
+    }
+
+    // Trim back to original size
+    data.resize(n);
+
+    fprintf(stderr, "[AJB_BP][BlellochScan] n=%zu padded=%zu total=%zu\n",
+            n, padded, total);
+}
+
 // =============================================================================
 // radix_sort.cuh — Multi-GPU radix sort (AJB-instrumented, enhanced)
 //

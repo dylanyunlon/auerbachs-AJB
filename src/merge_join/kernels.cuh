@@ -94,3 +94,54 @@ __global__ void __launch_bounds__(kNumJoinThreads, blocks_per_multi_processor)
     materialized[at] = ranges;
   }
 }
+
+// --- M1121: SIMD-friendly 4-way key comparison for 32-bit keys ---
+// When join keys are 32-bit integers, we can compare 4 keys simultaneously
+// using 128-bit SIMD registers (or GPU warp shuffle).  This helper packs
+// 4 comparison results into a bitmask for branchless processing.
+// Returns a 4-bit mask where bit i is set if keys_a[i] == keys_b[i].
+__device__ __forceinline__
+unsigned int SimdCompare4x32(const int* keys_a, const int* keys_b) {
+    unsigned int mask = 0;
+    // Manual unroll of 4-way comparison — compiler maps to VSETP on SM80+
+    mask |= (keys_a[0] == keys_b[0]) ? 1u : 0u;
+    mask |= (keys_a[1] == keys_b[1]) ? 2u : 0u;
+    mask |= (keys_a[2] == keys_b[2]) ? 4u : 0u;
+    mask |= (keys_a[3] == keys_b[3]) ? 8u : 0u;
+    return mask;
+}
+
+// Population count of match mask — gives the number of matching pairs
+__device__ __forceinline__
+int SimdMatchCount4(unsigned int mask) {
+    return __popc(mask);  // PTX popc instruction
+}
+
+// --- M1122: Branch-free merge path binary search ---
+// Standard merge path binary search uses if/else branches which cause
+// warp divergence on GPU.  This version uses conditional move (ternary)
+// which the CUDA compiler maps to SELP instructions (no branch).
+template <typename T>
+__device__ __forceinline__
+long long BranchFreeMergePathSearch(
+    const T* a, long long a_len,
+    const T* b, long long b_len,
+    long long diag) {
+
+    long long lo = (diag > b_len) ? (diag - b_len) : 0;
+    long long hi = (diag < a_len) ? diag : a_len;
+
+    // Binary search iterations — all use conditional assignment, no branch
+    while (lo < hi) {
+        long long mid = lo + ((hi - lo) >> 1);
+        long long b_idx = diag - 1 - mid;
+
+        // Branch-free: both paths compute, select result via ternary
+        int cmp = (b_idx >= 0 && b_idx < b_len && mid < a_len) ?
+                  (a[mid] > b[b_idx] ? 1 : 0) : 0;
+        lo = cmp ? lo : (mid + 1);
+        hi = cmp ? mid : hi;
+    }
+
+    return lo;
+}

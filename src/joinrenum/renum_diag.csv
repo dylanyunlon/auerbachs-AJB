@@ -1,2 +1,2 @@
 probe_time_sec,num_samples,total_tuples,distinct_keys,cv,normalized_skew,is_high_skew,K_x,K_u,K_v
-0.00115588,500,0,0,0,0,0,16,8,8
+0.00104873,500,0,0,0,0,0,16,8,8

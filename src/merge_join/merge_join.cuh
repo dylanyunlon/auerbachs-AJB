@@ -65,6 +65,87 @@ longlong2 FindBounds(T* data, long long count, const T& key) {
   return {LastSmaller(data, count, key) + 1, FirstGreater(data, count, key)};
 }
 
+// --- M1123: Output buffer size prediction ---
+// Predicts the join output size based on historical chunk selectivities.
+// Avoids GPU memory over-allocation (wasting VRAM) and under-allocation
+// (causing re-allocation and data copy mid-kernel).
+// Uses exponential moving average of observed selectivity across chunks.
+struct JoinOutputPredictor {
+  double ema_selectivity = 0.0;   // running average of (output/input) ratio
+  double ema_alpha = 0.2;         // smoothing factor
+  long long total_input = 0;
+  long long total_output = 0;
+  int num_observations = 0;
+
+  // Record one chunk's observed selectivity
+  void observe(long long input_size, long long output_size) {
+    if (input_size <= 0) return;
+    double sel = static_cast<double>(output_size) / input_size;
+    num_observations++;
+    if (num_observations == 1) {
+      ema_selectivity = sel;
+    } else {
+      ema_selectivity = ema_alpha * sel + (1.0 - ema_alpha) * ema_selectivity;
+    }
+    total_input += input_size;
+    total_output += output_size;
+
+    if (num_observations % 100 == 0) {
+      fprintf(stderr, "[AJB_BP][JoinPredict] obs=%d ema_sel=%.6f cumulative_sel=%.6f\n",
+              num_observations, ema_selectivity,
+              total_input > 0 ? (double)total_output / total_input : 0.0);
+    }
+  }
+
+  // Predict output size for a new chunk, with safety margin
+  long long predict(long long input_size, double safety_factor = 1.5) const {
+    if (num_observations == 0) {
+      // No history: assume 1:1 selectivity (conservative)
+      return static_cast<long long>(input_size * safety_factor);
+    }
+    double predicted = input_size * ema_selectivity * safety_factor;
+    // Floor at 1024 elements to avoid pathological tiny allocations
+    return std::max(static_cast<long long>(predicted), 1024LL);
+  }
+};
+
+// --- M1124: Adaptive chunk count ---
+// Determines optimal number of chunks for partitioned merge join based
+// on available GPU memory and predicted output size.
+// More chunks → less memory per chunk (fits in VRAM) but more kernel
+// launches.  Fewer chunks → better GPU utilization but may OOM.
+static inline long long AdaptiveChunkCount(
+    long long total_r, long long total_s,
+    size_t available_gpu_bytes, size_t key_bytes,
+    const JoinOutputPredictor& predictor) {
+
+  // Each chunk needs: input_r + input_s + output buffer + scratch
+  // We target each chunk using at most 25% of available GPU memory
+  size_t target_per_chunk = available_gpu_bytes / 4;
+  size_t element_size = key_bytes + sizeof(long long);  // key + row_id
+
+  // Input elements per chunk
+  long long total_elements = total_r + total_s;
+  long long elements_per_chunk = static_cast<long long>(target_per_chunk / element_size);
+  if (elements_per_chunk <= 0) elements_per_chunk = 1024;
+
+  // Predicted output adds to memory pressure
+  long long predicted_out = predictor.predict(elements_per_chunk, 1.0);
+  long long adjusted_capacity = elements_per_chunk -
+      std::min(predicted_out, elements_per_chunk / 2);
+  if (adjusted_capacity < 512) adjusted_capacity = 512;
+
+  long long chunks = (total_elements + adjusted_capacity - 1) / adjusted_capacity;
+  if (chunks < 1) chunks = 1;
+  if (chunks > 4096) chunks = 4096;  // cap for sanity
+
+  fprintf(stderr, "[AJB_BP][AdaptiveChunk] total=%lld avail_gpu=%zuB chunks=%lld "
+          "per_chunk=%lld predicted_out=%lld\n",
+          total_elements, available_gpu_bytes, chunks,
+          adjusted_capacity, predicted_out);
+  return chunks;
+}
+
 // Upstream: the body of HandleLongKeyRanges contains 7 nearly identical
 // copies of  FindBounds → if (x < y) → count += → materialize → update
 // next_start.  Each is ~8 lines, making a 205-line function where ~60%

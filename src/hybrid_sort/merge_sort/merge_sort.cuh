@@ -20,6 +20,88 @@
 #include "hybrid_sort/resource_manager.cuh"
 #include "kernels.cuh"
 
+// --- M1118: Adaptive tile size computation ---
+// Optimal merge sort tile size depends on L2 cache size and key width.
+// Too-small tiles → excessive merge passes; too-large → cache thrashing.
+// We target 2 tiles fitting in L2 (one per merge input), with a minimum
+// of 1024 elements for GPU warp utilization.
+struct AdaptiveTileConfig {
+    size_t tile_elements;    // elements per tile
+    size_t tile_bytes;       // bytes per tile
+    size_t merge_passes;     // estimated passes for total_elements
+    size_t l2_utilization;   // percentage of L2 used by 2 tiles
+};
+
+static inline AdaptiveTileConfig ComputeAdaptiveTile(
+    size_t total_elements, size_t key_bytes, size_t l2_cache_bytes = 6 * 1024 * 1024) {
+    // Each merge step reads from 2 tiles simultaneously
+    size_t available_per_tile = l2_cache_bytes / 2;
+    size_t element_size = key_bytes + sizeof(uint32_t);  // key + value (index)
+    size_t max_tile = available_per_tile / element_size;
+
+    // Clamp to power of 2 for efficient indexing
+    size_t tile = 1;
+    while (tile * 2 <= max_tile) tile *= 2;
+
+    // Minimum tile size for GPU efficiency
+    constexpr size_t MIN_TILE = 1024;
+    if (tile < MIN_TILE) tile = MIN_TILE;
+
+    // Don't exceed total elements
+    if (tile > total_elements) tile = total_elements;
+
+    // Compute merge pass count: ceil(log2(total_elements / tile))
+    size_t passes = 0;
+    size_t merged = tile;
+    while (merged < total_elements) {
+        merged *= 2;
+        passes++;
+    }
+
+    size_t util = l2_cache_bytes > 0 ? (2 * tile * element_size * 100) / l2_cache_bytes : 0;
+
+    fprintf(stderr, "[AJB_BP][AdaptiveTile] elements=%zu key_bytes=%zu tile=%zu passes=%zu L2_util=%zu%%\n",
+            total_elements, key_bytes, tile, passes, util);
+
+    return {tile, tile * element_size, passes, util};
+}
+
+// --- M1119: Sentinel-free merge path ---
+// Traditional GPU merge sort uses INF sentinel values at the end of each
+// sorted run to simplify boundary checks.  This wastes memory (padding)
+// and can cause issues with non-numeric key types.
+// The sentinel-free approach tracks explicit end pointers and uses a
+// three-way branch: left exhausted, right exhausted, or compare.
+template <typename T>
+static inline void SentinelFreeMerge(
+    const T* left, size_t left_n,
+    const T* right, size_t right_n,
+    T* output) {
+    size_t li = 0, ri = 0, oi = 0;
+    size_t total = left_n + right_n;
+
+    // Main merge loop with explicit boundary checks (no sentinel)
+    while (oi < total) {
+        if (li >= left_n) {
+            // Left exhausted: copy remaining right
+            while (ri < right_n) output[oi++] = right[ri++];
+        } else if (ri >= right_n) {
+            // Right exhausted: copy remaining left
+            while (li < left_n) output[oi++] = left[li++];
+        } else {
+            // Both active: compare and advance
+            if (left[li] <= right[ri]) {
+                output[oi++] = left[li++];
+            } else {
+                output[oi++] = right[ri++];
+            }
+        }
+    }
+
+    fprintf(stderr, "[AJB_BP][SentinelFreeMerge] left=%zu right=%zu total=%zu\n",
+            left_n, right_n, total);
+}
+
 // Upstream FindPivot: 6 separate allocate / deallocate calls (3 host,
 // 3 device).  Each allocator call is a potential synchronization point
 // and bookkeeping overhead.

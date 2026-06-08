@@ -121,3 +121,68 @@ struct JoinResult {
     }
   }
 };
+
+// --- M1123: Flajolet-Martin probabilistic distinct count sketch ---
+// Estimates the number of distinct join keys without storing all keys.
+// Uses multiple hash functions (simulated via seed variation) and takes
+// the harmonic mean of the max-trailing-zeros estimates (LogLog variant).
+// Memory: O(num_buckets) instead of O(distinct_keys).
+class FlajoletMartinSketch {
+ public:
+  explicit FlajoletMartinSketch(size_t num_buckets = 64)
+      : num_buckets_(num_buckets), max_trailing_(num_buckets, 0) {}
+
+  void Insert(size_t key_hash) {
+    // Use top bits for bucket selection, bottom bits for trailing zeros
+    size_t bucket = key_hash % num_buckets_;
+    // Count trailing zeros as the rank estimator
+    int tz = 0;
+    size_t shifted = key_hash / num_buckets_;  // remove bucket bits
+    if (shifted == 0) {
+      tz = 0;
+    } else {
+      while ((shifted & 1) == 0) { tz++; shifted >>= 1; }
+    }
+    if (tz > max_trailing_[bucket]) {
+      max_trailing_[bucket] = tz;
+    }
+    total_inserted_++;
+  }
+
+  // Estimate distinct count using harmonic mean (SuperLogLog correction)
+  double EstimateDistinct() const {
+    // Harmonic mean of 2^max_trailing across buckets
+    double sum_inv = 0.0;
+    int active_buckets = 0;
+    for (size_t b = 0; b < num_buckets_; ++b) {
+      if (max_trailing_[b] > 0 || total_inserted_ > 0) {
+        sum_inv += 1.0 / (1ULL << max_trailing_[b]);
+        active_buckets++;
+      }
+    }
+    if (active_buckets == 0 || sum_inv <= 0.0) return 0.0;
+
+    // Alpha correction factor (depends on bucket count)
+    double alpha = 0.7213 / (1.0 + 1.079 / num_buckets_);
+    double estimate = alpha * active_buckets * active_buckets / sum_inv;
+
+    fprintf(stderr, "[AJB_BP][FMSketch] buckets=%zu inserted=%zu estimate=%.0f active=%d\n",
+            num_buckets_, total_inserted_, estimate, active_buckets);
+    return estimate;
+  }
+
+  // Merge two sketches (for parallel processing)
+  void Merge(const FlajoletMartinSketch& other) {
+    for (size_t b = 0; b < num_buckets_ && b < other.num_buckets_; ++b) {
+      if (other.max_trailing_[b] > max_trailing_[b]) {
+        max_trailing_[b] = other.max_trailing_[b];
+      }
+    }
+    total_inserted_ += other.total_inserted_;
+  }
+
+ private:
+  size_t num_buckets_;
+  std::vector<int> max_trailing_;
+  size_t total_inserted_ = 0;
+};

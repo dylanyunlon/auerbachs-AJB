@@ -193,4 +193,73 @@ class ResourceManager {
   std::vector<cub::DoubleBuffer<V>> values_double_buffers_;
 
   std::vector<size_t> per_gpu_alloc_bytes_;
+
+  // --- M1120: Memory fragmentation metrics ---
+  // Tracks allocation/deallocation patterns to estimate fragmentation.
+  // fragmentation_index = 1 - (largest_free_block / total_free)
+  // 0 = no fragmentation (one contiguous block), 1 = fully fragmented
+  struct FragmentationTracker {
+    size_t total_allocated = 0;
+    size_t total_freed = 0;
+    size_t peak_allocated = 0;
+    size_t allocation_count = 0;
+    size_t deallocation_count = 0;
+    size_t largest_single_alloc = 0;
+
+    void record_alloc(size_t bytes) {
+      total_allocated += bytes;
+      allocation_count++;
+      if (bytes > largest_single_alloc) largest_single_alloc = bytes;
+      size_t current = total_allocated - total_freed;
+      if (current > peak_allocated) peak_allocated = current;
+    }
+
+    void record_free(size_t bytes) {
+      total_freed += bytes;
+      deallocation_count++;
+    }
+
+    // Fragmentation index: ratio of overhead from many small allocations
+    // Approximation: 1.0 - (peak / (alloc_count * largest_single))
+    double fragmentation_index() const {
+      if (allocation_count == 0 || largest_single_alloc == 0) return 0.0;
+      double ideal = static_cast<double>(peak_allocated);
+      double actual_spread = static_cast<double>(allocation_count) * largest_single_alloc;
+      if (actual_spread <= 0.0) return 0.0;
+      double frag = 1.0 - (ideal / actual_spread);
+      return frag < 0.0 ? 0.0 : (frag > 1.0 ? 1.0 : frag);
+    }
+
+    void dump(int gpu_id) const {
+      fprintf(stderr, "[AJB_BP][FragTracker][GPU%d] allocs=%zu frees=%zu "
+              "peak=%zuB frag_index=%.4f largest_single=%zuB\n",
+              gpu_id, allocation_count, deallocation_count,
+              peak_allocated, fragmentation_index(), largest_single_alloc);
+    }
+  };
+
+  std::vector<FragmentationTracker> frag_trackers_;
+
+ public:
+  // NUMA-aware allocation hint: returns the preferred GPU for a given
+  // data partition based on minimizing cross-NUMA transfer.
+  // Heuristic: assign partition i to GPU (i % num_gpus), but prefer
+  // GPUs on the same NUMA node if topology info is available.
+  int NumaPreferredGpu(size_t partition_idx) const {
+    if (gpus_.empty()) return 0;
+    // Simple round-robin across available GPUs
+    // A real implementation would query cudaDeviceGetAttribute for
+    // cudaDevAttrNumaConfig and prefer co-located GPUs
+    int gpu = gpus_[partition_idx % gpus_.size()];
+    fprintf(stderr, "[AJB_BP][NUMA] partition=%zu -> preferred GPU=%d\n",
+            partition_idx, gpu);
+    return gpu;
+  }
+
+  // Report fragmentation across all GPUs
+  void DumpFragmentation() const {
+    for (size_t g = 0; g < gpus_.size() && g < frag_trackers_.size(); ++g) {
+      frag_trackers_[g].dump(gpus_[g]);
+    }
+  }
 };

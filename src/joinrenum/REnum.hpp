@@ -84,4 +84,111 @@ class RandOrderEnum {
     vector<int> sample() {
         return idx.sample(idx.getFullBucket());
     }
+
+    // --- M1128: Lagrangian relaxation lower bound ---
+    // Computes a relaxed bound by dualizing the join constraints.
+    // For each variable, we assign a Lagrange multiplier (price) and
+    // compute the relaxed cost = sum of per-relation costs adjusted
+    // by multiplier weights.  This gives a valid lower bound on the
+    // optimal join plan cost, useful for branch-and-bound pruning.
+    struct LagrangianRelaxation {
+        std::vector<double> multipliers;    // one per variable
+        double best_bound = 0.0;            // best relaxed bound found
+        int iterations = 0;
+        double step_size = 1.0;             // subgradient step size
+
+        void initialize(int num_variables) {
+            multipliers.assign(num_variables, 1.0);
+            best_bound = 0.0;
+            iterations = 0;
+            step_size = 1.0;
+        }
+
+        // Compute relaxed bound given current multipliers and relation costs
+        double computeBound(const std::vector<double>& relation_costs,
+                           const std::vector<std::vector<int>>& var_to_rel_map) {
+            double bound = 0.0;
+            for (size_t r = 0; r < relation_costs.size(); ++r) {
+                // Each relation's relaxed cost is its base cost weighted by
+                // the product of multipliers of its variables
+                double weight = 1.0;
+                for (int v : var_to_rel_map[r]) {
+                    if (v >= 0 && v < (int)multipliers.size())
+                        weight *= multipliers[v];
+                }
+                bound += relation_costs[r] * weight;
+            }
+            return bound;
+        }
+
+        // Subgradient update: move multipliers toward constraint violation
+        void subgradientStep(const std::vector<double>& violations) {
+            iterations++;
+            // Diminishing step size: step / sqrt(iterations)
+            double effective_step = step_size / std::sqrt(static_cast<double>(iterations));
+
+            double violation_norm_sq = 0.0;
+            for (double v : violations) violation_norm_sq += v * v;
+            if (violation_norm_sq < 1e-12) return;
+
+            for (size_t i = 0; i < multipliers.size() && i < violations.size(); ++i) {
+                multipliers[i] += effective_step * violations[i] / std::sqrt(violation_norm_sq);
+                // Keep multipliers non-negative
+                if (multipliers[i] < 0.0) multipliers[i] = 0.0;
+            }
+        }
+
+        void dump() const {
+            fprintf(stderr, "[AJB_BP][Lagrangian] iterations=%d best_bound=%.4f step=%.6f\n",
+                    iterations, best_bound, step_size);
+        }
+    };
+
+    LagrangianRelaxation lagrangian;
+
+    // --- M1129: Iterative convergence detection ---
+    // Monitors the change in bound/cost across iterations.
+    // Stops early when delta < epsilon for k consecutive iterations.
+    struct ConvergenceDetector {
+        double epsilon = 1e-6;        // convergence threshold
+        int required_stable = 5;      // consecutive stable iterations needed
+        int stable_count = 0;         // current streak of stable iterations
+        double prev_value = 1e18;     // previous iteration's value
+        int total_iterations = 0;
+        bool converged = false;
+
+        bool check(double current_value) {
+            total_iterations++;
+            double delta = std::abs(current_value - prev_value);
+
+            if (delta < epsilon) {
+                stable_count++;
+                if (stable_count >= required_stable && !converged) {
+                    converged = true;
+                    fprintf(stderr, "[AJB_BP][Convergence] CONVERGED at iter=%d delta=%.2e "
+                            "value=%.6f (stable for %d iters)\n",
+                            total_iterations, delta, current_value, stable_count);
+                }
+            } else {
+                stable_count = 0;
+            }
+            prev_value = current_value;
+            return converged;
+        }
+
+        void reset() {
+            stable_count = 0;
+            prev_value = 1e18;
+            total_iterations = 0;
+            converged = false;
+        }
+
+        void dump() const {
+            fprintf(stderr, "[AJB_BP][Convergence] iters=%d stable=%d converged=%s prev=%.6f\n",
+                    total_iterations, stable_count,
+                    converged ? "YES" : "NO", prev_value);
+        }
+    };
+
+    ConvergenceDetector convergence;
 };

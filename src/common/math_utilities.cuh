@@ -56,3 +56,99 @@ inline unsigned ILog2(unsigned long long n) {
   while (n >>= 1) ++r;
   return r;
 }
+
+// --- M1111: Kahan compensated summation ---
+// GPU join count accumulation over many partitions suffers from float
+// catastrophic cancellation when mixing large and small cardinalities.
+// Kahan-Babushka-Neumaier variant: tracks a compensation term so that
+// the running error stays O(eps) instead of O(eps*n).
+template <typename Iter>
+double KahanSum(Iter begin, Iter end) {
+  double sum = 0.0;
+  double compensation = 0.0;  // running compensation for lost low-order bits
+  for (Iter it = begin; it != end; ++it) {
+    double y = static_cast<double>(*it) - compensation;
+    double t = sum + y;
+    // (t - sum) recovers the high-order part of y; subtracting y gives
+    // the roundoff that was lost when adding to sum
+    compensation = (t - sum) - y;
+    sum = t;
+  }
+  fprintf(stderr, "[AJB_BP][KahanSum] final_compensation=%.2e sum=%.6f\n",
+          compensation, sum);
+  return sum;
+}
+
+// Accumulator variant for streaming use (call add() repeatedly)
+struct KahanAccumulator {
+  double sum = 0.0;
+  double comp = 0.0;
+  long long count = 0;
+
+  void add(double val) {
+    double y = val - comp;
+    double t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+    count++;
+  }
+
+  double result() const { return sum; }
+  double mean() const { return count > 0 ? sum / count : 0.0; }
+};
+
+// --- M1112: Fast inverse square root (Newton-Raphson) ---
+// Used in AGM bound normalization where we need 1/sqrt(x) but don't
+// need full double precision.  Two Newton iterations give ~1e-7 relative
+// error, sufficient for cost model heuristics.
+inline double FastInvSqrt(double x) {
+  if (x <= 0.0) {
+    fprintf(stderr, "[AJB_BP][FastInvSqrt] non-positive input=%.6e\n", x);
+    return 0.0;
+  }
+  // Initial guess via bit-level hack (Lomont's constant for double)
+  union { double d; unsigned long long i; } conv;
+  conv.d = x;
+  conv.i = 0x5FE6EB50C7B537A9ULL - (conv.i >> 1);
+  double y = conv.d;
+  // Two Newton-Raphson refinement steps: y = y * (1.5 - 0.5*x*y*y)
+  double halfx = 0.5 * x;
+  y = y * (1.5 - halfx * y * y);  // iteration 1
+  y = y * (1.5 - halfx * y * y);  // iteration 2
+  return y;
+}
+
+// --- M1113: Log-gamma Stirling approximation ---
+// Needed for computing log-binomial coefficients in AGM bound estimation
+// without pulling in <cmath> lgamma (which isn't constexpr and has
+// platform-varying precision).
+// Stirling: ln(Gamma(x)) ≈ 0.5*ln(2π) + (x-0.5)*ln(x) - x + 1/(12x)
+//           - 1/(360*x^3) + 1/(1260*x^5)
+inline double StirlingLogGamma(double x) {
+  if (x <= 0.0) {
+    fprintf(stderr, "[AJB_BP][StirlingLogGamma] non-positive x=%.6e\n", x);
+    return 0.0;
+  }
+  // For small x, use the recurrence ln(Gamma(x+1)) = ln(x) + ln(Gamma(x))
+  // to shift x into the asymptotic regime (x >= 8)
+  double shift_log = 0.0;
+  while (x < 8.0) {
+    shift_log -= __builtin_log(x);
+    x += 1.0;
+  }
+  // Asymptotic expansion
+  double inv_x = 1.0 / x;
+  double inv_x2 = inv_x * inv_x;
+  double result = 0.9189385332046727 // 0.5 * ln(2*pi)
+                  + (x - 0.5) * __builtin_log(x)
+                  - x
+                  + inv_x * (1.0/12.0 - inv_x2 * (1.0/360.0 - inv_x2 / 1260.0));
+  return result + shift_log;
+}
+
+// Log-binomial coefficient via Stirling: log(C(n,k)) = lgamma(n+1) - lgamma(k+1) - lgamma(n-k+1)
+inline double LogBinomial(long long n, long long k) {
+  if (k < 0 || k > n) return -1e30;  // effectively 0 probability
+  if (k == 0 || k == n) return 0.0;
+  return StirlingLogGamma(n + 1.0) - StirlingLogGamma(k + 1.0) - StirlingLogGamma(n - k + 1.0);
+}

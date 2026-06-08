@@ -97,6 +97,99 @@ private:
     std::unordered_map<vector<uint8_t>, long long, BoundCacheHasher> ajb_bound_cache;
     long long ajb_bcache_hits = 0, ajb_bcache_misses = 0;
 
+    // --- M1130: Bushy tree support ---
+    // Traditional join tree construction only builds left-deep trees.
+    // Bushy trees allow any binary tree shape, which can be better for
+    // multi-GPU execution where parallelism is key.
+    // This structure tracks whether a node can be a bushy junction (both
+    // children are join operators, not just one join + one base relation).
+    struct BushyTreeAnalysis {
+        int num_bushy_nodes = 0;        // internal nodes with 2+ join children
+        int num_left_deep_nodes = 0;    // internal nodes with at most 1 join child
+        int max_depth = 0;              // maximum tree depth
+        int bushy_width = 0;            // maximum number of nodes at any level
+
+        void analyze(const vector<vector<int>>& children_ref, int root) {
+            if (root < 0 || root >= (int)children_ref.size()) return;
+            // BFS to compute level widths
+            std::queue<std::pair<int, int>> bfs_q;  // (node, depth)
+            std::unordered_map<int, int> level_count;
+            bfs_q.push({root, 0});
+            while (!bfs_q.empty()) {
+                auto [node, depth] = bfs_q.front();
+                bfs_q.pop();
+                level_count[depth]++;
+                if (depth > max_depth) max_depth = depth;
+
+                int join_children = 0;
+                for (int c : children_ref[node]) {
+                    bfs_q.push({c, depth + 1});
+                    if (!children_ref[c].empty()) join_children++;
+                }
+                if (join_children >= 2) num_bushy_nodes++;
+                else num_left_deep_nodes++;
+            }
+            for (auto& [lev, cnt] : level_count) {
+                if (cnt > bushy_width) bushy_width = cnt;
+            }
+        }
+
+        bool isBushy() const { return num_bushy_nodes > 0; }
+
+        void dump() const {
+            fprintf(stderr, "[AJB_BP][BushyTree] bushy_nodes=%d left_deep=%d max_depth=%d "
+                    "max_width=%d is_bushy=%s\n",
+                    num_bushy_nodes, num_left_deep_nodes, max_depth, bushy_width,
+                    isBushy() ? "YES" : "NO");
+        }
+    };
+
+    BushyTreeAnalysis bushy_analysis;
+
+    // --- M1130: GPU memory hierarchy cost model ---
+    // Models the cost of data movement through the GPU memory hierarchy:
+    //   L1 cache (per-SM, ~128KB, ~4 cycles)
+    //   L2 cache (shared, ~6MB, ~30 cycles)
+    //   HBM (global DRAM, ~32GB, ~400 cycles)
+    //   PCIe/NVLink (cross-GPU, ~100GB/s, ~10000 cycles)
+    // The cost of a join operation depends on which level both inputs
+    // reside in.
+    struct GpuMemoryCostModel {
+        // Latency in abstract cycles for each level
+        static constexpr double L1_LATENCY = 4.0;
+        static constexpr double L2_LATENCY = 30.0;
+        static constexpr double HBM_LATENCY = 400.0;
+        static constexpr double NVLINK_LATENCY = 10000.0;
+
+        // Cache sizes in bytes
+        static constexpr size_t L1_SIZE = 128 * 1024;     // 128 KB per SM
+        static constexpr size_t L2_SIZE = 6 * 1024 * 1024; // 6 MB shared
+        static constexpr size_t HBM_SIZE = 32ULL * 1024 * 1024 * 1024; // 32 GB
+
+        // Determine which memory level a dataset of given size resides in
+        static double accessLatency(size_t data_bytes) {
+            if (data_bytes <= L1_SIZE) return L1_LATENCY;
+            if (data_bytes <= L2_SIZE) return L2_LATENCY;
+            if (data_bytes <= HBM_SIZE) return HBM_LATENCY;
+            return NVLINK_LATENCY;
+        }
+
+        // Cost of joining two relations given their sizes
+        static double joinCost(size_t left_bytes, size_t right_bytes,
+                              size_t output_estimate_bytes) {
+            double read_cost = accessLatency(left_bytes) * left_bytes +
+                               accessLatency(right_bytes) * right_bytes;
+            double write_cost = accessLatency(output_estimate_bytes) * output_estimate_bytes;
+            double total = read_cost + write_cost;
+
+            fprintf(stderr, "[AJB_BP][GpuCostModel] L=%zu R=%zu O=%zu -> cost=%.0f "
+                    "(read=%.0f write=%.0f)\n",
+                    left_bytes, right_bytes, output_estimate_bytes,
+                    total, read_cost, write_cost);
+            return total;
+        }
+    };
+
     void buildLeaves(int node, int fa = -1, int k = -1) {
         if(node < 0 || node >= (int)children.size()) return;
         ajb_jt_stats.buildleaves_nodes++;

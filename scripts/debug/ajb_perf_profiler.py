@@ -351,6 +351,141 @@ def main():
         accumulators = welford_multi_run(args.traces)
         print_welford_report(accumulators)
 
+    # M1133: GPU kernel timeline analysis if NVTX markers present
+    for trace_path in args.traces:
+        kernel_events = parse_nvtx_kernel_timeline(trace_path)
+        if kernel_events:
+            print(f"\n{'='*60}")
+            print(f"  GPU KERNEL TIMELINE: {trace_path}")
+            print(f"{'='*60}")
+            print_kernel_timeline(kernel_events)
+
+
+# =============================================================================
+# M1133: GPU Kernel Timeline Parsing (NVTX markers)
+# =============================================================================
+
+@dataclass
+class NvtxKernelEvent:
+    """Parsed NVTX kernel marker from AJB trace output."""
+    kernel_name: str
+    start_ms: float
+    duration_ms: float
+    gpu_id: int = 0
+    grid_size: int = 0
+    block_size: int = 0
+    category: str = ""
+
+
+# NVTX patterns in AJB output:
+#   [AJB_NVTX] kernel=RadixPass start=12.34ms dur=5.67ms gpu=0 grid=128 block=256
+#   [NVTX][RadixSort] phase=scatter dur=2.1ms
+NVTX_PATTERN = re.compile(
+    r'\[AJB_NVTX\]\s*kernel=(\S+)\s+start=([\d.]+)ms\s+dur=([\d.]+)ms'
+    r'(?:\s+gpu=(\d+))?(?:\s+grid=(\d+))?(?:\s+block=(\d+))?'
+)
+NVTX_SIMPLE = re.compile(
+    r'\[NVTX\]\[(\w+)\]\s*(?:phase=(\w+)\s+)?dur=([\d.]+)ms'
+)
+# Also parse TimeScope markers
+TIMESCOPE_PATTERN = re.compile(
+    r'\[AJB_TIMER\](?:\[(\w+)\])?\s*(\S+?)(?:\s+total)?[=:]\s*([\d.]+)\s*ms'
+)
+
+
+def parse_nvtx_kernel_timeline(trace_path: str) -> List[NvtxKernelEvent]:
+    """Parse NVTX kernel markers from a trace file."""
+    events = []
+    try:
+        with open(trace_path) as f:
+            for line in f:
+                m = NVTX_PATTERN.search(line)
+                if m:
+                    events.append(NvtxKernelEvent(
+                        kernel_name=m.group(1),
+                        start_ms=float(m.group(2)),
+                        duration_ms=float(m.group(3)),
+                        gpu_id=int(m.group(4)) if m.group(4) else 0,
+                        grid_size=int(m.group(5)) if m.group(5) else 0,
+                        block_size=int(m.group(6)) if m.group(6) else 0,
+                    ))
+                    continue
+
+                m = NVTX_SIMPLE.search(line)
+                if m:
+                    cat = m.group(1)
+                    phase = m.group(2) or ""
+                    name = f"{cat}:{phase}" if phase else cat
+                    events.append(NvtxKernelEvent(
+                        kernel_name=name,
+                        start_ms=0.0,
+                        duration_ms=float(m.group(3)),
+                        category=cat,
+                    ))
+    except (IOError, OSError):
+        pass
+    return events
+
+
+def print_kernel_timeline(events: List[NvtxKernelEvent]):
+    """Render kernel timeline as ASCII Gantt chart."""
+    if not events:
+        print("  (no NVTX kernel events found)")
+        return
+
+    # Sort by start time
+    events.sort(key=lambda e: e.start_ms)
+
+    # Aggregate by kernel name using Welford
+    kernel_stats: Dict[str, Dict] = {}
+    for ev in events:
+        name = ev.kernel_name
+        if name not in kernel_stats:
+            kernel_stats[name] = {'n': 0, 'mean': 0.0, 'm2': 0.0,
+                                  'total': 0.0, 'max': 0.0}
+        s = kernel_stats[name]
+        s['n'] += 1
+        s['total'] += ev.duration_ms
+        if ev.duration_ms > s['max']:
+            s['max'] = ev.duration_ms
+        delta = ev.duration_ms - s['mean']
+        s['mean'] += delta / s['n']
+        delta2 = ev.duration_ms - s['mean']
+        s['m2'] += delta * delta2
+
+    # Print summary table
+    total_gpu_ms = sum(s['total'] for s in kernel_stats.values())
+    print(f"\n  Total GPU kernel time: {total_gpu_ms:.2f} ms")
+    print(f"  Distinct kernels: {len(kernel_stats)}")
+    print(f"  Total invocations: {sum(s['n'] for s in kernel_stats.values())}")
+    print()
+    print(f"  {'Kernel':<30s} {'Count':>6s} {'Total ms':>10s} {'Mean ms':>10s} "
+          f"{'Std ms':>10s} {'Max ms':>10s} {'%GPU':>6s}")
+    print(f"  {'-'*30} {'-'*6} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*6}")
+
+    # Sort by total time descending
+    for name, s in sorted(kernel_stats.items(), key=lambda x: -x[1]['total']):
+        std = math.sqrt(s['m2'] / (s['n'] - 1)) if s['n'] > 1 else 0.0
+        pct = 100.0 * s['total'] / total_gpu_ms if total_gpu_ms > 0 else 0.0
+        print(f"  {name:<30s} {s['n']:>6d} {s['total']:>10.2f} {s['mean']:>10.4f} "
+              f"{std:>10.4f} {s['max']:>10.4f} {pct:>5.1f}%")
+
+    # ASCII Gantt chart (first 20 events, scaled to 60 chars width)
+    if events[0].start_ms > 0 or any(e.start_ms > 0 for e in events):
+        print(f"\n  Timeline (first 20 events):")
+        display = events[:20]
+        max_end = max(e.start_ms + e.duration_ms for e in display)
+        if max_end <= 0:
+            max_end = 1.0
+        chart_width = 50
+
+        for ev in display:
+            start_col = int(ev.start_ms / max_end * chart_width)
+            dur_cols = max(1, int(ev.duration_ms / max_end * chart_width))
+            bar = ' ' * start_col + '█' * dur_cols
+            label = f"{ev.kernel_name[:20]:<20s}"
+            print(f"  {label} |{bar:<{chart_width}s}| {ev.duration_ms:.2f}ms")
+
 
 if __name__ == "__main__":
     main()
