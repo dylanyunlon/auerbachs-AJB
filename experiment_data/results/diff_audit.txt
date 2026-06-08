@@ -1,0 +1,83 @@
+================================================================================
+DIFF AUDIT: AJB vs Upstream
+================================================================================
+
+File                                            Base   Add   Del   Chg    Chg% Status
+--------------------------------------------------------------------------------
+joinrenum/AGM.hpp                                266   249    42   291  109.4% MODIFIED
+joinrenum/BanPickTree.hpp                        171   215    29   244  142.7% MODIFIED
+joinrenum/BinarySearch.cpp                       217   188    30   218  100.5% MODIFIED
+joinrenum/Bucket.hpp                             148   261    53   314  212.2% MODIFIED
+joinrenum/BucketPool.hpp                          51   197     7   204  400.0% MODIFIED
+joinrenum/CountOracle.hpp                        314   607    49   656  208.9% MODIFIED
+joinrenum/Enumerator.hpp                         109   356    35   391  358.7% MODIFIED
+joinrenum/Index.hpp                              936   486   127   613   65.5% MODIFIED
+joinrenum/JoinTree.hpp                           237   360    16   376  158.6% MODIFIED
+joinrenum/MHBS.hpp                                87   149     6   155  178.2% MODIFIED
+joinrenum/Parcel.h                               112   107    42   149  133.0% MODIFIED
+joinrenum/REnum.hpp                               37   165     8   173  467.6% MODIFIED
+joinrenum/RRAccessTree.hpp                       604   312    57   369   61.1% MODIFIED
+joinrenum/RangeTree.hpp                         1317  1637  1317  2954  224.3% MODIFIED
+joinrenum/ReadConfig.hpp                          52   134     9   143  275.0% MODIFIED
+joinrenum/SplitBucket.hpp                        107   606    25   631  589.7% MODIFIED
+joinrenum/SplitTable.h                            65    57    48   105  161.5% MODIFIED
+joinrenum/Table.h                                227   118    18   136   59.9% MODIFIED
+joinrenum/test.cpp                               191   153    33   186   97.4% MODIFIED
+joinrenum/testjoin.cpp                            98   133     8   141  143.9% MODIFIED
+common/config_utilities.cuh                       24    21     1    22   91.7% MODIFIED
+common/data_generator.cuh                        313   107    46   153   48.9% MODIFIED
+common/debug_utilities.cuh                        47   156     0   156  331.9% MODIFIED
+common/device_allocator.cuh                       24    38     0    38  158.3% MODIFIED
+common/error_utilities.cuh                        29    18     1    19   65.5% MODIFIED
+common/host_allocator.cuh                         24    31     0    31  129.2% MODIFIED
+common/key_value_pair.cuh                         35    16     4    20   57.1% MODIFIED
+common/math_utilities.cuh                         13   142     1   143 1100.0% MODIFIED
+common/memory_allocator.cuh                      125    80     4    84   67.2% MODIFIED
+common/options_limits.cuh                        239    45    69   114   47.7% MODIFIED
+common/parallel_algorithms.cuh                    52    91     8    99  190.4% MODIFIED
+common/pinned_vector.cuh                          24    13     2    15   62.5% MODIFIED
+common/profile_utilities.cuh                      65   165     1   166  255.4% MODIFIED
+common/relation_generator.cuh                     88    45    10    55   62.5% MODIFIED
+common/resource_context.cuh                       30    51     3    54  180.0% MODIFIED
+common/stream_pool.cuh                            38    47     1    48  126.3% MODIFIED
+hybrid_sort/hybrid_sort.cuh                       91    59     5    64   70.3% MODIFIED
+hybrid_sort/resource_manager.cuh                 140   154    29   183  130.7% MODIFIED
+hybrid_sort/radix_sort/buckets.cuh                64    47    19    66  103.1% MODIFIED
+hybrid_sort/radix_sort/constants.cuh              12    38     1    39  325.0% MODIFIED
+hybrid_sort/radix_sort/device_containers.cuh      90    41    10    51   56.7% MODIFIED
+hybrid_sort/radix_sort/device_histograms.cuh      92    37    16    53   57.6% MODIFIED
+hybrid_sort/radix_sort/host_containers.cuh        70    40     5    45   64.3% MODIFIED
+hybrid_sort/radix_sort/host_histograms.cuh        59    35     5    40   67.8% MODIFIED
+hybrid_sort/radix_sort/kernels.cuh               297   107    89   196   66.0% MODIFIED
+hybrid_sort/radix_sort/radix_sort.cuh            894   408   123   531   59.4% MODIFIED
+hybrid_sort/merge_sort/constants.cuh               3     5     2     7  233.3% MODIFIED
+hybrid_sort/merge_sort/kernels.cuh                31    57     2    59  190.3% MODIFIED
+hybrid_sort/merge_sort/merge_sort.cuh            290   179    43   222   76.6% MODIFIED
+merge_join/constants.cuh                           6    78     0    78 1300.0% MODIFIED
+merge_join/join_result.cuh                        33   165    10   175  530.3% MODIFIED
+merge_join/kernels.cuh                            80    97    30   127  158.8% MODIFIED
+merge_join/merge_join.cuh                        466   265   136   401   86.1% MODIFIED
+root/cpu_merge_benchmark.cu                      176    57    29    86   48.9% MODIFIED
+root/cpu_sort_benchmark.cu                       137    56    16    72   52.6% MODIFIED
+root/gpu_merge_benchmark.cu                      165    70    20    90   54.5% MODIFIED
+root/gpu_sort_benchmark.cu                       168    77    16    93   55.4% MODIFIED
+root/join_benchmark.cu                           258   127    56   183   70.9% MODIFIED
+root/sort_benchmark.cu                           184    71    23    94   51.1% MODIFIED
+--------------------------------------------------------------------------------
+TOTAL                                          10322             12621  122.3%
+
+Files compared: 59
+  Identical:    0
+  Modified:     59
+Overall change: 122.3% of upstream base lines
+
+AJB-only files (no upstream counterpart):
+  src/joinrenum/AGM_dual_analysis.hpp
+  src/joinrenum/ajb_renum_adapter.hpp
+  src/joinrenum/ajb_renum_test.cpp
+  src/common/ajb_debug_infra.cuh
+  src/ajb_join/ajb_hybrid_sort.cuh
+  src/ajb_join/ajb_merge_join.cuh
+  src/ajb_join/skew_detector.cuh
+  src/ajb_join/tier_transfer_scheduler.cuh
+  src/ajb_benchmark.cu
