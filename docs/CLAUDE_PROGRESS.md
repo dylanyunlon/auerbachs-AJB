@@ -758,19 +758,94 @@ RangeTree.hpp + Parcel.h 算法级改写 — 全部同名文件≥20%:
   - [AJB_BP] trace pipeline验证
 
 第十一位Claude: M1201-M1230
-  - 实验数据收集pipeline
-  - benchmark结果CSV生成
-  - multi-seed runs (3-5 seeds per config)
+  - Python脚本验证+实验pipeline
 
 第十二位Claude: M1231-M1260
-  - paper图表生成 (Figures 2-5)
-  - publication-quality plots
+  - benchmark数据收集
 
 第十三位Claude: M1261-M1290
-  - Docker复现环境
-  - CI/CD pipeline
+  - paper图表
 
 第十四位Claude: M1291-M1320
-  - camera-ready paper最终验证
-  - 跨节点扩展
+  - Docker+最终验证
+
+第十五位Claude: M1321-M1350
+  - camera-ready
+```
+
+## 第十位 Claude 完成: M1171-M1200
+
+### 环境准备
+- 安装 libglpk-dev, libboost-dev, g++, cmake
+- boost/functional/hash.hpp 是 Parcel.h 的编译依赖
+
+### M1171-M1180: 全量编译验证 (27个test + 12个tool = 39个.cpp)
+- **首次编译**: 14/27 test FAIL (全因 boost/functional/hash.hpp 缺失)
+- **安装 libboost-dev 后**: 27/27 编译通过
+- **tools/**: 12/12 编译通过 (gen_co_data, run_bpt, upper_bound_demo, wash_data 各3变体)
+- 总计: 39/39 .cpp 文件编译成功
+
+### M1181-M1190: 类型不匹配 bug 修复 (printf format string)
+这些是真正的类型不匹配bug，运行时会产生未定义行为:
+
+**test_count_oracle.cpp**: `dim()` 返回 `size_t`，printf 用 `%d` → 修为 `%zu` + `(size_t)0` cast
+**test_count_oracle_full.cpp**: 同上，fprintf 的 dim 参数 `%d` → `%zu`
+**test_enumerator.cpp**: Index 内部计数器 (cntCacheHit, cntTotalCall, cntAGMCall, cntSplitCall, cntBSCall, totalrrtreenode) 全是 `int`，但 printf 用 `%lld` → 修为 `%d` (6处)
+**test_join_tree.cpp**: `upp_bound`, `upp_iter` 是 `long long`，printf 用 `%d` → 修为 `%lld` (2处)
+
+### M1191-M1200: 数据文件路径 bug 修复
+**test_join_triangle.cpp**: 硬编码 `db/Ra.tbl` 但文件不存在（只有 `db/Ra.csv`，同为 pipe-delimited 格式）→ 修为 `db/Ra.csv`
+**test_join_baseline_full.cpp**: 只尝试 `.tbl` 后缀 → 增加 `.csv` 后缀 fallback (`db/Ra.csv`, `db/R1.csv`)
+
+### 最终测试结果: 27/27 PASS
+```
+PASS: test_bucket_pool               PASS: test_bucket_pool_full
+PASS: test_bucket_pool_upstream      PASS: test_count_oracle
+PASS: test_count_oracle_full         PASS: test_count_oracle_upstream
+PASS: test_enumerator                PASS: test_enumerator_full
+PASS: test_enumerator_upstream       PASS: test_index
+PASS: test_index_full                PASS: test_index_upstream
+PASS: test_join_baseline             PASS: test_join_baseline_full
+PASS: test_join_baseline_upstream    PASS: test_join_tree
+PASS: test_join_tree_full            PASS: test_join_tree_upstream
+PASS: test_join_triangle             PASS: test_renum_baseline
+PASS: test_rr_access_tree            PASS: test_rr_access_tree_full
+PASS: test_rr_access_tree_upstream   PASS: test_sample_baseline
+PASS: test_unordered_map             PASS: test_unordered_map_full
+PASS: test_unordered_map_upstream
+```
+
+### AJB 断点系统验证
+- **[AJB_STATE]**: BucketPool 状态、ReadConfig 解析、Query 构造、Index/Table 统计 ✅
+- **[AJB_TIMER]**: read_data, build_count_oracle, gen_ranges, range_queries 计时 ✅
+- **[AJB_BP]**: 测试入口/出口标记, CountOracle 构建, AGM/Query/Index 构造 ✅
+- **[AJB_DEBUG]**: BucketPool addBucket, Bucket splitBucket PRE/POST ✅
+- **[AJB_RESULTS]**: CountOracle range query summary, unordered_map benchmark ✅
+- **[AJB_PROBE]**: alloc/free/reuse/split/volume/pick 微基准计时 ✅
+- **[AJB_MEM]**: RSS delta 跟踪 ✅
+- **[AJB_TRACE]**: ReadConfig 逐行 trace ✅
+
+### Bug 修复总结 (共 10 处算法/类型 bug):
+| 文件 | Bug 类型 | 修复 |
+|------|----------|------|
+| test_count_oracle.cpp | printf format `%d` vs `size_t` | → `%zu` + cast |
+| test_count_oracle_full.cpp | fprintf format `%d` vs `size_t` | → `%zu` + cast |
+| test_enumerator.cpp | printf format `%lld` vs `int` (6处) | → `%d` |
+| test_join_tree.cpp | printf format `%d` vs `long long` (2处) | → `%lld` |
+| test_join_triangle.cpp | 文件路径 `Ra.tbl` 不存在 | → `Ra.csv` |
+| test_join_baseline_full.cpp | 文件路径 fallback 缺 `.csv` | → 增加 csv 路径 |
+
+### 接力规划:
+```
+第十位Claude完成: M1171-M1200 ✅ (当前)
+  - 39/39 .cpp 全量编译通过
+  - 10处类型/路径 bug 修复
+  - 27/27 test PASS
+  - AJB 断点系统全验证
+
+第十一位Claude: M1201-M1230 (Python脚本验证+实验pipeline)
+第十二位Claude: M1231-M1260 (benchmark数据收集)
+第十三位Claude: M1261-M1290 (paper图表)
+第十四位Claude: M1291-M1320 (Docker+最终验证)
+第十五位Claude: M1321-M1350 (camera-ready)
 ```

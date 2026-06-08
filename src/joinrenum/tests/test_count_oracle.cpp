@@ -152,8 +152,8 @@ int main(int argc, char* argv[]) {
         }
         printf("[AJB] Generated %d synthetic %d-D points (data.txt fallback)\n", synth_n, synth_dim);
     }
-    printf("[AJB] Loaded %zu points, dim=%d\n",
-           points.size(), points.empty() ? 0 : points[0].dim());
+    printf("[AJB] Loaded %zu points, dim=%zu\n",
+           points.size(), points.empty() ? (size_t)0 : points[0].dim());
 
     AJBMemSnapshot mem_after_load;
     mem_after_load.Capture();

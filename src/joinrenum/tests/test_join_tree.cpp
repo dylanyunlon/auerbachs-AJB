@@ -85,8 +85,8 @@ int main() {
     long long upp_iter  = tree.treeUpp(B);
 
     printf("\n[AJB_RESULTS] treeUpp comparison:\n");
-    printf("  bound-based = %d\n", upp_bound);
-    printf("  bucket-based = %d\n", upp_iter);
+    printf("  bound-based = %lld\n", upp_bound);
+    printf("  bucket-based = %lld\n", upp_iter);
 
     // AJB: consistency check
     if (upp_bound != upp_iter) {

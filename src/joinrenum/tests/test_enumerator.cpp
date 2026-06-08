@@ -31,18 +31,18 @@ using namespace std;
 // AJB: print Index internal performance counters
 void printIndexDiagnostics(Index& idx) {
     printf("\n[AJB_STATE] Index performance counters:\n");
-    printf("  SplitBucket cache hit  = %lld / %lld (%.1f%%)\n",
+    printf("  SplitBucket cache hit  = %d / %d (%.1f%%)\n",
            idx.cntCacheHit, idx.cntTotalCall,
            idx.cntTotalCall > 0 ? 100.0 * idx.cntCacheHit / idx.cntTotalCall : 0.0);
-    printf("  AGM calls              = %lld\n", idx.cntAGMCall);
+    printf("  AGM calls              = %d\n", idx.cntAGMCall);
     printf("  AGM total time         = %.6f s\n", idx.totalAGMTime);
     printf("  CountOracle time       = %.6f s\n", idx.totalCountOracleTime);
     printf("  Split total time       = %.6f s\n", idx.totalSplitTime);
-    printf("  Split calls            = %lld\n", idx.cntSplitCall);
-    printf("  Binary search loops    = %lld\n", idx.cntBSCall);
+    printf("  Split calls            = %d\n", idx.cntSplitCall);
+    printf("  Binary search loops    = %d\n", idx.cntBSCall);
     printf("  Cache hit time         = %.6f s\n", idx.totalCacheHitTime);
     printf("  Bound prepare time     = %.6f s\n", idx.totalBoundPrepareTime);
-    printf("  RRTree nodes           = %lld\n", idx.totalrrtreenode);
+    printf("  RRTree nodes           = %d\n", idx.totalrrtreenode);
 
     // AJB: derived metrics
     if (idx.cntSplitCall > 0) {

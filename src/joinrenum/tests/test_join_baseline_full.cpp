@@ -82,8 +82,8 @@ int main() {
     vector<pair<int,int>> edges;
     edges.reserve(1 << 20);
 
-    // try db/Ra.tbl first, then db/R1.tbl
-    const char* paths[] = {"db/Ra.tbl", "db/R1.tbl", nullptr};
+    // try db/Ra.tbl first, then db/R1.tbl, then .csv variants
+    const char* paths[] = {"db/Ra.tbl", "db/R1.tbl", "db/Ra.csv", "db/R1.csv", nullptr};
     for (int pi = 0; paths[pi]; pi++) {
         ifstream f(paths[pi]);
         if (!f.is_open()) continue;

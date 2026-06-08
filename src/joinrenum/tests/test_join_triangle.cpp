@@ -73,7 +73,7 @@ void flush_cache() {
 
 int main() {
     flush_cache();
-    std::string filename = "db/Ra.tbl";
+    std::string filename = "db/Ra.csv";
     std::ifstream infile(filename);
     if (!infile.is_open()) {
         std::cerr << "Error: Cannot open file " << filename << std::endl;

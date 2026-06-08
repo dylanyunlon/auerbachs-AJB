@@ -153,8 +153,8 @@ int main() {
         for (int i = 0; i < 1000; i++)
             points.push_back(Point<int>({rand()%100, rand()%100, rand()%100}));
     }
-    fprintf(stderr, "[AJB_STATE] loaded %zu points, dim=%d, parse=%.1fms\n",
-            points.size(), points.empty() ? 0 : points[0].dim(),
+    fprintf(stderr, "[AJB_STATE] loaded %zu points, dim=%zu, parse=%.1fms\n",
+            points.size(), points.empty() ? (size_t)0 : points[0].dim(),
             chrono::duration<double,milli>(t1 - t0).count());
 
     // upstream: build CountOracle
