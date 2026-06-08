@@ -113,27 +113,83 @@ struct BoundaryStaleness {
   static constexpr double kLowThreshold = 0.01;
   bool transfer_paused = false;
 
+  // Timestamp-based staleness re-sync: each boundary partition records when
+  // it was last updated; if the age exceeds resync_threshold_sec the tracker
+  // forces a re-sync regardless of the L-infinity norm.
+  std::vector<std::chrono::high_resolution_clock::time_point> boundary_update_ts;
+  double resync_threshold_sec = 0.05;  // 50 ms default
+  size_t boundary_version_counter = 0;
+  size_t forced_resync_count = 0;
+
   double ComputeLInfNorm(const std::vector<int64_t>& current_r,
                          const std::vector<int64_t>& current_s,
                          size_t total_tuples) {
+    auto now = std::chrono::high_resolution_clock::now();
+
     if (last_boundary_r.empty()) {
       last_boundary_r = current_r;
       last_boundary_s = current_s;
+      boundary_update_ts.assign(current_r.size(), now);
+      boundary_version_counter = 1;
       return 1.0;  // first time: maximum staleness
     }
     double max_dev = 0.0;
     double scale = static_cast<double>(std::max<size_t>(total_tuples, 1));
+    // Ensure timestamp vector is sized to match
+    if (boundary_update_ts.size() < current_r.size()) {
+      boundary_update_ts.resize(current_r.size(), now);
+    }
     for (size_t i = 0; i < std::min(current_r.size(), last_boundary_r.size()); ++i) {
       double dr = std::fabs(static_cast<double>(current_r[i] - last_boundary_r[i])) / scale;
       double ds = std::fabs(static_cast<double>(current_s[i] - last_boundary_s[i])) / scale;
-      max_dev = std::max({max_dev, dr, ds});
+      double local_dev = std::max(dr, ds);
+      max_dev = std::max(max_dev, local_dev);
+      // Update per-partition timestamp when boundary actually changed
+      if (dr > 0.0 || ds > 0.0) {
+        boundary_update_ts[i] = now;
+      }
     }
     last_boundary_r = current_r;
     last_boundary_s = current_s;
+    boundary_version_counter++;
     return max_dev;
   }
 
+  // Check whether any partition boundary is stale beyond the resync threshold.
+  // Returns true if at least one partition exceeds the age limit.
+  bool CheckTimestampStaleness() {
+    if (boundary_update_ts.empty()) return false;
+    auto now = std::chrono::high_resolution_clock::now();
+    size_t stale_partitions = 0;
+    double max_age_sec = 0.0;
+    for (size_t i = 0; i < boundary_update_ts.size(); ++i) {
+      double age = std::chrono::duration<double>(now - boundary_update_ts[i]).count();
+      max_age_sec = std::max(max_age_sec, age);
+      if (age > resync_threshold_sec) {
+        stale_partitions++;
+      }
+    }
+    if (stale_partitions > 0) {
+      forced_resync_count++;
+      fprintf(stderr, "[AJB_STATE][Staleness] %zu/%zu partitions stale "
+              "(max_age=%.4fs > threshold=%.4fs) -> forced re-sync #%zu\n",
+              stale_partitions, boundary_update_ts.size(),
+              max_age_sec, resync_threshold_sec, forced_resync_count);
+      // Reset all timestamps on forced re-sync
+      std::fill(boundary_update_ts.begin(), boundary_update_ts.end(), now);
+      return true;
+    }
+    return false;
+  }
+
   bool ShouldPauseTransfer(double linf) {
+    // Timestamp-based override: never pause if boundaries are time-stale
+    if (CheckTimestampStaleness()) {
+      consecutive_low = 0;
+      transfer_paused = false;
+      return false;
+    }
+
     if (linf < kLowThreshold) {
       consecutive_low++;
       if (consecutive_low >= 3) {
@@ -151,6 +207,142 @@ struct BoundaryStaleness {
       transfer_paused = false;
     }
     return transfer_paused;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Welford online mean/variance tracker for per-partition output cardinality
+// ---------------------------------------------------------------------------
+struct PartitionCardinalityWelford {
+  struct Stats {
+    size_t partition_id;
+    size_t n;
+    double mean;
+    double m2;     // sum of squared deviations
+
+    Stats() : partition_id(0), n(0), mean(0.0), m2(0.0) {}
+    explicit Stats(size_t pid) : partition_id(pid), n(0), mean(0.0), m2(0.0) {}
+
+    void Update(double value) {
+      n++;
+      double delta = value - mean;
+      mean += delta / static_cast<double>(n);
+      double delta2 = value - mean;
+      m2 += delta * delta2;
+    }
+
+    double Variance() const {
+      return (n < 2) ? 0.0 : m2 / static_cast<double>(n - 1);
+    }
+
+    double StdDev() const { return std::sqrt(Variance()); }
+
+    double CoefficientOfVariation() const {
+      return (mean > 0.0) ? StdDev() / mean : 0.0;
+    }
+  };
+
+  std::vector<Stats> partition_stats;
+
+  void Initialize(size_t num_partitions) {
+    partition_stats.resize(num_partitions);
+    for (size_t i = 0; i < num_partitions; ++i) {
+      partition_stats[i] = Stats(i);
+    }
+  }
+
+  void RecordOutput(size_t partition_id, size_t output_count) {
+    if (partition_id < partition_stats.size()) {
+      partition_stats[partition_id].Update(static_cast<double>(output_count));
+    }
+  }
+
+  void DebugPrint(size_t t) const {
+    double global_mean = 0.0, global_var = 0.0;
+    size_t total_n = 0;
+    for (const auto& s : partition_stats) {
+      if (s.n > 0) {
+        global_mean += s.mean * s.n;
+        total_n += s.n;
+      }
+    }
+    if (total_n > 0) global_mean /= static_cast<double>(total_n);
+    // Compute inter-partition variance of means
+    for (const auto& s : partition_stats) {
+      if (s.n > 0) {
+        double d = s.mean - global_mean;
+        global_var += d * d;
+      }
+    }
+    if (!partition_stats.empty()) {
+      global_var /= static_cast<double>(partition_stats.size());
+    }
+    fprintf(stderr, "[AJB_STATE][Welford] t=%zu: partitions=%zu global_mean=%.2f "
+            "inter_partition_stddev=%.2f\n",
+            t, partition_stats.size(), global_mean, std::sqrt(global_var));
+    for (const auto& s : partition_stats) {
+      if (s.n > 0) {
+        fprintf(stderr, "  partition %zu: n=%zu mean=%.2f stddev=%.2f cv=%.3f\n",
+                s.partition_id, s.n, s.mean, s.StdDev(),
+                s.CoefficientOfVariation());
+      }
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Sorted-order verifier for merge results — adjacent-pair inversion check
+// ---------------------------------------------------------------------------
+struct SortedOrderVerifier {
+  size_t total_inversions = 0;
+  size_t total_checked = 0;
+  // Store the first 3 inversions for diagnostics
+  struct Inversion {
+    size_t position;
+    int64_t left_key;
+    int64_t right_key;
+  };
+  std::vector<Inversion> first_inversions;
+  static constexpr size_t kMaxRecordedInversions = 3;
+
+  template <typename T>
+  void VerifyKeys(const T* keys, size_t count) {
+    if (count < 2) return;
+    for (size_t i = 0; i + 1 < count; ++i) {
+      total_checked++;
+      if (keys[i] > keys[i + 1]) {
+        total_inversions++;
+        if (first_inversions.size() < kMaxRecordedInversions) {
+          first_inversions.push_back({
+            i,
+            static_cast<int64_t>(keys[i]),
+            static_cast<int64_t>(keys[i + 1])
+          });
+        }
+      }
+    }
+  }
+
+  void DebugPrint() const {
+    fprintf(stderr, "[AJB_STATE][SortVerify] checked=%zu inversions=%zu",
+            total_checked, total_inversions);
+    if (total_inversions == 0) {
+      fprintf(stderr, " -> SORTED OK\n");
+    } else {
+      fprintf(stderr, " -> VIOLATIONS DETECTED\n");
+      for (const auto& inv : first_inversions) {
+        fprintf(stderr, "  inversion at pos %zu: %lld > %lld\n",
+                inv.position,
+                static_cast<long long>(inv.left_key),
+                static_cast<long long>(inv.right_key));
+      }
+    }
+  }
+
+  void Reset() {
+    total_inversions = 0;
+    total_checked = 0;
+    first_inversions.clear();
   }
 };
 
@@ -312,6 +504,17 @@ JoinResult<T> AJBMergeJoin(
   JoinCardinalityHLL hll_sketch;
   // Boundary staleness tracker
   BoundaryStaleness staleness_tracker;
+  // Welford per-partition output cardinality tracker
+  PartitionCardinalityWelford welford_tracker;
+  welford_tracker.Initialize(device_count);
+  // Sorted-order verifier for merge results
+  SortedOrderVerifier sort_verifier;
+
+  // [AJB_STATE] Merge start breakpoint
+  fprintf(stderr, "[AJB_STATE][MergeStart] gpu_count=%zu partitions=%zu "
+          "boundary_version=0 total_r=%zu total_s=%zu\n",
+          device_count, total_chunk_groups,
+          keys_r.size(), keys_s.size());
 
   for (size_t t = 0; t < total_chunk_groups; ++t) {
     auto cg_start = std::chrono::high_resolution_clock::now();
@@ -398,6 +601,30 @@ JoinResult<T> AJBMergeJoin(
 
     auto cg_end = std::chrono::high_resolution_clock::now();
     double cg_duration = std::chrono::duration<double>(cg_end - cg_start).count();
+
+    // --- Welford per-partition output cardinality tracking ---
+    {
+      size_t partition_output = device_results[t].count_;
+      welford_tracker.RecordOutput(t % device_count, partition_output);
+      if (t % debug_print_interval == 0) {
+        welford_tracker.DebugPrint(t);
+      }
+    }
+
+    // --- Sorted-order verification of merge results ---
+    {
+      // Verify that the input key ranges used by this chunk group are sorted
+      size_t r_start = static_cast<size_t>(starts[t].x);
+      size_t r_end = static_cast<size_t>(ends[t].x);
+      if (r_end > r_start + 1) {
+        sort_verifier.VerifyKeys(keys_r.data() + r_start, r_end - r_start);
+      }
+      size_t s_start = static_cast<size_t>(starts[t].y);
+      size_t s_end = static_cast<size_t>(ends[t].y);
+      if (s_end > s_start + 1) {
+        sort_verifier.VerifyKeys(keys_s.data() + s_start, s_end - s_start);
+      }
+    }
 
     // --- L∞ staleness computation ---
     {
@@ -498,6 +725,21 @@ JoinResult<T> AJBMergeJoin(
 
   auto pipeline_end = std::chrono::high_resolution_clock::now();
   double total_time = std::chrono::duration<double>(pipeline_end - pipeline_start).count();
+
+  // [AJB_STATE] Merge end breakpoint
+  fprintf(stderr, "[AJB_STATE][MergeEnd] gpu_count=%zu partitions=%zu "
+          "boundary_version=%zu output_count=%zu "
+          "forced_resyncs=%zu total_time=%.6fs\n",
+          device_count, total_chunk_groups,
+          staleness_tracker.boundary_version_counter,
+          answer.count_,
+          staleness_tracker.forced_resync_count,
+          total_time);
+
+  // Final sorted-order verification report
+  sort_verifier.DebugPrint();
+  // Final Welford cardinality summary
+  welford_tracker.DebugPrint(total_chunk_groups);
 
   printf("\n");
   printf("######################################################################\n");

@@ -54,6 +54,65 @@ struct DeviceLink {
   BandwidthTier tier;
   double measured_bw_gbps;   // filled by ProbeInterconnect()
 
+  // Per-link EMA bandwidth estimation
+  double ema_bw_mbps = 0.0;       // current EMA bandwidth in MB/s
+  double ema_alpha = 0.15;         // smoothing factor
+  double baseline_bw_mbps = 0.0;   // first-observed bandwidth as baseline
+  size_t link_transfer_count = 0;
+
+  // Congestion backoff state
+  double congestion_level = 0.0;    // 0.0 = clear, 1.0 = severe
+  size_t backoff_exponent = 0;      // current exponential backoff level
+  size_t transfers_until_retry = 0; // countdown before next transfer attempt
+  static constexpr double kCongestionThreshold = 0.50;  // 50% bw drop triggers backoff
+  static constexpr size_t kMaxBackoffExponent = 6;       // max 2^6 = 64x delay
+
+  void UpdateLinkBandwidth(size_t bytes, double duration_sec) {
+    if (duration_sec <= 0.0 || bytes == 0) return;
+    double bw = static_cast<double>(bytes) / (duration_sec * 1e6);  // MB/s
+    link_transfer_count++;
+    if (link_transfer_count == 1) {
+      ema_bw_mbps = bw;
+      baseline_bw_mbps = bw;
+    } else {
+      ema_bw_mbps = ema_alpha * bw + (1.0 - ema_alpha) * ema_bw_mbps;
+    }
+
+    // Congestion detection: compare current EMA to baseline
+    if (baseline_bw_mbps > 0.0) {
+      double drop_fraction = 1.0 - (ema_bw_mbps / baseline_bw_mbps);
+      congestion_level = std::max(0.0, std::min(1.0, drop_fraction));
+
+      if (drop_fraction > kCongestionThreshold) {
+        // Escalate backoff
+        if (backoff_exponent < kMaxBackoffExponent) {
+          backoff_exponent++;
+        }
+        transfers_until_retry = static_cast<size_t>(1) << backoff_exponent;
+        fprintf(stderr, "[AJB_STATE][Congestion] GPU %d->%d bw_drop=%.1f%% "
+                "(ema=%.1f baseline=%.1f MB/s) -> backoff 2^%zu = %zu transfers\n",
+                src_device, dst_device, drop_fraction * 100.0,
+                ema_bw_mbps, baseline_bw_mbps,
+                backoff_exponent, transfers_until_retry);
+      } else {
+        // Recovery: reduce backoff
+        if (backoff_exponent > 0 && drop_fraction < kCongestionThreshold * 0.5) {
+          backoff_exponent = (backoff_exponent > 1) ? backoff_exponent - 1 : 0;
+          transfers_until_retry = 0;
+        }
+      }
+    }
+  }
+
+  // Returns true if this link is currently in congestion backoff
+  bool IsBackedOff() {
+    if (transfers_until_retry > 0) {
+      transfers_until_retry--;
+      return true;
+    }
+    return false;
+  }
+
   void DebugPrint() const {
     printf("[DeviceLink] GPU %d -> GPU %d | tier=%s | bw=%.2f GB/s\n",
            src_device, dst_device, TierName(tier), measured_bw_gbps);
@@ -210,6 +269,30 @@ class TierTransferScheduler {
     return should;
   }
 
+  // Congestion-aware variant: checks per-link backoff state before allowing
+  // a transfer on a specific GPU pair. Returns false if the link is currently
+  // in exponential backoff due to bandwidth degradation.
+  bool ShouldTransferWithCongestion(TransferEvent::StructureKind kind,
+                                    size_t t, int src_gpu, int dst_gpu) {
+    if (!ShouldTransfer(kind, t)) return false;
+
+    // Check per-link congestion backoff
+    for (auto& link : topology_) {
+      if (link.src_device == src_gpu && link.dst_device == dst_gpu) {
+        if (link.IsBackedOff()) {
+          fprintf(stderr, "[AJB_STATE][CongestionSkip] t=%zu GPU %d->%d "
+                  "structure=%s backed_off (exponent=%zu remaining=%zu)\n",
+                  t, src_gpu, dst_gpu,
+                  TransferEvent::KindName(kind),
+                  link.backoff_exponent, link.transfers_until_retry);
+          return false;
+        }
+        break;
+      }
+    }
+    return true;
+  }
+
   // ---------------------------------------------------------------------------
   // Record a transfer that actually happened (for post-hoc analysis / figures)
   // ---------------------------------------------------------------------------
@@ -239,6 +322,24 @@ class TierTransferScheduler {
         ewma_host_.Update(bytes, duration_sec);
         break;
     }
+
+    // Per-link bandwidth estimation and congestion tracking
+    double bw_mbps = 0.0;
+    double congestion = 0.0;
+    for (auto& link : topology_) {
+      if (link.src_device == src && link.dst_device == dst) {
+        link.UpdateLinkBandwidth(bytes, duration_sec);
+        bw_mbps = link.ema_bw_mbps;
+        congestion = link.congestion_level;
+        break;
+      }
+    }
+
+    // [AJB_STATE] Per-transfer breakpoint
+    fprintf(stderr, "[AJB_STATE][Transfer] src_gpu=%d dst_gpu=%d bytes=%zu "
+            "bandwidth_mbps=%.2f congestion_level=%.3f tier=%s structure=%s t=%zu\n",
+            src, dst, bytes, bw_mbps, congestion,
+            TierName(tier), TransferEvent::KindName(kind), t);
 
     // [AJB_BP] EWMA state dump every 50 transfers
     if (event_log_.size() % 50 == 0) {
@@ -359,6 +460,18 @@ class TierTransferScheduler {
            ewma_fast_.cumulative_staleness,
            ewma_slow_.cumulative_staleness,
            ewma_host_.cumulative_staleness);
+    // Per-link bandwidth and congestion summary
+    printf("  --- Per-Link Bandwidth & Congestion ---\n");
+    for (const auto& link : topology_) {
+      if (link.link_transfer_count > 0) {
+        printf("  GPU %d -> GPU %d: ema_bw=%.1f MB/s baseline=%.1f MB/s "
+               "congestion=%.3f backoff_exp=%zu transfers=%zu\n",
+               link.src_device, link.dst_device,
+               link.ema_bw_mbps, link.baseline_bw_mbps,
+               link.congestion_level, link.backoff_exponent,
+               link.link_transfer_count);
+      }
+    }
     printf("==================================================================\n\n");
   }
 
