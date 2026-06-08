@@ -621,3 +621,69 @@ RangeTree.hpp + Parcel.h 算法级改写 — 全部同名文件≥20%:
 第25位Claude: M1141-M1170
   - Docker + NeurIPS实验复现包
 ```
+
+---
+
+## 第八位Claude (实际第一位新session): M1081-M1110 ✅
+
+### 环境: claude.hk.cn Opus 4.6 dispatch
+### Commit: bb90fec
+
+### M1081-M1085: skew_detector.cuh (214→287行, +34%)
+- Chi-squared拟合优度检验 + Wilson-Hilferty p值近似
+- Kolmogorov-Smirnov距离 (经验CDF vs 均匀CDF最大偏差)
+- Freedman-Diaconis自适应bucket数 (IQR-based, clamp [8,512])
+- 诊断断点: top-5 bucket频率, chi-sq/KS拒绝报告
+
+### M1086-M1090: tier_transfer_scheduler.cuh (406→541行, +33%)
+- TierBandwidthEWMA结构体: 每tier的EWMA带宽跟踪 (α=0.1)
+- AdaptK_u(): 黄金比例(1.618) K_u步长调整 based on staleness
+- ShouldCoalesce(): 传输合并判定 (combined < MTU 4096)
+- 每50次传输dump EWMA状态, PrintSummary含adaptive K_u摘要
+
+### M1091-M1095: ajb_hybrid_sort.cuh (285→372行, +31%)
+- 自适应WSD: warmup = ceil(log2(ngpu))/n_groups, decay = min(0.15, 1/ngpu)
+- ChunkGroupBalance: Gini系数 per-GPU负载均衡
+- Shannon熵: first-byte histogram radix pivot质量评估
+- 断点: Gini/entropy per chunk-group, Gini>0.3触发redistribution
+
+### M1096-M1100: ajb_merge_join.cuh (382→521行, +36%)
+- JoinCardinalityHLL: HyperLogLog sketch (m=256, ~6.5% std error)
+- BoundaryStaleness: L∞范数boundary变化跟踪, 3次连续低staleness暂停传输
+- 早期终止: staleness驱动boundary transfer pause/resume
+- HLL基数估计打印 with 误差百分比
+
+### M1101-M1105: Index.hpp (1167→1297行, +11%)
+- 贪心dim选择: max cardinality ratio (非first-mismatch)
+- MHBS早期终止: remaining search space < 1%时返回
+- Bound tightening: split后用子bucket actual min/max收紧
+- 诊断断点: split决策dim/ratio/remaining打印
+
+### M1106-M1110: scripts/debug/ajb_perf_profiler.py (新建 344行)
+- Flamegraph文本树: [AJB_TIMER]事件构建调用层次ASCII树
+- 多次运行Welford: 在线mean/std/cv跨trace文件
+- 热路径标注: >10%总时间标红(ANSI color)
+- 两trace diff: >50%偏差高亮
+
+### 测试: 11/11 PASS (8 unit + 3 main executables)
+
+### 接力规划:
+```
+第一位Claude完成: M1081-M1110 ✅ (当前)
+第二位Claude: M1111-M1140
+  - upstream/merge_join/ 所有kernel文件算法深化
+  - merge_path partitioning优化
+  - paper/ 实验figure数据pipeline
+第三位Claude: M1141-M1170
+  - upstream/hybrid_sort/ 算法深化(radix/merge sort内核)
+  - common/ 工具库算法增强
+第四位Claude: M1171-M1200
+  - 全量实验复现: 多GPU scale-out benchmark
+  - Docker环境 + 数据集生成
+第五位Claude: M1201-M1230
+  - paper/ NeurIPS camera-ready 图表生成
+  - 性能回归测试自动化
+第六位Claude: M1231-M1260
+  - 跨节点分布式join扩展
+  - 故障恢复机制
+```
