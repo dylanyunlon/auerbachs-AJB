@@ -285,3 +285,129 @@ std::pair<SkewEstimate, SkewEstimate> DetectJoinSkew(
 
   return {skew_r, skew_s};
 }
+
+// ---------------------------------------------------------------------------
+// HyperLogLog cardinality estimator — O(1) space per register
+// Estimates the number of distinct keys in a relation without sorting.
+// Used for join selectivity prediction: if |R ∩ S| / |R| is small,
+// the join is highly selective and we can use smaller output buffers.
+//
+// Algorithm: hash each key, use first p bits as register index,
+// count leading zeros of remaining bits. The harmonic mean of
+// 2^(max_leading_zeros) across registers estimates cardinality.
+// ---------------------------------------------------------------------------
+template <typename T>
+struct HyperLogLogEstimator {
+  static constexpr int kPrecision = 14;  // 2^14 = 16384 registers
+  static constexpr size_t kNumRegisters = 1u << kPrecision;
+  std::vector<uint8_t> registers;
+
+  HyperLogLogEstimator() : registers(kNumRegisters, 0) {}
+
+  // FNV-1a hash for 64-bit keys
+  static uint64_t Hash(T key) {
+    uint64_t h = 14695981039346656037ULL;  // FNV offset basis
+    uint64_t k = static_cast<uint64_t>(key);
+    for (int i = 0; i < 8; ++i) {
+      h ^= (k >> (i * 8)) & 0xFF;
+      h *= 1099511628211ULL;  // FNV prime
+    }
+    return h;
+  }
+
+  void Insert(T key) {
+    uint64_t h = Hash(key);
+    size_t idx = h >> (64 - kPrecision);  // top p bits as register index
+    uint64_t w = (h << kPrecision) | (1ULL << (kPrecision - 1));  // remaining bits
+    // Count leading zeros + 1
+    uint8_t rho = 1;
+    while ((w & (1ULL << 63)) == 0 && rho < 64) {
+      rho++;
+      w <<= 1;
+    }
+    if (rho > registers[idx]) registers[idx] = rho;
+  }
+
+  double Estimate() const {
+    // Harmonic mean of 2^(-M[j])
+    double sum = 0.0;
+    int zeros = 0;
+    for (size_t j = 0; j < kNumRegisters; ++j) {
+      sum += std::pow(2.0, -static_cast<double>(registers[j]));
+      if (registers[j] == 0) zeros++;
+    }
+    double alpha_m;
+    // Bias correction factor
+    if (kNumRegisters == 16)    alpha_m = 0.673;
+    else if (kNumRegisters == 32)  alpha_m = 0.697;
+    else if (kNumRegisters == 64)  alpha_m = 0.709;
+    else alpha_m = 0.7213 / (1.0 + 1.079 / kNumRegisters);
+
+    double estimate = alpha_m * kNumRegisters * kNumRegisters / sum;
+
+    // Small range correction (linear counting)
+    if (estimate <= 2.5 * kNumRegisters && zeros > 0) {
+      estimate = kNumRegisters * std::log(static_cast<double>(kNumRegisters) / zeros);
+    }
+    return estimate;
+  }
+
+  void DumpState(const char* label) const {
+    double est = Estimate();
+    // Register utilization
+    int used = 0;
+    int max_reg = 0;
+    for (size_t j = 0; j < kNumRegisters; ++j) {
+      if (registers[j] > 0) used++;
+      if (registers[j] > max_reg) max_reg = registers[j];
+    }
+    fprintf(stderr, "[AJB_STATE][HLL][%s] estimated_cardinality=%.0f "
+            "registers_used=%d/%zu max_rho=%d\n",
+            label, est, used, kNumRegisters, max_reg);
+  }
+};
+
+// Estimate join selectivity using HLL on both relations
+template <typename T>
+double EstimateJoinSelectivity(const T* keys_r, size_t n_r,
+                                const T* keys_s, size_t n_s,
+                                size_t sample_limit = 500000) {
+  HyperLogLogEstimator<T> hll_r, hll_s, hll_union;
+
+  size_t r_sample = std::min(n_r, sample_limit);
+  size_t s_sample = std::min(n_s, sample_limit);
+
+  // Sample R keys
+  std::mt19937 rng(12345);
+  for (size_t i = 0; i < r_sample; ++i) {
+    size_t idx = (n_r <= sample_limit) ? i : (rng() % n_r);
+    hll_r.Insert(keys_r[idx]);
+    hll_union.Insert(keys_r[idx]);
+  }
+  // Sample S keys
+  for (size_t i = 0; i < s_sample; ++i) {
+    size_t idx = (n_s <= sample_limit) ? i : (rng() % n_s);
+    hll_s.Insert(keys_s[idx]);
+    hll_union.Insert(keys_s[idx]);
+  }
+
+  double card_r = hll_r.Estimate();
+  double card_s = hll_s.Estimate();
+  double card_union = hll_union.Estimate();
+
+  // |R ∩ S| ≈ |R| + |S| - |R ∪ S| (inclusion-exclusion)
+  double card_intersection = std::max(0.0, card_r + card_s - card_union);
+
+  // Selectivity = |R ⋈ S| / (|R| × |S|)
+  // Under uniform distribution: selectivity ≈ |R ∩ S| / max(|R|, |S|)
+  double selectivity = (card_union > 0) ? card_intersection / card_union : 0.0;
+
+  hll_r.DumpState("R-keys");
+  hll_s.DumpState("S-keys");
+  hll_union.DumpState("union");
+  fprintf(stderr, "[AJB_STATE][JoinSelectivity] card_R=%.0f card_S=%.0f "
+          "card_union=%.0f card_intersect=%.0f selectivity=%.6f\n",
+          card_r, card_s, card_union, card_intersection, selectivity);
+
+  return selectivity;
+}
