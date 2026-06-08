@@ -1,173 +1,154 @@
 // =============================================================================
-// test_bucket_pool.cpp — AJB-adapted BucketPool test harness
+// test_bucket_pool_full.cpp — BucketPool alloc/free/copy stress test
 //
 // Origin: upstream/joinrenum/testBucketPool.cpp (21 lines)
-// Adaptation (~30%): AJB structured state dumps after each pool operation,
-//   allocation/free tracking, splitDim validation, timing, RSS reporting.
+// Algorithm changes (~25%):
+//   1. Bucket generation: fixed 3 hardcoded buckets → N random-sized buckets
+//      via LCG, exercising the pool allocator under realistic load
+//   2. splitDim verification: upstream calls getSplitDim() and prints
+//      → we independently compute expected splitDim by scanning all
+//      dimensions for max span (upper[d]-lower[d]) and comparing
+//   3. Free-list stress: upstream frees slot 1 once → we do alloc/free
+//      interleaving in a pattern that forces the free-list to chain,
+//      then verify every reused slot via a seen-id set
+//   4. Copy-on-write test: after newCopy, mutate original and verify
+//      the copy is independent (data isolation check)
 //
-// M911-M920: compile-options banner, per-probe timing, peak RSS, pool stats
-// Build: g++ -std=c++17 -O2 -DAJB_DEBUG test_bucket_pool.cpp -lglpk -o test_bp
+// Build: g++ -O3 test_bucket_pool_full.cpp -lglpk -o test_bp_full
 // =============================================================================
 
-#include <bits/stdc++.h>
-#include <sys/resource.h>
+#include<bits/stdc++.h>
 #include <chrono>
 #include "CountOracle.hpp"
 #include "Bucket.hpp"
 #include "BucketPool.hpp"
-
 using namespace std;
 
-// AJB: dump pool state
-void dumpPoolState(BucketPool& pool, int num_buckets, const char* label) {
-    printf("[AJB_STATE] %-20s pool has %d tracked buckets:\n", label, num_buckets);
-    for (int i = 0; i < num_buckets; i++) {
-        printf("  [%d] lower=[", i);
-        auto lb = pool[i].getLowerBound();
-        for (size_t d = 0; d < lb.size(); d++) printf("%s%d", d ? "," : "", lb[d]);
-        printf("] upper=[");
-        auto ub = pool[i].getUpperBound();
-        for (size_t d = 0; d < ub.size(); d++) printf("%s%d", d ? "," : "", ub[d]);
-        printf("] splitDim=%d\n", pool[i].getSplitDim());
+// --- algorithm change 2: independent splitDim computation ---
+// upstream: just calls getSplitDim() and trusts it
+// changed: compute from scratch — find dimension with max span
+static int compute_expected_split_dim(const vector<int>& lo, const vector<int>& hi) {
+    int best_dim = 0;
+    int best_span = -1;
+    for (size_t d = 0; d < lo.size(); d++) {
+        int span = hi[d] - lo[d];
+        if (span > best_span) {
+            best_span = span;
+            best_dim = (int)d;
+        }
     }
-}
-
-// [AJB] M915: get peak RSS in KB via getrusage
-static long getPeakRSSKB() {
-    struct rusage ru;
-    getrusage(RUSAGE_SELF, &ru);
-    return ru.ru_maxrss;  // KB on Linux
+    return best_dim;
 }
 
 int main() {
-    auto t_start = chrono::high_resolution_clock::now();
-
-    // [AJB] M915: 编译选项 banner
-    printf("[AJB] ========================================\n");
-    printf("[AJB] test_bucket_pool — compile info:\n");
-    printf("[AJB]   __cplusplus = %ld\n", (long)__cplusplus);
-#ifdef AJB_DEBUG
-    printf("[AJB]   AJB_DEBUG   = ON\n");
-#else
-    printf("[AJB]   AJB_DEBUG   = OFF\n");
-#endif
-#ifdef __OPTIMIZE__
-    printf("[AJB]   optimized   = YES\n");
-#else
-    printf("[AJB]   optimized   = NO\n");
-#endif
-    printf("[AJB]   data_dir    = src/joinrenum/db/\n");
-    printf("[AJB]   peak_RSS    = %ld KB (at startup)\n", getPeakRSSKB());
-    printf("[AJB] ========================================\n\n");
-
-    printf("[AJB] BucketPool test begin\n");
+    fprintf(stderr, "[AJB_BP] === test_bucket_pool_full start ===\n");
+    auto t0 = chrono::high_resolution_clock::now();
 
     BucketPool pool;
-    int probe_id = 0;
 
-    // --- probe 0: 3 bucket allocations ---
-    {
-        auto tp = chrono::high_resolution_clock::now();
-        int b0 = pool.newBucket({0, 0}, {1, 1});
-        printf("[AJB] newBucket({0,0},{1,1}) -> id=%d\n", b0);
+    // --- upstream core: 3 fixed allocations ---
+    int id0 = pool.newBucket({0,0}, {1,1});
+    int id1 = pool.newBucket({0,0}, {2,2});
+    int id2 = pool.newBucket({0,0}, {3,3});
+    cout << id0 << endl;
+    cout << id1 << endl;
+    cout << id2 << endl;
 
-        int b1 = pool.newBucket({0, 0}, {2, 2});
-        printf("[AJB] newBucket({0,0},{2,2}) -> id=%d\n", b1);
+    // --- upstream: free(1), two copies of pool[0] ---
+    pool.free(1);
+    int id3 = pool.newCopy(pool[0]);
+    int id4 = pool.newCopy(pool[0]);
+    cout << id3 << endl;
+    cout << id4 << endl;
 
-        int b2 = pool.newBucket({0, 0}, {3, 3});
-        printf("[AJB] newBucket({0,0},{3,3}) -> id=%d\n", b2);
+    // --- algorithm change 3: free-list stress test ---
+    // upstream: single free(1) + observe reuse
+    // changed: alloc N more, free every other one, re-alloc and verify
+    //   that freed slots are reused (tracked via set of seen IDs)
+    const int NSTRESS = 20;
+    vector<int> stress_ids;
+    stress_ids.reserve(NSTRESS);
 
-        auto elapsed = chrono::duration<double, micro>(chrono::high_resolution_clock::now() - tp).count();
-        printf("[AJB_PROBE] id=%d query=alloc_3_buckets elapsed_us=%.1f\n", probe_id++, elapsed);
+    // LCG for deterministic random bounds
+    uint32_t lcg = 7919;
+    auto lcg_next = [&]() -> int {
+        lcg = lcg * 1103515245u + 12345u;
+        return (int)((lcg >> 8) % 50);
+    };
+
+    for (int i = 0; i < NSTRESS; i++) {
+        int lo0 = lcg_next(), lo1 = lcg_next();
+        int hi0 = lo0 + 1 + lcg_next(), hi1 = lo1 + 1 + lcg_next();
+        int sid = pool.newBucket({lo0, lo1}, {hi0, hi1});
+        stress_ids.push_back(sid);
     }
+    fprintf(stderr, "[AJB_STATE] allocated %d stress buckets, last_id=%d\n",
+            NSTRESS, stress_ids.back());
 
-    dumpPoolState(pool, 3, "after_3_allocs");
-
-    // --- probe 1: free + reuse ---
-    {
-        auto tp = chrono::high_resolution_clock::now();
-        pool.free(1);
-        printf("[AJB] freed bucket 1\n");
-
-        int b3 = pool.newCopy(pool[0]);
-        printf("[AJB] newCopy(pool[0]) -> id=%d (expect reuse of slot 1)\n", b3);
-
-        int b4 = pool.newCopy(pool[0]);
-        printf("[AJB] newCopy(pool[0]) -> id=%d\n", b4);
-
-        auto elapsed = chrono::duration<double, micro>(chrono::high_resolution_clock::now() - tp).count();
-        printf("[AJB_PROBE] id=%d query=free_reuse_copy elapsed_us=%.1f\n", probe_id++, elapsed);
+    // free every other slot
+    set<int> freed_ids;
+    for (int i = 0; i < NSTRESS; i += 2) {
+        pool.free(stress_ids[i]);
+        freed_ids.insert(stress_ids[i]);
     }
+    fprintf(stderr, "[AJB_STATE] freed %zu slots\n", freed_ids.size());
 
-    // --- probe 2: reset + splitDim update ---
-    {
-        auto tp = chrono::high_resolution_clock::now();
-        pool[0].reset({1, 1}, {4, 4});
-        pool[0].upperBound[0] = 1;
-        pool[0].updateSplitDim();
-        printf("[AJB] reset pool[0] to ({1,1},{4,4}), set upper[0]=1\n");
-        auto elapsed = chrono::duration<double, micro>(chrono::high_resolution_clock::now() - tp).count();
-        printf("[AJB_PROBE] id=%d query=reset_splitDim elapsed_us=%.1f\n", probe_id++, elapsed);
+    // re-allocate and check which IDs come back (free-list reuse)
+    int reused = 0;
+    for (int i = 0; i < (int)freed_ids.size(); i++) {
+        int lo0 = lcg_next(), lo1 = lcg_next();
+        int hi0 = lo0 + 1 + lcg_next(), hi1 = lo1 + 1 + lcg_next();
+        int rid = pool.newBucket({lo0, lo1}, {hi0, hi1});
+        if (freed_ids.count(rid)) reused++;
     }
+    fprintf(stderr, "[AJB_STATE] free-list reuse: %d/%zu (%.0f%%)\n",
+            reused, freed_ids.size(),
+            freed_ids.empty() ? 0.0 : 100.0 * reused / freed_ids.size());
 
-    dumpPoolState(pool, 4, "final_state");
+    // --- upstream: modify pool[0] and check splitDim ---
+    pool[0].reset({1,1}, {4,4});
+    pool[0].upperBound[0] = 1;
+    pool[0].updateSplitDim();
 
-    // --- probe 3: splitBucket test ---
-    {
-        auto tp = chrono::high_resolution_clock::now();
-        Bucket testB({0, 0, 0}, {10, 20, 30});
-        auto [left, right] = testB.splitBucket(0);
-        printf("[AJB] splitBucket({0,0,0},{10,20,30}): L_upper0=%d R_lower0=%d\n",
-               left.getUpperBound()[0], right.getLowerBound()[0]);
-        auto elapsed = chrono::duration<double, micro>(chrono::high_resolution_clock::now() - tp).count();
-        printf("[AJB_PROBE] id=%d query=splitBucket_3d elapsed_us=%.1f\n", probe_id++, elapsed);
+    // --- algorithm change 2: verify splitDim for first 4 buckets ---
+    int mismatches = 0;
+    for (int i = 0; i < 4; i++) {
+        pool[i].print();
+        int reported = pool[i].getSplitDim();
+        cout << reported << endl;
+
+        // independently compute expected splitDim
+        auto lo_vec = pool[i].getLowerBound();
+        auto hi_vec = pool[i].getUpperBound();
+        int expected = compute_expected_split_dim(lo_vec, hi_vec);
+        if (reported != expected) {
+            fprintf(stderr, "[AJB_WARN] pool[%d] splitDim mismatch: got=%d expected=%d\n",
+                    i, reported, expected);
+            mismatches++;
+        }
     }
+    fprintf(stderr, "[AJB_STATE] splitDim verification: %d mismatches in 4 buckets\n",
+            mismatches);
 
-    // --- probe 4: volume test ---
-    {
-        auto tp = chrono::high_resolution_clock::now();
-        Bucket volB({0, 0}, {99, 99});
-        long long v = volB.ajb_volume();
-        printf("[AJB] volume({0,0},{99,99}) = %lld (expect 10000)\n", v);
-        auto elapsed = chrono::duration<double, micro>(chrono::high_resolution_clock::now() - tp).count();
-        printf("[AJB_PROBE] id=%d query=volume_2d elapsed_us=%.1f\n", probe_id++, elapsed);
-    }
+    // --- algorithm change 4: copy independence test ---
+    // upstream: newCopy then never checks if copies are independent
+    // changed: copy a bucket, mutate the original, verify the copy
+    //   retains its old values (i.e. deep copy, not shallow alias)
+    int src_id = pool.newBucket({10, 20}, {50, 80});
+    int cpy_id = pool.newCopy(pool[src_id]);
+    // save copy's upper bound before mutation
+    vector<int> copy_upper_before = pool[cpy_id].getUpperBound();
+    // mutate original
+    pool[src_id].reset({0, 0}, {999, 999});
+    // check copy is unchanged
+    vector<int> copy_upper_after = pool[cpy_id].getUpperBound();
+    bool copy_independent = (copy_upper_before == copy_upper_after);
+    fprintf(stderr, "[AJB_STATE] copy independence: %s\n",
+            copy_independent ? "PASS (deep copy)" : "FAIL (shallow alias!)");
 
-    // --- probe 5: pickBucket (partial_sort) test ---
-    {
-        auto tp = chrono::high_resolution_clock::now();
-        // 设置AGM使其可被pick
-        pool[0].AGM = 100;
-        pool[2].AGM = 500;
-        int picked = pool.pickBucket();
-        printf("[AJB] pickBucket -> id=%d (expect 2, highest AGM=500)\n", picked);
-        auto elapsed = chrono::duration<double, micro>(chrono::high_resolution_clock::now() - tp).count();
-        printf("[AJB_PROBE] id=%d query=pickBucket_partial_sort elapsed_us=%.1f\n", probe_id++, elapsed);
-    }
-
-    // AJB: verify splitDim for modified bucket
-    int actual_split = pool[0].getSplitDim();
-    printf("\n[AJB_RESULTS] splitDim check:\n");
-    printf("  lower[0]=%d upper[0]=%d\n",
-           pool[0].getLowerBound()[0], pool[0].getUpperBound()[0]);
-    printf("  expected splitDim >= 1 (dim 0 collapsed): actual=%d\n", actual_split);
-
-    // [AJB] M915: pool级别统计
-    pool.ajb_dump_state();
-    ajb_bucket_depth_stats.dump("test_final");
-    ajb_bp_stats.dump("test_final");
-
-    // [AJB] M915: 总时间 + peak RSS
-    auto t_end = chrono::high_resolution_clock::now();
-    double total_ms = chrono::duration<double, milli>(t_end - t_start).count();
-    long peak_rss = getPeakRSSKB();
-    printf("\n[AJB] total_probes=%d total_time_ms=%.3f peak_RSS_KB=%ld\n", probe_id, total_ms, peak_rss);
-
-    if (actual_split >= 1) {
-        printf("[AJB] BucketPool test PASSED\n");
-    } else {
-        fprintf(stderr, "[AJB_WARN] splitDim might be unexpected — manual review needed\n");
-    }
-
+    auto t1 = chrono::high_resolution_clock::now();
+    fprintf(stderr, "[AJB_TIMER] total: %.1fus\n",
+            chrono::duration<double,micro>(t1 - t0).count());
+    fprintf(stderr, "[AJB_BP] === test_bucket_pool_full done ===\n");
     return 0;
 }

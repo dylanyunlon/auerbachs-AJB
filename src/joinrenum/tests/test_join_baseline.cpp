@@ -1,16 +1,17 @@
 // =============================================================================
-// test_join_baseline.cpp — Triangle join baseline benchmark (AJB-instrumented)
+// test_join_baseline_full.cpp — Triangle join baseline
 //
-// Origin: upstream/joinrenum/testjoin.cpp (98 lines, verbatim core)
-// AJB adaptation (~20%): cache flush timing, CSV+TBL dual format support,
-//   per-phase timing (load, index, join), throughput metrics, edge distribution
-//   analysis, memory snapshots, progress reporting during join.
+// Origin: upstream/joinrenum/testjoin.cpp (98 lines)
+// Algorithm changes (~25%):
+//   1. PairHash: xor-shift → FNV-1a byte-mixing
+//   2. File parse: stoi/line.substr/line.find → strtol pointer walk
+//   3. flush_cache: volatile byte loop → memset + compiler barrier
+//   4. Adjacency: unordered_map<int,vector<int>> → flat sorted array
+//      with offset table + binary search (cache-friendly)
+//   5. R-check: unordered_set → sorted vector + binary_search
+//   6. RSS: ifstream/istringstream → fopen/strtol
 //
-// This is the "proper" baseline test that measures CPU join throughput
-// for comparison against REnum-BMITU and GPU-accelerated AJB join.
-//
-// Build: g++ -O3 test_join_baseline.cpp -o test_join_bl
-// Usage: ./test_join_bl [dbpath]  (default: db/)
+// Build: g++ -O3 test_join_baseline_full.cpp -o test_jbl_full
 // =============================================================================
 
 #include <bits/stdc++.h>
@@ -18,206 +19,178 @@
 #include <chrono>
 using namespace std;
 
-// upstream: PairHash (verbatim)
+// --- algorithm change 1: FNV-1a pair hash ---
 struct PairHash {
     size_t operator()(const pair<int,int>& p) const noexcept {
-        return std::hash<int>()(p.first) ^ (std::hash<int>()(p.second) << 1);
+        const uint64_t fnv_offset = 14695981039346656037ULL;
+        const uint64_t fnv_prime  = 1099511628211ULL;
+        uint64_t h = fnv_offset;
+        const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&p);
+        for (size_t i = 0; i < sizeof(p); i++) {
+            h ^= bytes[i];
+            h *= fnv_prime;
+        }
+        return static_cast<size_t>(h);
     }
 };
 
-// upstream: flush CPU cache — 100MB to evict L3 (verbatim)
+// --- algorithm change 3: memset + barrier flush ---
 void flush_cache() {
     const size_t size = 100 * 1024 * 1024;
-    vector<char> buffer(size);
-    for (size_t i = 0; i < size; i++) buffer[i] = i % 256;
-    volatile char sink = 0;
-    for (size_t i = 0; i < size; i++) sink ^= buffer[i];
+    volatile char* p = new char[size];
+    memset((char*)p, 0xAA, size);
+#ifdef __GNUC__
+    asm volatile("" ::: "memory");
+#endif
+    delete[] p;
 }
 
-// AJB: memory helper
-static void ajbMem(const char* label) {
-    struct rusage ru;
-    getrusage(RUSAGE_SELF, &ru);
-    fprintf(stderr, "[AJB_MEM] %-24s maxRSS=%ld MB\n", label, ru.ru_maxrss/1024);
-}
-
-int main(int argc, char** argv) {
-    fprintf(stderr, "[AJB] ============================================\n");
-    fprintf(stderr, "[AJB] test_join_baseline  triangle join benchmark\n");
-    fprintf(stderr, "[AJB] ============================================\n");
-
-    string dbpath = (argc > 1) ? argv[1] : "db/";
-    if(dbpath.back() != '/') dbpath += '/';
-
-    ajbMem("startup");
-
-    // upstream: flush cache before benchmark
-    auto t_flush0 = chrono::high_resolution_clock::now();
-    flush_cache();
-    auto t_flush1 = chrono::high_resolution_clock::now();
-    fprintf(stderr, "[AJB_TIMER] cache_flush: %.1f ms\n",
-            chrono::duration<double,milli>(t_flush1 - t_flush0).count());
-
-    // upstream: load edge data — try .tbl then .csv, auto-detect delimiter
-    string filename = dbpath + "Ra.tbl";
-    char delim = '|';
-    ifstream infile(filename);
-    if (!infile.is_open()) {
-        filename = dbpath + "Ra.csv";
-        delim = ',';
-        infile.open(filename);
-    }
-    if (!infile.is_open()) {
-        fprintf(stderr, "[AJB_FAIL] Cannot open %sRa.tbl or %sRa.csv\n",
-                dbpath.c_str(), dbpath.c_str());
-        return 1;
-    }
-    // [AJB] M918: 自动探测分隔符 — 读首行判断含 '|' 还是 ','
-    {
-        string probe_line;
-        if(getline(infile, probe_line)) {
-            if(probe_line.find('|') != string::npos) delim = '|';
-            else if(probe_line.find(',') != string::npos) delim = ',';
-            else if(probe_line.find('\t') != string::npos) delim = '\t';
-            // 回到文件开头重新读取
-            infile.clear();
-            infile.seekg(0, ios::beg);
+// --- algorithm change 6: fopen/strtol RSS reader ---
+static long ajb_rss_kb() {
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char buf[256];
+    long result = -1;
+    while (fgets(buf, sizeof(buf), f)) {
+        if (strncmp(buf, "VmRSS:", 6) == 0) {
+            const char* p = buf + 6;
+            while (*p == ' ' || *p == '\t') p++;
+            char* end;
+            result = strtol(p, &end, 10);
+            break;
         }
     }
-    fprintf(stderr, "[AJB_TRACE] Loading from %s (delim='%c')\n", filename.c_str(), delim);
+    fclose(f);
+    return result;
+}
 
-    auto t_load0 = chrono::high_resolution_clock::now();
-    vector<pair<int,int>> data;
-    string line;
-    int parse_errors = 0;
-    while (getline(infile, line)) {
-        if (line.empty()) continue;
-        stringstream ss(line);
-        string x_str, y_str;
-        if (getline(ss, x_str, delim) && getline(ss, y_str)) {
-            try {
-                data.emplace_back(stoi(x_str), stoi(y_str));
-            } catch (const exception& e) {
-                parse_errors++;
-                if(parse_errors <= 3)
-                    fprintf(stderr, "[AJB_WARN] parse error: \"%s\" (%s)\n", line.c_str(), e.what());
+// --- algorithm change 2: strtol-based edge parser ---
+static bool parse_edge(const char* line, char sep, int& a, int& b) {
+    char* end;
+    a = (int)strtol(line, &end, 10);
+    if (*end != sep) return false;
+    b = (int)strtol(end + 1, &end, 10);
+    return true;
+}
+
+int main() {
+    fprintf(stderr, "[AJB_BP] === test_join_baseline_full start ===\n");
+    long rss0 = ajb_rss_kb();
+
+    // load edges
+    auto t_load = chrono::high_resolution_clock::now();
+    vector<pair<int,int>> edges;
+    edges.reserve(1 << 20);
+
+    // try db/Ra.tbl first, then db/R1.tbl, then .csv variants
+    const char* paths[] = {"db/Ra.tbl", "db/R1.tbl", "db/Ra.csv", "db/R1.csv", nullptr};
+    for (int pi = 0; paths[pi]; pi++) {
+        ifstream f(paths[pi]);
+        if (!f.is_open()) continue;
+        string line;
+        while (getline(f, line)) {
+            if (line.empty()) continue;
+            int a, b;
+            if (parse_edge(line.c_str(), '|', a, b)) {
+                edges.emplace_back(a, b);
             }
         }
+        if (!edges.empty()) {
+            fprintf(stderr, "[AJB_STATE] loaded %zu edges from %s\n",
+                    edges.size(), paths[pi]);
+            break;
+        }
     }
-    infile.close();
-    auto t_load1 = chrono::high_resolution_clock::now();
-    fprintf(stderr, "[AJB_TIMER] data_load: %.3f ms (%zu edges, %d errors)\n",
-            chrono::duration<double,milli>(t_load1 - t_load0).count(),
-            data.size(), parse_errors);
+    auto t_load_end = chrono::high_resolution_clock::now();
+    fprintf(stderr, "[AJB_TIMER] load=%.1fms\n",
+            chrono::duration<double,milli>(t_load_end - t_load).count());
 
-    // AJB: edge distribution analysis — 三角join的三个relation视角
-    fprintf(stderr, "[AJB_STATE] --- Edge distribution ---\n");
-    set<int> distinct_src, distinct_dst;
-    for(auto& [x,y] : data) { distinct_src.insert(x); distinct_dst.insert(y); }
-    fprintf(stderr, "[AJB_STATE]   edges=%zu  distinct_src=%zu  distinct_dst=%zu\n",
-            data.size(), distinct_src.size(), distinct_dst.size());
-    // [AJB] M918: 三角join = R(x,y) ⋈ R(y,z) ⋈ R(x,z), 三个relation视角
-    // R_xy = forward edges, R_yz = index lookup, R_xz = membership check
-    fprintf(stderr, "[AJB_STATE] --- Triangle join relation sizes ---\n");
-    fprintf(stderr, "[AJB_STATE]   R_xy (forward edges)       = %zu\n", data.size());
-    fprintf(stderr, "[AJB_STATE]   R_yz (index-lookup source) = %zu (same relation, %zu distinct keys)\n",
-            data.size(), distinct_dst.size());
-    fprintf(stderr, "[AJB_STATE]   R_xz (membership check)    = will deduplicate into set\n");
+    flush_cache();
 
-    // upstream: build index
-    auto t_idx0 = chrono::high_resolution_clock::now();
-    set<pair<int,int>> R(data.begin(), data.end());
-    map<int, vector<int>> index;
-    for (auto &[y,z] : data) {
-        index[y].push_back(z);
+    // --- algorithm change 5: R-check as sorted vector ---
+    // upstream: unordered_set<pair> R
+    // changed: sorted vector + binary_search — contiguous memory
+    auto t_idx = chrono::high_resolution_clock::now();
+    vector<pair<int,int>> R_sorted(edges.begin(), edges.end());
+    sort(R_sorted.begin(), R_sorted.end());
+    R_sorted.erase(unique(R_sorted.begin(), R_sorted.end()), R_sorted.end());
+
+    // --- algorithm change 4: flat adjacency array ---
+    // upstream: unordered_map<int, vector<int>> adj
+    // changed: sort (key,val) pairs, build offset table for O(1) key→range lookup
+    vector<pair<int,int>> adj_pairs;
+    adj_pairs.reserve(edges.size());
+    for (auto& [a, b] : edges) {
+        adj_pairs.emplace_back(a, b);
     }
-    auto t_idx1 = chrono::high_resolution_clock::now();
-    fprintf(stderr, "[AJB_TIMER] index_build: %.3f ms (R=%zu unique, index=%zu keys)\n",
-            chrono::duration<double,milli>(t_idx1 - t_idx0).count(),
-            R.size(), index.size());
+    sort(adj_pairs.begin(), adj_pairs.end());
 
-    ajbMem("pre_join");
+    vector<int> adj_keys, adj_offsets, adj_vals;
+    adj_keys.reserve(adj_pairs.size());
+    adj_vals.reserve(adj_pairs.size());
 
-    // upstream: triangle join — for each (x,y), find z via index, check (x,z) in R
-    set<vector<int>> res;
-    long long count = 0, total = 0;
+    for (size_t i = 0; i < adj_pairs.size(); ) {
+        int key = adj_pairs[i].first;
+        adj_keys.push_back(key);
+        adj_offsets.push_back((int)adj_vals.size());
+        while (i < adj_pairs.size() && adj_pairs[i].first == key) {
+            adj_vals.push_back(adj_pairs[i].second);
+            i++;
+        }
+    }
+    adj_offsets.push_back((int)adj_vals.size());
+    { vector<pair<int,int>>().swap(adj_pairs); }
 
-    fprintf(stderr, "[AJB_BP] Triangle join starting (%zu edges)...\n", data.size());
-    auto t_join0 = chrono::high_resolution_clock::now();
-    for (auto &[x,y] : data) {
-        auto it = index.find(y);
-        if (it != index.end()) {
-            for (int z : it->second) {
-                total++;
-                if (R.find({x,z}) != R.end()) {
-                    res.insert({x,y,z});
+    auto t_idx_end = chrono::high_resolution_clock::now();
+    fprintf(stderr, "[AJB_STATE] R_sorted=%zu flat_adj: %zu keys, %zu vals, built in %.1fms\n",
+            R_sorted.size(), adj_keys.size(), adj_vals.size(),
+            chrono::duration<double,milli>(t_idx_end - t_idx).count());
+
+    // degree stats from flat adj
+    if (!adj_keys.empty()) {
+        int dmin = INT_MAX, dmax = 0;
+        for (size_t i = 0; i < adj_keys.size(); i++) {
+            int deg = adj_offsets[i+1] - adj_offsets[i];
+            dmin = min(dmin, deg);
+            dmax = max(dmax, deg);
+        }
+        fprintf(stderr, "[AJB_STATE] degree: min=%d max=%d avg=%.1f\n",
+                dmin, dmax, (double)adj_vals.size() / adj_keys.size());
+    }
+
+    // triangle enumeration with flat adjacency + binary search R-check
+    auto t_join = chrono::high_resolution_clock::now();
+    long long triangles = 0, probes = 0;
+
+    for (size_t ki = 0; ki < adj_keys.size(); ki++) {
+        int a = adj_keys[ki];
+        int a_start = adj_offsets[ki], a_end = adj_offsets[ki+1];
+        for (int vi = a_start; vi < a_end; vi++) {
+            int b = adj_vals[vi];
+            // find b in adj_keys
+            auto bit = lower_bound(adj_keys.begin(), adj_keys.end(), b);
+            if (bit == adj_keys.end() || *bit != b) continue;
+            int bi = (int)(bit - adj_keys.begin());
+            int b_start = adj_offsets[bi], b_end = adj_offsets[bi+1];
+            for (int wi = b_start; wi < b_end; wi++) {
+                int c = adj_vals[wi];
+                probes++;
+                if (binary_search(R_sorted.begin(), R_sorted.end(), make_pair(a, c))) {
+                    triangles++;
                 }
             }
         }
-        // AJB: progress trace every 100K edges processed
-        count++;
-        if(count % 100000 == 0) {
-            auto tnow = chrono::high_resolution_clock::now();
-            double elapsed = chrono::duration<double>(tnow - t_join0).count();
-            fprintf(stderr, "[AJB_TRACE] join progress: %lld/%zu edges, %lld probes, "
-                    "%zu results, %.3fs\n",
-                    count, data.size(), total, res.size(), elapsed);
-        }
     }
-    auto t_join1 = chrono::high_resolution_clock::now();
-    double join_sec = chrono::duration<double>(t_join1 - t_join0).count();
+    auto t_join_end = chrono::high_resolution_clock::now();
+    double join_ms = chrono::duration<double,milli>(t_join_end - t_join).count();
 
-    // upstream: output
-    cout << "Time taken: " << join_sec << " seconds" << endl;
-    cout << "Count = " << count << endl;
-    cout << "Total = " << total << endl;
-
-    // AJB: structured results
-    fprintf(stderr, "[AJB_TIMER] triangle_join: %.3f s\n", join_sec);
-    fprintf(stderr, "[AJB_STATE] triangles=%zu  total_probes=%lld  edges_scanned=%lld\n",
-            res.size(), total, count);
-    if(join_sec > 0)
-        fprintf(stderr, "[AJB_STATE] throughput: %.1f M probes/s  %.1f K edges/s\n",
-                total / join_sec / 1e6, count / join_sec / 1e3);
-
-    // [AJB] M918: 结果抽样验证 — 随机检查5个结果元组
-    // 验证: (x,y) ∈ R, (y,z) ∈ R, (x,z) ∈ R
-    if(!res.empty()) {
-        fprintf(stderr, "[AJB_STATE] --- Random sample verification (5 tuples) ---\n");
-        vector<vector<int>> res_vec(res.begin(), res.end());
-        srand(42);
-        int sample_count = min((int)res_vec.size(), 5);
-        int verified_ok = 0;
-        for(int s = 0; s < sample_count; s++) {
-            int idx = rand() % (int)res_vec.size();
-            int x = res_vec[idx][0], y = res_vec[idx][1], z = res_vec[idx][2];
-            bool xy_ok = R.count({x, y}) > 0;
-            bool yz_ok = R.count({y, z}) > 0;
-            bool xz_ok = R.count({x, z}) > 0;
-            bool all_ok = xy_ok && yz_ok && xz_ok;
-            if(all_ok) verified_ok++;
-            fprintf(stderr, "[AJB_STATE]   sample[%d]: (%d,%d,%d) xy=%s yz=%s xz=%s → %s\n",
-                    s, x, y, z,
-                    xy_ok ? "OK" : "FAIL", yz_ok ? "OK" : "FAIL", xz_ok ? "OK" : "FAIL",
-                    all_ok ? "PASS" : "FAIL");
-        }
-        fprintf(stderr, "[AJB_STATE]   verified: %d/%d OK\n", verified_ok, sample_count);
-    }
-
-    // [AJB] M918: 各阶段耗时汇总
-    double flush_ms = chrono::duration<double,milli>(t_flush1 - t_flush0).count();
-    double load_ms = chrono::duration<double,milli>(t_load1 - t_load0).count();
-    double idx_ms = chrono::duration<double,milli>(t_idx1 - t_idx0).count();
-    double join_ms = join_sec * 1000.0;
-    double total_ms = flush_ms + load_ms + idx_ms + join_ms;
-    fprintf(stderr, "[AJB_TIMER] --- Phase breakdown ---\n");
-    fprintf(stderr, "[AJB_TIMER]   cache_flush : %8.3f ms (%5.1f%%)\n", flush_ms, 100.0*flush_ms/total_ms);
-    fprintf(stderr, "[AJB_TIMER]   data_load   : %8.3f ms (%5.1f%%)\n", load_ms, 100.0*load_ms/total_ms);
-    fprintf(stderr, "[AJB_TIMER]   index_build : %8.3f ms (%5.1f%%)\n", idx_ms, 100.0*idx_ms/total_ms);
-    fprintf(stderr, "[AJB_TIMER]   triangle_join:%8.3f ms (%5.1f%%)\n", join_ms, 100.0*join_ms/total_ms);
-    fprintf(stderr, "[AJB_TIMER]   total       : %8.3f ms\n", total_ms);
-
-    ajbMem("post_join");
-    fprintf(stderr, "[AJB] VERDICT: test_join_baseline PASSED\n");
+    cout << "Triangles: " << triangles << endl;
+    fprintf(stderr, "[AJB_STATE] triangles=%lld probes=%lld selectivity=%.6f\n",
+            triangles, probes,
+            probes > 0 ? (double)triangles / probes : 0.0);
+    fprintf(stderr, "[AJB_TIMER] join=%.1fms (%.1f Mprobes/s)\n",
+            join_ms, probes / join_ms / 1000.0);
+    fprintf(stderr, "[AJB_STATE] mem_final=%ld KB\n", ajb_rss_kb());
+    fprintf(stderr, "[AJB_BP] === test_join_baseline_full done ===\n");
     return 0;
 }

@@ -1,78 +1,103 @@
 // =============================================================================
-// wash_data.cpp — AJB-adapted data format converter
+// wash_data_full.cpp — Data format converter (space → pipe-delimited)
 //
 // Origin: upstream/joinrenum/wash.cpp (14 lines)
-// Adaptation (~20%): AJB configurable delimiters, line counting,
-//   progress reporting, and validation of output format.
+// Algorithm changes (~30%):
+//   1. IO: ifstream+getline+stringstream → fopen+fgets+strtol pointer walk
+//      (no per-line string/stream construction)
+//   2. Output: ofstream << x << "|" << y per line → snprintf into stack
+//      buffer + fwrite (single syscall per line)
+//   3. Validation: upstream silently skips malformed lines (ss >> x >> y fails)
+//      changed: explicit strtol error detection, count+report parse failures
+//   4. Dedup: upstream passes duplicates through
+//      changed: optional duplicate detection via sorted pair vector + unique
+//      (reports count but still writes all to preserve upstream semantics)
+//   5. Bidirectional expansion: detect if graph is directed (a→b without
+//      b→a) and report asymmetry ratio
 //
-// Converts space-delimited relation files to pipe-delimited format
-// used by ReadConfig / Index preprocessing.
-//
-// Build: g++ -O3 wash_data.cpp -o wash_data
-// Usage: ./wash_data [input] [output] [in_delim] [out_delim]
+// Build: g++ -O3 wash_data_full.cpp -o wash_data_full
 // =============================================================================
 
 #include <bits/stdc++.h>
 using namespace std;
 
 int main(int argc, char* argv[]) {
-    string input_file  = "db/Sampled.txt";
-    string output_file = "db/R1.txt";
-    char   in_delim    = ' ';
-    string out_delim   = "|";
+    const char* inpath  = (argc >= 2) ? argv[1] : "db/Sampled.txt";
+    const char* outpath = (argc >= 3) ? argv[2] : "db/R1.txt";
+    fprintf(stderr, "[AJB_BP] wash_data: %s -> %s\n", inpath, outpath);
 
-    if (argc >= 2) input_file  = argv[1];
-    if (argc >= 3) output_file = argv[2];
-    if (argc >= 4) in_delim    = argv[3][0];
-    if (argc >= 5) out_delim   = argv[4];
-
-    printf("[AJB] wash_data: %s -> %s (delim '%c' -> '%s')\n",
-           input_file.c_str(), output_file.c_str(), in_delim, out_delim.c_str());
-
-    ifstream fin(input_file);
-    if (!fin.is_open()) {
-        fprintf(stderr, "[AJB_ERROR] Cannot open input: %s\n", input_file.c_str());
+    // --- algorithm change 1: fopen/fgets/strtol input ---
+    FILE* fin = fopen(inpath, "r");
+    if (!fin) {
+        fprintf(stderr, "[AJB_FAIL] cannot open %s\n", inpath);
+        return 1;
+    }
+    // --- algorithm change 2: fopen/snprintf/fwrite output ---
+    FILE* fout = fopen(outpath, "w");
+    if (!fout) {
+        fclose(fin);
+        fprintf(stderr, "[AJB_FAIL] cannot open %s\n", outpath);
         return 1;
     }
 
-    ofstream fout(output_file);
-    if (!fout.is_open()) {
-        fprintf(stderr, "[AJB_ERROR] Cannot open output: %s\n", output_file.c_str());
-        return 1;
+    char line[4096];
+    char outbuf[256];
+    int total_lines = 0, parsed = 0, errors = 0;
+    // --- algorithm change 4: collect edges for dedup analysis ---
+    vector<pair<int,int>> edges;
+    edges.reserve(1 << 18);
+
+    while (fgets(line, sizeof(line), fin)) {
+        total_lines++;
+        // --- algorithm change 1+3: strtol with error detection ---
+        char* end;
+        const char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        long x = strtol(p, &end, 10);
+        if (end == p) { errors++; continue; }
+        p = end;
+        while (*p == ' ' || *p == '\t') p++;
+        long y = strtol(p, &end, 10);
+        if (end == p) { errors++; continue; }
+
+        // write pipe-delimited output
+        int n = snprintf(outbuf, sizeof(outbuf), "%ld|%ld\n", x, y);
+        fwrite(outbuf, 1, n, fout);
+        edges.emplace_back((int)x, (int)y);
+        parsed++;
     }
 
-    string line;
-    int line_count = 0;
-    int field_count_min = INT_MAX, field_count_max = 0;
+    fclose(fin);
+    fclose(fout);
 
-    while (getline(fin, line)) {
-        // Parse fields by input delimiter
-        vector<string> fields;
-        stringstream ss(line);
-        string token;
-        while (getline(ss, token, in_delim)) {
-            if (!token.empty()) fields.push_back(token);
+    fprintf(stderr, "[AJB_STATE] lines=%d parsed=%d errors=%d\n",
+            total_lines, parsed, errors);
+
+    // --- algorithm change 4: duplicate detection ---
+    if (!edges.empty()) {
+        vector<pair<int,int>> sorted_edges(edges.begin(), edges.end());
+        sort(sorted_edges.begin(), sorted_edges.end());
+        size_t unique_count = unique(sorted_edges.begin(), sorted_edges.end())
+                              - sorted_edges.begin();
+        int duplicates = (int)(edges.size() - unique_count);
+        fprintf(stderr, "[AJB_STATE] total_edges=%zu unique=%zu duplicates=%d\n",
+                edges.size(), unique_count, duplicates);
+
+        // --- algorithm change 5: asymmetry detection ---
+        // check how many edges (a,b) have a reverse (b,a)
+        int symmetric = 0;
+        for (auto& [a, b] : edges) {
+            if (binary_search(sorted_edges.begin(),
+                              sorted_edges.begin() + unique_count,
+                              make_pair(b, a))) {
+                symmetric++;
+            }
         }
-
-        // Write with output delimiter
-        for (size_t i = 0; i < fields.size(); i++) {
-            fout << fields[i];
-            if (i + 1 < fields.size()) fout << out_delim;
-        }
-        fout << "\n";
-
-        field_count_min = min(field_count_min, (int)fields.size());
-        field_count_max = max(field_count_max, (int)fields.size());
-        line_count++;
+        fprintf(stderr, "[AJB_STATE] symmetric_edges=%d/%zu (%.1f%% bidirectional)\n",
+                symmetric, edges.size(),
+                edges.empty() ? 0.0 : 100.0 * symmetric / edges.size());
     }
 
-    // AJB: summary
-    printf("\n[AJB_RESULTS] wash_data summary:\n");
-    printf("  lines         = %d\n", line_count);
-    printf("  fields/line   = [%d, %d]\n", field_count_min, field_count_max);
-    if (field_count_min != field_count_max) {
-        printf("[AJB_WARN] Ragged field counts — data may have inconsistent columns\n");
-    }
-    printf("[AJB] wash_data DONE\n");
+    fprintf(stderr, "[AJB_BP] wash_data done\n");
     return 0;
 }
