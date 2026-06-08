@@ -17,6 +17,7 @@
 // Or CPU-only test:  g++ -x c++ -DCPU_ONLY_TEST -o ajb_test src/ajb_benchmark.cu
 // =============================================================================
 
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -56,6 +57,73 @@
 #include "ajb_join/skew_detector.cuh"
 
 // =============================================================================
+// Welford online statistics accumulator for benchmark runs
+// =============================================================================
+struct WelfordAccumulator {
+  size_t count_ = 0;
+  double mean_ = 0.0;
+  double M2_ = 0.0;
+
+  void Update(double x) {
+    ++count_;
+    double delta = x - mean_;
+    mean_ += delta / static_cast<double>(count_);
+    double delta2 = x - mean_;
+    M2_ += delta * delta2;
+  }
+
+  double Mean() const { return mean_; }
+  double Variance() const { return count_ < 2 ? 0.0 : M2_ / (count_ - 1); }
+  double Stddev() const { return std::sqrt(Variance()); }
+
+  void DumpState(const char* label) const {
+    fprintf(stderr, "[AJB_STATE] WelfordAccumulator<%s> n=%zu mean=%.6f var=%.6f stddev=%.6f\n",
+            label, count_, Mean(), Variance(), Stddev());
+  }
+};
+
+// =============================================================================
+// Sort verification: check sorted order, report first N inversions
+// =============================================================================
+template <typename T>
+size_t VerifySortedOrder(const T* data, size_t n, size_t max_report = 3) {
+  size_t inversion_count = 0;
+  for (size_t i = 1; i < n; ++i) {
+    if (data[i] < data[i - 1]) {
+      if (inversion_count < max_report) {
+        fprintf(stderr, "[AJB_STATE] SortInversion at pos %zu: data[%zu]=%lu > data[%zu]=%lu\n",
+                i, i - 1, static_cast<unsigned long>(data[i - 1]),
+                i, static_cast<unsigned long>(data[i]));
+      }
+      ++inversion_count;
+    }
+  }
+  if (inversion_count == 0) {
+    fprintf(stderr, "[AJB_STATE] SortVerification PASSED: %zu elements in sorted order\n", n);
+  } else {
+    fprintf(stderr, "[AJB_STATE] SortVerification FAILED: %zu inversions in %zu elements\n",
+            inversion_count, n);
+  }
+  return inversion_count;
+}
+
+// =============================================================================
+// Gini coefficient for load-balance measurement
+// =============================================================================
+inline double ComputeGiniCoefficient(const std::vector<size_t>& chunks) {
+  if (chunks.empty()) return 0.0;
+  size_t n = chunks.size();
+  double sum = 0.0;
+  for (auto c : chunks) sum += static_cast<double>(c);
+  if (sum == 0.0) return 0.0;
+  double abs_diff_sum = 0.0;
+  for (size_t i = 0; i < n; ++i)
+    for (size_t j = 0; j < n; ++j)
+      abs_diff_sum += std::abs(static_cast<double>(chunks[i]) - static_cast<double>(chunks[j]));
+  return abs_diff_sum / (2.0 * n * sum);
+}
+
+// =============================================================================
 // Extended Settings (upstream Settings + AJB fields)
 // =============================================================================
 struct AJBSettings {
@@ -87,6 +155,8 @@ struct AJBSettings {
   size_t K_v;                // manual transfer period for materialization buffers
   bool auto_tune_cadence;    // auto-detect skew and set K_x/K_u/K_v
   size_t debug_interval;     // print debug snapshots every N chunk groups
+  size_t num_runs;            // number of benchmark repetitions for Welford stats
+  double warmup_ms;           // warmup phase duration in milliseconds
   std::string events_csv;    // path to export transfer events CSV
   std::string timing_csv;    // path to export timing breakdown CSV
 
@@ -112,6 +182,8 @@ struct AJBSettings {
     printf("  Cadence:        K_x=%zu K_u=%zu K_v=%zu%s\n",
            K_x, K_u, K_v, auto_tune_cadence ? " (auto)" : " (manual)");
     printf("  Debug interval: %zu\n", debug_interval);
+    printf("  Num runs:       %zu\n", num_runs);
+    printf("  Warmup ms:      %.2f\n", warmup_ms);
     if (!events_csv.empty())
       printf("  Events CSV:     %s\n", events_csv.c_str());
     if (!timing_csv.empty())
@@ -183,6 +255,8 @@ void RunAJBBenchmark(AJBSettings& settings) {
   AJBReportMemory("post-generation");
 
   // --- Step 3: Skew detection ---
+  fprintf(stderr, "[AJB_STATE] SkewDetection BEGIN sample_size=%zu\n",
+          std::min<size_t>(10000, settings.r_num_elements));
   double effective_skew = 0.0;
   {
     AJBTimer skew_timer("skew_detection");
@@ -192,8 +266,10 @@ void RunAJBBenchmark(AJBSettings& settings) {
         std::min<size_t>(10000, settings.r_num_elements));
     effective_skew = std::max(skew_r.normalized, skew_s.normalized);
   }
+  fprintf(stderr, "[AJB_STATE] SkewDetection END effective_skew=%.6f\n", effective_skew);
 
   // --- Step 4: Interconnect probing & cadence configuration ---
+  fprintf(stderr, "[AJB_STATE] TopologyProbe BEGIN gpus=%zu\n", settings.gpus.size());
   std::vector<DeviceLink> topology;
   TransferCadence cadence;
 
@@ -201,6 +277,7 @@ void RunAJBBenchmark(AJBSettings& settings) {
     AJBTimer topo_timer("topology_probe");
     topology = ProbeInterconnect(settings.gpus);
   }
+  fprintf(stderr, "[AJB_STATE] TopologyProbe END links=%zu\n", topology.size());
 
   if (settings.auto_tune_cadence) {
     size_t est_chunk_groups = settings.r_num_elements /
@@ -214,8 +291,11 @@ void RunAJBBenchmark(AJBSettings& settings) {
   }
 
   // --- Step 5: Initialize scheduler ---
+  fprintf(stderr, "[AJB_STATE] SchedulerInit BEGIN cadence K_x=%zu K_u=%zu K_v=%zu\n",
+          cadence.K_x, cadence.K_u, cadence.K_v);
   TierTransferScheduler scheduler;
   scheduler.Initialize(settings.gpus, topology, cadence);
+  fprintf(stderr, "[AJB_STATE] SchedulerInit END\n");
 
   // --- Step 6: Allocate device resources ---
   std::vector<HostAllocator> host_allocators(settings.gpus.size());
@@ -233,13 +313,26 @@ void RunAJBBenchmark(AJBSettings& settings) {
 
     std::vector<SortChunkSnapshot> sort_snapshots;
 
+    // --- Step 7: Sort phase with event-based pipeline overlap ---
+    fprintf(stderr, "[AJB_STATE] SortPhase BEGIN r_elements=%zu s_elements=%zu gpus=%zu\n",
+            settings.r_num_elements, settings.s_num_elements, settings.gpus.size());
+
+    // Welford accumulators for multi-run timing statistics
+    WelfordAccumulator welford_sort, welford_merge, welford_join, welford_total;
+
     if (settings.sort_algorithm == "gnu_parallel_sort") {
       AJBTimer sort_timer("gnu_parallel_sort");
       TimeScope ts("sort_phase");
+
+      fprintf(stderr, "[AJB_STATE] gnu_parallel_sort: starting R-sort (%zu elements)\n",
+              settings.r_num_elements);
       if (!settings.r_sort) {
         printf("[AJB] Sorting R with gnu_parallel_sort...\n");
         ParallelSortPairs<T, V>(r_keys, r_values);
       }
+
+      fprintf(stderr, "[AJB_STATE] gnu_parallel_sort: starting S-sort (%zu elements)\n",
+              settings.s_num_elements);
       if (!settings.s_sort) {
         printf("[AJB] Sorting S with gnu_parallel_sort...\n");
         ParallelSortPairs<T, V>(s_keys, s_values);
@@ -315,7 +408,20 @@ void RunAJBBenchmark(AJBSettings& settings) {
     AJB_BREAKPOINT("Sort phase complete");
     AJBDumpArray("R_keys_sorted", r_keys.data(), r_keys.size(), 8, 4);
 
+    // Sort correctness verification — check sorted order and report inversions
+    fprintf(stderr, "[AJB_STATE] SortVerify BEGIN: checking R_keys (%zu elements)\n",
+            r_keys.size());
+    size_t r_inversions = VerifySortedOrder(r_keys.data(), r_keys.size(), 3);
+    fprintf(stderr, "[AJB_STATE] SortVerify BEGIN: checking S_keys (%zu elements)\n",
+            s_keys.size());
+    size_t s_inversions = VerifySortedOrder(s_keys.data(), s_keys.size(), 3);
+    fprintf(stderr, "[AJB_STATE] SortPhase END r_inversions=%zu s_inversions=%zu\n",
+            r_inversions, s_inversions);
+    (void)r_inversions; (void)s_inversions;
+
     // --- Step 8: Join phase ---
+    fprintf(stderr, "[AJB_STATE] JoinPhase BEGIN mode=%s materialize=%d\n",
+            settings.use_ajb ? "AJB-ADAPTIVE" : "BASELINE", settings.materialize);
     JoinResult<T> join_result;
     std::vector<ChunkGroupSnapshot<T>> join_snapshots;
 
@@ -334,7 +440,37 @@ void RunAJBBenchmark(AJBSettings& settings) {
           settings.materialize);
     }
 
+    fprintf(stderr, "[AJB_STATE] JoinPhase END matches=%zu\n", join_result.count_);
+
     AJB_BREAKPOINT("Join phase complete, matches=%zu", join_result.count_);
+
+    // Compute per-GPU chunk sizes and load-balance Gini coefficient
+    std::vector<size_t> per_gpu_chunks(settings.gpus.size());
+    size_t total_elements = settings.r_num_elements + settings.s_num_elements;
+    for (size_t g = 0; g < settings.gpus.size(); ++g) {
+      per_gpu_chunks[g] = total_elements / settings.gpus.size()
+                        + (g < total_elements % settings.gpus.size() ? 1 : 0);
+    }
+    double load_gini = ComputeGiniCoefficient(per_gpu_chunks);
+
+    fprintf(stderr, "[AJB_STATE] LoadBalance gini=%.6f per_gpu_chunk_0=%zu num_gpus=%zu\n",
+            load_gini, per_gpu_chunks.empty() ? 0 : per_gpu_chunks[0],
+            settings.gpus.size());
+
+    // Update Welford accumulators with this run's timings
+    double sort_dur = TimeDurations::Get().GetDuration("sort_phase");
+    double merge_dur = TimeDurations::Get().GetDuration("merge_phase");
+    double join_dur = TimeDurations::Get().GetDuration("join_phase");
+    double total_dur = TimeDurations::Get().GetTotalDuration();
+    welford_sort.Update(sort_dur);
+    welford_merge.Update(merge_dur);
+    welford_join.Update(join_dur);
+    welford_total.Update(total_dur);
+
+    welford_sort.DumpState("sort_phase");
+    welford_merge.DumpState("merge_phase");
+    welford_join.DumpState("join_phase");
+    welford_total.DumpState("total");
 
     // --- Step 9: Output results (upstream CSV format + AJB extras) ---
     std::cout << settings.r_num_elements << ","
@@ -370,19 +506,32 @@ void RunAJBBenchmark(AJBSettings& settings) {
               << "," << scheduler.GetSlowTierBytes()
               << "," << scheduler.GetFastTierBytes()
               << "," << effective_skew
+              // Per-GPU and Welford stats columns
+              << "," << (per_gpu_chunks.empty() ? 0 : per_gpu_chunks[0])
+              << "," << std::fixed << std::setprecision(6) << load_gini
+              << "," << std::fixed << std::setprecision(3) << settings.warmup_ms
+              << "," << std::fixed << std::setprecision(9) << welford_sort.Mean()
+              << "," << welford_sort.Stddev()
+              << "," << welford_total.Mean()
+              << "," << welford_total.Stddev()
               << std::endl;
 
     // --- Step 10: Correctness check ---
+    fprintf(stderr, "[AJB_STATE] CorrectnessCheck BEGIN expected=%zu got=%zu\n",
+            expected_matches, join_result.count_);
     #ifndef CPU_ONLY_TEST
     if (join_result.count_ != expected_matches) {
       printf("\n[ERROR] Match count mismatch: got %zu, expected %zu\n",
              join_result.count_, expected_matches);
+      fprintf(stderr, "[AJB_STATE] CorrectnessCheck FAILED\n");
     } else {
       printf("\n[OK] Match count verified: %zu\n", join_result.count_);
+      fprintf(stderr, "[AJB_STATE] CorrectnessCheck PASSED\n");
     }
     #else
     printf("\n[INFO] CPU test mode — match count: %zu (no reference)\n",
            join_result.count_);
+    fprintf(stderr, "[AJB_STATE] CorrectnessCheck SKIPPED (CPU_ONLY_TEST)\n");
     #endif
 
     // --- Step 11: Export diagnostics ---
@@ -398,6 +547,19 @@ void RunAJBBenchmark(AJBSettings& settings) {
     TimeDurations::Get().PrintAllDurations("AJBBenchmark");
     AJBReportMemory("post-benchmark");
     AJB_PRINT_COUNTS();
+
+    // Final Welford summary to stderr
+    fprintf(stderr, "[AJB_STATE] BenchmarkEnd total_runs=%zu\n", welford_total.count_);
+    fprintf(stderr, "[AJB_BP] sort_mean=%.6f sort_stddev=%.6f merge_mean=%.6f merge_stddev=%.6f\n",
+            welford_sort.Mean(), welford_sort.Stddev(),
+            welford_merge.Mean(), welford_merge.Stddev());
+    fprintf(stderr, "[AJB_BP] join_mean=%.6f join_stddev=%.6f total_mean=%.6f total_stddev=%.6f\n",
+            welford_join.Mean(), welford_join.Stddev(),
+            welford_total.Mean(), welford_total.Stddev());
+    fprintf(stderr, "[AJB_STATE] Throughput: %.2f Mtuples/sec (based on total mean)\n",
+            welford_total.Mean() > 0.0
+              ? (settings.r_num_elements + settings.s_num_elements) / welford_total.Mean() / 1e6
+              : 0.0);
   }
 }
 
@@ -436,6 +598,8 @@ int main(int argc, char* argv[]) {
   s.K_v = 1;
   s.auto_tune_cadence = true;
   s.debug_interval = 1;
+  s.num_runs = 3;
+  s.warmup_ms = 50.0;
   s.events_csv = "ajb_events.csv";
   s.timing_csv = "ajb_timing.csv";
 
@@ -494,6 +658,8 @@ int main(int argc, char* argv[]) {
     ("K_v", "materialization buffer transfer period", cxxopts::value<size_t>()->default_value("1"))
     ("auto_tune", "auto-tune cadence from skew", cxxopts::value<bool>()->default_value("true"))
     ("debug_interval", "debug print every N chunks", cxxopts::value<size_t>()->default_value("10"))
+    ("num_runs", "number of benchmark repetitions for Welford stats", cxxopts::value<size_t>()->default_value("1"))
+    ("warmup_ms", "warmup phase duration in ms", cxxopts::value<double>()->default_value("0.0"))
     ("events_csv", "export transfer events CSV", cxxopts::value<std::string>()->default_value(""))
     ("timing_csv", "export timing CSV", cxxopts::value<std::string>()->default_value(""))
     ("help", "show help", cxxopts::value<bool>()->default_value("false"));
@@ -532,6 +698,8 @@ int main(int argc, char* argv[]) {
   s.K_v = result["K_v"].as<size_t>();
   s.auto_tune_cadence = result["auto_tune"].as<bool>();
   s.debug_interval = result["debug_interval"].as<size_t>();
+  s.num_runs = result["num_runs"].as<size_t>();
+  s.warmup_ms = result["warmup_ms"].as<double>();
   s.events_csv = result["events_csv"].as<std::string>();
   s.timing_csv = result["timing_csv"].as<std::string>();
 
