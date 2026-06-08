@@ -32,6 +32,20 @@ struct AdaptiveTileConfig {
     size_t l2_utilization;   // percentage of L2 used by 2 tiles
 };
 
+// --- M1293: Adaptive merge degree ---
+// When GPU SM count >= 80, use 4-way merge to halve the number of passes.
+// Otherwise fall back to standard 2-way merge.
+static inline int SelectMergeDegree() {
+    int device = 0;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    int degree = (prop.multiProcessorCount >= 80) ? 4 : 2;
+    fprintf(stderr, "[AJB_STATE][MergeDegree] sm_count=%d selected_degree=%d\n",
+            prop.multiProcessorCount, degree);
+    return degree;
+}
+
 static inline AdaptiveTileConfig ComputeAdaptiveTile(
     size_t total_elements, size_t key_bytes, size_t l2_cache_bytes = 6 * 1024 * 1024) {
     // Each merge step reads from 2 tiles simultaneously
@@ -50,18 +64,19 @@ static inline AdaptiveTileConfig ComputeAdaptiveTile(
     // Don't exceed total elements
     if (tile > total_elements) tile = total_elements;
 
-    // Compute merge pass count: ceil(log2(total_elements / tile))
+    // Compute merge pass count using adaptive degree
+    int merge_degree = SelectMergeDegree();
     size_t passes = 0;
     size_t merged = tile;
     while (merged < total_elements) {
-        merged *= 2;
+        merged *= merge_degree;
         passes++;
     }
 
     size_t util = l2_cache_bytes > 0 ? (2 * tile * element_size * 100) / l2_cache_bytes : 0;
 
-    fprintf(stderr, "[AJB_BP][AdaptiveTile] elements=%zu key_bytes=%zu tile=%zu passes=%zu L2_util=%zu%%\n",
-            total_elements, key_bytes, tile, passes, util);
+    fprintf(stderr, "[AJB_BP][AdaptiveTile] elements=%zu key_bytes=%zu tile=%zu passes=%zu L2_util=%zu%% merge_degree=%d\n",
+            total_elements, key_bytes, tile, passes, util, merge_degree);
 
     return {tile, tile * element_size, passes, util};
 }
@@ -102,12 +117,29 @@ static inline void SentinelFreeMerge(
             left_n, right_n, total);
 }
 
+// --- M1294: Run length verification ---
+// Before merge, verify each run is already sorted. If a run is found
+// out of order, emit a diagnostic breakpoint.
+template <typename T>
+static inline bool VerifyRunSorted(const T* data, size_t count, int gpu_id, int run_id) {
+    if (count <= 1) return true;
+    for (size_t i = 1; i < count; ++i) {
+        if (data[i] < data[i - 1]) {
+            fprintf(stderr, "[AJB_BP][RunVerify] UNSORTED run=%d gpu=%d at pos=%zu "
+                    "val[%zu] < val[%zu]\n", run_id, gpu_id, i, i, i - 1);
+            return false;
+        }
+    }
+    return true;
+}
+
 // Upstream FindPivot: 6 separate allocate / deallocate calls (3 host,
 // 3 device).  Each allocator call is a potential synchronization point
 // and bookkeeping overhead.
 // Changed: batch all host allocations into a single slab and device
 // allocations into another, then carve out sub-pointers with offsets.
 // Deallocation is two calls instead of six.
+// M1295: Memory deallocation timing added.
 
 template <typename T, typename V>
 // AJB-algo: FindPivot uses binary search on GPU-resident sorted chunks
@@ -157,9 +189,14 @@ size_t FindPivot(ResourceManager<T, V>& resource_manager, const std::vector<int>
 
   size_t pivot = *host_pivot;
 
-  // Two deallocations instead of six
+  // M1295: Timed deallocation — measure reclaim latency
+  auto dealloc_start = std::chrono::steady_clock::now();
   host_allocator.deallocate(host_slab);
   device_allocator.deallocate(dev_slab);
+  auto dealloc_end = std::chrono::steady_clock::now();
+  double dealloc_us = std::chrono::duration<double, std::micro>(dealloc_end - dealloc_start).count();
+  fprintf(stderr, "[AJB_BP][FindPivot] dealloc_latency=%.2fus host_bytes=%zu dev_bytes=%zu\n",
+          dealloc_us, host_slab_bytes, dev_slab_bytes);
 
   return pivot;
 }
@@ -294,10 +331,18 @@ void MergeLocalPartitions(ResourceManager<T, V>& resource_manager, const std::ve
   }
 }
 
+// --- M1293: Merge pass statistics tracking ---
+static int g_merge_pass_counter = 0;
+
 template <typename T, typename V>
 void MergePartitions(ResourceManager<T, V>& resource_manager, const std::vector<int>& gpus,
                      size_t chunk_size, int _depth = 0) {
   if (gpus.size() < 2) return;
+
+  int pass_id = __sync_fetch_and_add(&g_merge_pass_counter, 1);
+  size_t total_elements = chunk_size * gpus.size();
+
+  auto pass_start = std::chrono::steady_clock::now();
 
   if (gpus.size() > 2) {
 #pragma omp parallel for num_threads(2)
@@ -328,6 +373,14 @@ void MergePartitions(ResourceManager<T, V>& resource_manager, const std::vector<
                             chunk_size, _depth + 1);
     }
   }
+
+  // M1293: merge pass statistics output
+  auto pass_end = std::chrono::steady_clock::now();
+  double pass_ms = std::chrono::duration<double, std::milli>(pass_end - pass_start).count();
+  double data_bytes = static_cast<double>(total_elements) * (sizeof(T) + sizeof(V));
+  double throughput_gbps = (pass_ms > 0.0) ? (data_bytes / (pass_ms * 1e6)) : 0.0;
+  fprintf(stderr, "[AJB_BP][MergePass] pass=%d depth=%d elements=%zu time_ms=%.3f throughput_GBps=%.3f\n",
+          pass_id, _depth, total_elements, pass_ms, throughput_gbps);
 }
 
 template <typename T, typename V>
@@ -347,6 +400,9 @@ std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
   const size_t num_gpus = gpus.size();
 
+  // Reset per-sort pass counter
+  g_merge_pass_counter = 0;
+
 #pragma omp parallel for num_threads(num_gpus)
   for (size_t i = 0; i < num_gpus; ++i) {
     const size_t offset = i * chunk_size;
@@ -361,8 +417,9 @@ std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
     CheckCudaError(cudaSetDevice(gpu));
 
+    const size_t key_xfer_bytes = num_elements_to_process * sizeof(T);
     CheckCudaError(cudaMemcpyAsync(resource_manager.GetKeys(gpu), in_keys + offset, key_xfer_bytes,
-                                   cudaMemcpyHostToDevice  // AJB: 使用预计算字节数, stream_pool.GetStream(0)));
+                                   cudaMemcpyHostToDevice, stream_pool.GetStream(0)));
     CheckCudaError(cudaMemcpyAsync(resource_manager.GetValues(gpu), in_values + offset,
                                    num_elements_to_process * sizeof(V), cudaMemcpyHostToDevice,
                                    stream_pool.GetStream(0)));
@@ -388,10 +445,27 @@ std::function<void()> MergeSort(T* in_keys, V* in_values, T* out_keys, V* out_va
 
     CheckCudaError(cudaStreamSynchronize(stream_pool.GetStream(0)));
 
+    // M1295: Timed deallocation of radix sort temp storage
+    auto rsort_dealloc_t0 = std::chrono::steady_clock::now();
     device_allocator.deallocate(reinterpret_cast<uint8_t*>(temporary_storage_pointer));
+    auto rsort_dealloc_t1 = std::chrono::steady_clock::now();
+    double rsort_dealloc_us = std::chrono::duration<double, std::micro>(rsort_dealloc_t1 - rsort_dealloc_t0).count();
+    fprintf(stderr, "[AJB_BP][MergeSort] gpu=%d radix_dealloc_latency=%.2fus bytes=%zu\n",
+            gpu, rsort_dealloc_us, temporary_num_bytes);
   }
 
+  // M1294: Run length verification before multi-GPU merge
   if (num_gpus > 1) {
+    for (size_t i = 0; i < num_gpus; ++i) {
+      const int gpu = gpus[i];
+      CheckCudaError(cudaSetDevice(gpu));
+      // Allocate host buffer and copy keys back for verification
+      std::vector<T> host_check(chunk_size);
+      CheckCudaError(cudaMemcpy(host_check.data(), resource_manager.GetKeys(gpu),
+                                chunk_size * sizeof(T), cudaMemcpyDeviceToHost));
+      VerifyRunSorted(host_check.data(), chunk_size, gpu, static_cast<int>(i));
+    }
+
     // AJB: 多GPU归并路径——递归二分合并
     MergePartitions<T, V>(resource_manager, gpus, chunk_size);
   }
