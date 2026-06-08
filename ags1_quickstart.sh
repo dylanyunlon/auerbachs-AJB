@@ -5,9 +5,26 @@
 # 使用: 在ags1上复制粘贴这整个脚本, 或者:
 #   bash <(curl -sL https://raw.githubusercontent.com/dylanyunlon/auerbachs-AJB/main/ags1_quickstart.sh)
 # =============================================================================
-set -euo pipefail
+set -uo pipefail
 
-WORK="/data/jiacheng/system/cache/temp/nips2026"
+# === Auto-detect CUDA/cmake paths ===
+for p in /usr/local/cuda/bin /usr/local/cuda-*/bin $HOME/.local/bin /opt/cmake*/bin; do
+  [ -d "$p" ] && export PATH="$p:$PATH"
+done
+# conda cmake fallback
+if ! command -v cmake &>/dev/null && command -v conda &>/dev/null; then
+  conda install -y cmake 2>/dev/null || true
+fi
+# Check g++ version for -march support
+GCC_VER=$(g++ -dumpversion 2>/dev/null | cut -d. -f1)
+if [ "${GCC_VER:-0}" -lt 12 ]; then
+  MARCH_FLAG="-march=znver3"
+else
+  MARCH_FLAG="-march=znver3"
+fi
+
+
+WORK="${WORK:-$(pwd)}"
 cd "$WORK"
 
 # === Step 1: 拉取最新代码 ===
@@ -46,11 +63,10 @@ for f in tests/test_bucket_pool.cpp tests/test_count_oracle.cpp \
          tests/test_enumerator.cpp tests/test_join_baseline.cpp \
          tests/test_join_triangle.cpp tests/test_renum_baseline.cpp; do
   name=$(basename $f .cpp)
-  numactl --cpubind=1 --membind=1 \
-    g++ -std=c++17 -O3 -march=znver4 -DAJB_DEBUG -I. $f -lglpk -o /tmp/$name 2>&1 && {
+  g++ -std=c++17 -O3 -march=znver3 -DAJB_DEBUG -I. $f -lglpk -o /tmp/$name 2>&1 && {
     echo -n "  $name: "
     T0=$(date +%s%N)
-    numactl --cpubind=1 --membind=1 timeout 120 /tmp/$name \
+    timeout 120 /tmp/$name \
       > ../../experiment_data/logs/${name}.txt 2>&1
     RC=$?
     T1=$(date +%s%N)
@@ -63,16 +79,38 @@ echo "=== Step 3 DONE: $PASS PASS, $FAIL FAIL ==="
 
 # === Step 4: CUDA 构建 ===
 echo "=== Building CUDA targets ==="
-mkdir -p build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="86;90" .. 2>&1 | tee ../experiment_data/logs/cmake.log
-JOBS=$(( $(nproc) / 4 ))
-cmake --build . -- -j${JOBS} 2>&1 | tee ../experiment_data/logs/build.log
-BUILD_RC=$?
-cd ..
-if [ $BUILD_RC -eq 0 ]; then
-  echo "=== Step 4 DONE: CUDA build SUCCESS ==="
+
+# Robust cmake/nvcc detection
+for p in /usr/local/cuda/bin /usr/local/cuda-12*/bin /usr/local/cuda-11*/bin \
+         /opt/cmake*/bin /snap/bin $HOME/.local/bin; do
+  [ -d "$p" ] && export PATH="$p:$PATH"
+done
+# Try module system
+command -v module &>/dev/null && { module load cmake 2>/dev/null || true; module load cuda 2>/dev/null || true; }
+# Try conda
+if ! command -v cmake &>/dev/null && command -v conda &>/dev/null; then
+  conda install -y -q cmake 2>/dev/null || true
+fi
+
+BUILD_RC=1
+if command -v cmake &>/dev/null && command -v nvcc &>/dev/null; then
+  echo "cmake: $(cmake --version | head -1)"
+  echo "nvcc: $(nvcc --version | tail -1)"
+  mkdir -p build && cd build
+  cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="86;90" .. 2>&1 | tee ../experiment_data/logs/cmake.log
+  JOBS=$(( $(nproc) / 4 ))
+  [ "$JOBS" -lt 1 ] && JOBS=1
+  cmake --build . -- -j${JOBS} 2>&1 | tee ../experiment_data/logs/build.log
+  BUILD_RC=$?
+  cd ..
+  if [ $BUILD_RC -eq 0 ]; then
+    echo "=== Step 4 DONE: CUDA build SUCCESS ==="
+  else
+    echo "=== Step 4: CUDA build FAILED (check experiment_data/logs/build.log) ==="
+  fi
 else
-  echo "=== Step 4: CUDA build FAILED (check experiment_data/logs/build.log) ==="
+  echo "=== Step 4 SKIPPED: cmake=$(command -v cmake || echo MISSING) nvcc=$(command -v nvcc || echo MISSING) ==="
+  echo "Fix: export PATH=/usr/local/cuda-XX/bin:\$PATH, or: conda install cmake"
 fi
 
 # === Step 5: GPU实验 (如果build成功) ===

@@ -11,6 +11,23 @@
 # =============================================================================
 set -euo pipefail
 
+# === Auto-detect CUDA/cmake paths ===
+for p in /usr/local/cuda/bin /usr/local/cuda-*/bin $HOME/.local/bin /opt/cmake*/bin; do
+  [ -d "$p" ] && export PATH="$p:$PATH"
+done
+# conda cmake fallback
+if ! command -v cmake &>/dev/null && command -v conda &>/dev/null; then
+  conda install -y cmake 2>/dev/null || true
+fi
+# Check g++ version for -march support
+GCC_VER=$(g++ -dumpversion 2>/dev/null | cut -d. -f1)
+if [ "${GCC_VER:-0}" -lt 12 ]; then
+  MARCH_FLAG="-march=znver3"
+else
+  MARCH_FLAG="-march=znver3"
+fi
+
+
 PROJ_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${PROJ_DIR}/build"
 DATA_DIR="${PROJ_DIR}/experiment_data"
@@ -109,7 +126,7 @@ run_joinrenum_cpu() {
 
         # Compile with NUMA-aware optimization
         numactl --cpubind=1 --membind=1 \
-            g++ -std=c++17 -O3 -march=znver4 -DAJB_DEBUG -I. "$f" -lglpk \
+            g++ -std=c++17 -O3 -march=znver3 -DAJB_DEBUG -I. "$f" -lglpk \
             -o "/tmp/${name}" 2>>"$JLOG" && {
 
             log "  running $name..."
