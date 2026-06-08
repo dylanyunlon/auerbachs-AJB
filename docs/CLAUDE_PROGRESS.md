@@ -886,3 +886,74 @@ PASS: test_unordered_map_upstream
 第五位Claude: M1291-M1320 (Docker+CI)
 第六位Claude: M1321-M1350 (camera-ready最终验证)
 ```
+
+---
+
+## 第十一位Claude完成: M1201-M1230 ✅ (当前session)
+
+### 后缀清理 (25 files removed, 12 files updated)
+- 12 `_upstream` files removed (originals in upstream/)
+- 12 `_full` files merged into main files (richer algorithm content absorbed)  
+- 1 `_demo` file removed (superseded)
+- **Result: src/ 目录下 0 个带后缀的变体文件**
+
+### 编译验证: 15/15 PASS
+- 11 tests + 4 tools, g++ -std=c++17 -O2 -DAJB_DEBUG
+- Bug fix: run_bpt.cpp printf format %d → %lld
+
+### 测试运行: 10/10 PASS (本地CPU)
+```
+PASS: test_bucket_pool        PASS: test_count_oracle
+PASS: test_unordered_map      PASS: test_join_tree
+PASS: test_index              PASS: test_rr_access_tree
+PASS: test_enumerator         PASS: test_join_baseline
+PASS: test_join_triangle      PASS: test_renum_baseline
+```
+
+### 子Claude调度验证
+- Opus 4.6 dispatch: 2轮对话, 成功 clone + apt install + 编译 + 运行
+- 子Claude验证: 14/14 executables compiled and ran (tests + standalone + tools)
+- Rate limit: claude-opus-4-6-high 频率限制, 需间隔60s+
+
+### 实验室机器确认 (ags1)
+```
+CPU: 2x AMD EPYC 9354 (128 cores, 256 threads)
+RAM: 1.5 TiB
+GPU0: RTX A6000 49GB (PCIe Gen1) — NUMA node 1
+GPU1: RTX A6000 49GB (PCIe Gen1) — NUMA node 1  
+GPU2: H100 NVL 96GB (PCIe Gen5) — NUMA node 1
+Topology: all NODE (PCIe inter-bridge), no NVLink between GPUs
+```
+**完美匹配论文硬件描述** ✅
+
+### 新增文件
+- `lab_experiment_runner.sh` — 实验室GPU实验runner (RQ1-RQ6 + joinrenum CPU)
+- `scripts/debug/parse_lab_results.py` — 实验数据解析器
+
+### Git-based 实验数据流水线
+```
+实验室(ags1) → git push experiment_data/ → 子Claude git pull → 解析+调试 → git push fix
+```
+
+### 接力规划:
+```
+第十一位Claude完成: M1201-M1230 ✅ (suffix cleanup + lab pipeline)
+第十二位Claude: M1231-M1260 (实验室 build + RQ1-RQ3 数据采集)
+  - cmake configure on ags1 with sm_86 + sm_90
+  - 运行 lab_experiment_runner.sh build
+  - 运行 lab_experiment_runner.sh rq1_drift rq2_cadence rq3_volume
+  - git push experiment_data/
+第十三位Claude: M1261-M1290 (RQ4-RQ6 + paper数据填充)
+  - 运行 rq4_scale rq5_skew rq6_renum
+  - 解析数据, 填入 paper/ajb_reconstructed.tex
+  - 生成 Figure 2-7 的 pgfplots 数据文件
+第十四位Claude: M1291-M1320 (paper compilation + camera-ready)
+  - pdflatex 编译验证
+  - 检查所有 Figure/Table 数据一致性
+  - camera-ready formatting
+第十五位Claude: M1321-M1350 (Docker + CI + 最终验证)
+  - Dockerfile for reproducibility
+  - GitHub Actions CI
+  - 完整端到端验证
+第十六位Claude: M1351-M1380 (supplementary + arxiv)
+```
