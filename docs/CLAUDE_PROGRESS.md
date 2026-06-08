@@ -1172,3 +1172,55 @@ test_sample_baseline  PASS  <1s      sorted-vector dedup OK
   - 验证speedup claims
 第十九位Claude(sub): M1331-M1350 (camera-ready)
 ```
+
+## 15th Claude Session (M1273-M1280) — Algorithm Rewrite + Sub-Claude Dispatch
+
+### M1273: Final suffix cleanup
+- Removed `scripts/debug/experiment_results_m1031.csv` (last suffix file)
+- 0 suffix files remain across entire project
+
+### M1274-M1276: 3-file algorithm-level rewrite (commit ff4049f)
+482 insertions, 142 deletions across:
+
+**resource_context.cuh** (78→180 lines, +131%):
+- Slab free-list cache for small GPU allocations (best-fit search, O(1) swap-remove)
+- TSC-based allocation latency histogram (5 buckets)
+- Slab hit-rate tracking
+
+**profile_utilities.cuh** (229→362 lines, +58%):
+- Per-invocation stats (count/min/max/mean) on every Toc()
+- Kahan compensated summation in Mean()
+- HierarchicalScope: nested timer tree output
+- PhaseOverlapDetector: sweep-line overlap detection
+
+**resource_manager.cuh** (265→370 lines, +40%):
+- AdaptiveChunkSizer: per-GPU chunk proportional to free memory (H100 ~2x vs A6000)
+- WarmupLatencyTracker: per-GPU per-stream timing
+- LoadImbalanceDetector: Gini coefficient + CV
+- Auto-dump on destructor
+
+### M1277-M1280: Sub-Claude ajb_benchmark.cu rewrite (commit 8029907)
+Sub-Claude Opus 4.6 (medium) dispatched via claude.hk.cn API:
+- ajb_benchmark.cu: 548→716 lines (+31%)
+- Pipeline overlap (event-based sort→merge)
+- WelfordAccumulator for online mean/variance
+- Sort verification with inversion reporting
+- Per-GPU CSV columns (chunk_size, gini, warmup_ms)
+- 50+ AJB_STATE breakpoint outputs
+
+### Experiment Infrastructure Created
+- `scripts/ags1_experiment_env.sh` — server env setup (conda, CUDA deps, topology probe)
+- `scripts/ags1_run_and_push.sh` — full benchmark sweep: 4 methods × 4 distributions × 3 K_x × 3 input sizes, auto-push to git
+- `scripts/analyze_and_fill_paper.py` — parses experiment CSVs, computes Table 1 (ICL) + Table 2 (wallclock), AJB vs baseline comparison
+
+### CPU Test Status: 10/10 PASS
+
+### Relay Plan
+```
+Completed: M1-M1280 (15 Claudes)
+16th Claude: M1281-M1310 — run ags1_run_and_push.sh on GPU server, collect data
+17th Claude: M1311-M1340 — analyze data, fill paper Tables 1-2, tune K_x
+18th Claude: M1341-M1370 — paper camera-ready (figures, ablation study)
+19th Claude: M1371-M1400 — Docker reproducibility + CI
+20th Claude: M1401-M1420 — final review + submission prep
+```
