@@ -957,3 +957,104 @@ Topology: all NODE (PCIe inter-bridge), no NVLink between GPUs
   - 完整端到端验证
 第十六位Claude: M1351-M1380 (supplementary + arxiv)
 ```
+
+---
+
+## 第十二位 Claude 完成: M1231-M1260
+
+### CMake 幽灵目标大清理
+- 移除 54 处引用不存在 `_full`/`_upstream`/`_demo` 文件的 cmake 目标
+- 合并为两个干净的列表: `AJB_RENUM_TESTS_GLPK` + `AJB_RENUM_TESTS_NOGLPK`
+- 修正 `upper_bound_demo` → `upper_bound`（匹配实际文件名）
+- 删除 `test_join_baseline_upstream`（从未存在过的文件）
+- 统一便捷目标: `ajb_joinrenum_tests` + `ajb_joinrenum_all`
+- 净减: -171 行死 cmake 代码, 0 个幽灵目标残留
+
+### 无条件诊断输出（实验监控核心）
+- BucketPool.hpp: `ajb_summary_line()` — 不需 AJB_DEBUG 即可打印
+  - 输出: pool/active/maxAGM/allocs/reuse%/bans
+- Enumerator.hpp: `#else` 分支增加 yield_mean/cv/intervals 输出
+  - 每次枚举结束自动调用 `pool.ajb_summary_line("enum_done")`
+- 效果: 实验运行时 stderr 总有关键状态行，无需重编译
+
+### 编译验证
+- 11/11 CPU 测试编译通过 (g++ 11.4 / libglpk-dev / libboost-dev)
+- 运行验证: test_enumerator, test_index, test_count_oracle,
+  test_bucket_pool, test_join_triangle, test_unordered_map 全 PASS
+
+### 新增文件
+- `ags1_experiment_loop.sh` — 服务器实验自动化流水线
+  - `build`: cmake auto-detect CUDA + make -j
+  - `test`: 跑所有 joinrenum CPU tests, 生成 CSV 摘要
+  - `gpu`: 按 GPU 跑 sort/merge/join benchmark
+  - `push`: git add + commit + push experiment_data/
+  - `all`: 一条命令跑完 build→test→gpu→push
+
+### 服务器硬件确认 (ags1)
+```
+CPU: 2x AMD EPYC 9354 (128 cores, 256 threads)
+RAM: 1.5 TiB (node0=774G, node1=774G)
+GPU0: RTX A6000 49GB (PCIe Gen1, sm_86) — NUMA node 1
+GPU1: RTX A6000 49GB (PCIe Gen1, sm_86) — NUMA node 1
+GPU2: H100 NVL 96GB (PCIe Gen5, sm_90)  — NUMA node 1
+Topology: all NODE (PCIe), no NVLink between GPUs
+CUDA: 11.5 / driver 550.144.03
+OS: Ubuntu 22.04, kernel 5.15
+```
+
+### 实验-迭代工作流
+```
+                    ┌──────────────────────────┐
+                    │   ags1 实验室服务器        │
+                    │   bash ags1_experiment_   │
+                    │   loop.sh all             │
+                    │   → build + test + gpu    │
+                    │   → git push              │
+                    └──────────┬───────────────┘
+                               │ git push experiment_data/
+                               ▼
+                    ┌──────────────────────────┐
+                    │   GitHub (auerbachs-AJB)  │
+                    │   experiment_data/logs/   │
+                    │   *.csv, *.log            │
+                    └──────────┬───────────────┘
+                               │ git pull
+                               ▼
+                    ┌──────────────────────────┐
+                    │   子Claude (Opus 4.6)     │
+                    │   via claude_hk_chat.sh   │
+                    │   读取日志 → 分析 → 修码  │
+                    │   → git push 修复         │
+                    └──────────┬───────────────┘
+                               │ git push src/
+                               ▼
+                    ┌──────────────────────────┐
+                    │   ags1 git pull + rebuild │
+                    │   → 下一轮实验            │
+                    └──────────────────────────┘
+```
+
+### 接力规划 (更新)
+```
+第十二位Claude完成: M1231-M1260 ✅ (cmake cleanup + diagnostics + ags1 pipeline)
+第十三位Claude: M1261-M1290 (ags1 首次完整编译 + CPU test全量运行)
+  - git pull on ags1, cmake configure with sm_86+sm_90
+  - bash ags1_experiment_loop.sh build
+  - bash ags1_experiment_loop.sh test
+  - 分析test日志, 修复编译/运行错误
+  - 生成首轮 experiment_data CSV
+第十四位Claude: M1291-M1320 (GPU benchmark + RQ1-RQ3)
+  - bash ags1_experiment_loop.sh gpu
+  - sort_benchmark: 1M/10M/100M elements x {A6000, H100}
+  - join_benchmark: skew sweep θ∈{0.0,0.5,0.8,0.95,0.99}
+  - 收集 [AJB_STATE] 输出, 解析为 CSV
+第十五位Claude: M1321-M1350 (RQ4-RQ6 + paper数据填充)
+  - multi-GPU scaling: 1/2/3 GPU
+  - joinrenum大规模测试 (TPC-H/JOB schema)
+  - 填入 paper/ajb_reconstructed.tex Tables/Figures
+第十六位Claude: M1351-M1380 (paper编译 + camera-ready)
+  - pdflatex验证
+  - Figure pgfplots数据文件生成
+  - 全部claim vs 实测数据交叉校验
+第十七位Claude: M1381-M1410 (Docker + CI + 最终验证)
+```
