@@ -34,18 +34,21 @@
 struct SkewEstimate {
   double raw_cv;           // coefficient of variation (unbounded)
   double normalized;       // tanh(raw_cv), in [0, 1)
+  double chi_sq;           // chi-squared goodness-of-fit statistic
+  double chi_sq_pvalue;    // approximate p-value (Wilson-Hilferty)
+  double ks_distance;      // Kolmogorov-Smirnov max CDF deviation
   size_t sample_size;
   size_t num_buckets;
   size_t max_bucket_count;
   size_t min_bucket_count;
 
   void DebugPrint(const char* label = "SkewEstimate") const {
-    printf("[%s] CV=%.4f normalized=%.4f | samples=%zu buckets=%zu | "
-           "max_count=%zu min_count=%zu\n",
-           label, raw_cv, normalized, sample_size, num_buckets,
-           max_bucket_count, min_bucket_count);
-  }
-};
+    fprintf(stderr, "[AJB_BP][%s] cv=%.4f norm=%.4f chi2=%.2f(p=%.4f) ks=%.4f "
+            "n=%zu buckets=%zu max=%zu min=%zu\n",
+            label, raw_cv, normalized, chi_sq, chi_sq_pvalue, ks_distance,
+            sample_size, num_buckets, max_bucket_count, min_bucket_count);
+    // frequency histogram top-5 buckets (diagnostic)
+  }};
 
 // ---------------------------------------------------------------------------
 // Lightweight key-frequency histogram
@@ -138,6 +141,27 @@ SkewEstimate DetectSkew(const T* keys, size_t n,
     return est;
   }
 
+  // --- Freedman-Diaconis adaptive bucket count ---
+  // IQR-based: bin_width = 2 * IQR * n^(-1/3)
+  {
+    std::vector<T> sorted_samples(samples);
+    std::sort(sorted_samples.begin(), sorted_samples.end());
+    size_t q1_idx = sorted_samples.size() / 4;
+    size_t q3_idx = 3 * sorted_samples.size() / 4;
+    double iqr = static_cast<double>(sorted_samples[q3_idx]) -
+                 static_cast<double>(sorted_samples[q1_idx]);
+    if (iqr > 0) {
+      double bin_width = 2.0 * iqr * std::pow(static_cast<double>(sample_size), -1.0/3.0);
+      double range = static_cast<double>(max_key) - static_cast<double>(min_key);
+      size_t fd_buckets = static_cast<size_t>(std::ceil(range / bin_width));
+      // clamp to [8, 512]
+      fd_buckets = std::max<size_t>(8, std::min<size_t>(512, fd_buckets));
+      fprintf(stderr, "[AJB_BP][Skew] Freedman-Diaconis: IQR=%.1f bin_w=%.1f -> %zu buckets (was %zu)\n",
+              iqr, bin_width, fd_buckets, num_buckets);
+      num_buckets = fd_buckets;
+    }
+  }
+
   // --- Build histogram ---
   KeyHistogram<T> hist(num_buckets, min_key, max_key);
   for (const auto& key : samples) {
@@ -165,20 +189,69 @@ SkewEstimate DetectSkew(const T* keys, size_t n,
   double cv = (mean > 0) ? stddev / mean : 0.0;
   double normalized = std::tanh(cv);
 
-  SkewEstimate est{cv, normalized, sample_size, num_buckets, max_count, min_count};
+  // --- Chi-squared goodness-of-fit (H0: uniform distribution) ---
+  double chi_sq = 0.0;
+  double expected = static_cast<double>(sample_size) / num_buckets;
+  for (size_t i = 0; i < num_buckets; ++i) {
+    double diff_cs = static_cast<double>(hist.counts[i]) - expected;
+    chi_sq += (diff_cs * diff_cs) / expected;
+  }
+  // Wilson-Hilferty approximation for chi-sq p-value
+  double df = static_cast<double>(num_buckets - 1);
+  double wh_z = std::pow(chi_sq / df, 1.0/3.0) - (1.0 - 2.0/(9.0*df));
+  double wh_denom = std::sqrt(2.0 / (9.0 * df));
+  double chi_sq_pvalue = 0.5 * std::erfc(wh_z / (wh_denom * std::sqrt(2.0)));
+
+  // --- Kolmogorov-Smirnov distance (empirical vs uniform CDF) ---
+  double ks_distance = 0.0;
+  {
+    double cum_observed = 0.0;
+    for (size_t i = 0; i < num_buckets; ++i) {
+      cum_observed += static_cast<double>(hist.counts[i]) / sample_size;
+      double cum_expected = static_cast<double>(i + 1) / num_buckets;
+      double deviation = std::fabs(cum_observed - cum_expected);
+      if (deviation > ks_distance) ks_distance = deviation;
+    }
+  }
+
+  // [AJB_BP] diagnostic: top-5 bucket frequencies
+  {
+    std::vector<std::pair<size_t,size_t>> freq_idx(num_buckets);
+    for (size_t i = 0; i < num_buckets; ++i) freq_idx[i] = {hist.counts[i], i};
+    std::partial_sort(freq_idx.begin(),
+                      freq_idx.begin() + std::min<size_t>(5, num_buckets),
+                      freq_idx.end(),
+                      [](auto&a, auto&b){ return a.first > b.first; });
+    fprintf(stderr, "[AJB_BP][Skew] top-5 buckets:");
+    for (size_t k = 0; k < std::min<size_t>(5, num_buckets); ++k)
+      fprintf(stderr, " [%zu]=%zu", freq_idx[k].second, freq_idx[k].first);
+    fprintf(stderr, "\n");
+  }
+
+  SkewEstimate est{cv, normalized, chi_sq, chi_sq_pvalue, ks_distance,
+                   sample_size, num_buckets, max_count, min_count};
   est.DebugPrint("Computed");
 
   // --- Print diagnostic ---
-  if (normalized < 0.3) {
-    printf("  -> Distribution is NEARLY UNIFORM (low skew)\n");
+  // Combined judgment: use both chi-sq rejection and KS distance
+  bool chi_rejects_uniform = (chi_sq_pvalue < 0.05);
+  bool ks_rejects_uniform  = (ks_distance > 1.36 / std::sqrt(static_cast<double>(num_buckets)));
+  fprintf(stderr, "[AJB_BP][Skew] chi2 %s uniform (p=%.4f), KS %s uniform (D=%.4f, crit=%.4f)\n",
+          chi_rejects_uniform ? "REJECTS" : "accepts",
+          chi_sq_pvalue,
+          ks_rejects_uniform ? "REJECTS" : "accepts",
+          ks_distance,
+          1.36 / std::sqrt(static_cast<double>(num_buckets)));
+
+  if (!chi_rejects_uniform && !ks_rejects_uniform) {
+    printf("  -> Distribution is NEARLY UNIFORM (both tests accept H0)\n");
     printf("     Implication: K_u can be large, boundaries stay valid\n");
-  } else if (normalized < 0.7) {
-    printf("  -> Distribution has MODERATE SKEW\n");
-    printf("     Implication: K_u should be moderate for correctness\n");
-  } else {
-    printf("  -> Distribution is HIGHLY SKEWED\n");
+  } else if (chi_rejects_uniform && ks_rejects_uniform) {
+    printf("  -> Distribution is HIGHLY SKEWED (both tests reject H0)\n");
     printf("     Implication: K_u must be small, frequent boundary syncs needed\n");
-    printf("     (Theorem 1: finite K_u required for non-uniform keys)\n");
+  } else {
+    printf("  -> Distribution has MODERATE SKEW (tests disagree)\n");
+    printf("     Implication: K_u should be moderate for correctness\n");
   }
   printf("\n");
 

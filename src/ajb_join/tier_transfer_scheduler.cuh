@@ -115,6 +115,44 @@ struct TransferEvent {
 // ---------------------------------------------------------------------------
 // Tier-aware transfer scheduler
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// EWMA bandwidth estimator per tier — tracks actual vs theoretical bandwidth
+// ---------------------------------------------------------------------------
+struct TierBandwidthEWMA {
+  double alpha;          // smoothing factor (default 0.1)
+  double ewma_bw_gbps;  // exponentially weighted moving average
+  double peak_bw_gbps;  // peak observed
+  size_t n_samples;
+  double cumulative_staleness;  // for adaptive K_u
+
+  TierBandwidthEWMA(double a = 0.1, double initial_bw = 0.0)
+      : alpha(a), ewma_bw_gbps(initial_bw), peak_bw_gbps(0.0),
+        n_samples(0), cumulative_staleness(0.0) {}
+
+  void Update(size_t bytes, double duration_sec) {
+    if (duration_sec <= 0) return;
+    double bw = static_cast<double>(bytes) / (duration_sec * 1e9);  // GB/s
+    if (n_samples == 0) {
+      ewma_bw_gbps = bw;
+    } else {
+      ewma_bw_gbps = alpha * bw + (1.0 - alpha) * ewma_bw_gbps;
+    }
+    if (bw > peak_bw_gbps) peak_bw_gbps = bw;
+    n_samples++;
+  }
+
+  double Utilization() const {
+    return (peak_bw_gbps > 0) ? ewma_bw_gbps / peak_bw_gbps : 0.0;
+  }
+
+  void DebugPrint(const char* tier_name) const {
+    fprintf(stderr, "[AJB_BP][EWMA] %s: bw=%.2f GB/s (peak=%.2f, util=%.1f%%) "
+            "staleness=%.3f n=%zu\n",
+            tier_name, ewma_bw_gbps, peak_bw_gbps, Utilization() * 100.0,
+            cumulative_staleness, n_samples);
+  }
+};
+
 class TierTransferScheduler {
  public:
   TierTransferScheduler() = default;
@@ -148,6 +186,7 @@ class TierTransferScheduler {
       link.DebugPrint();
     }
     printf("==================================================================\n\n");
+    initial_cadence_ = cadence;
   }
 
   // ---------------------------------------------------------------------------
@@ -187,10 +226,72 @@ class TierTransferScheduler {
     event_log_.push_back(evt);
 
     switch (tier) {
-      case BandwidthTier::kFastP2P:  total_fast_tier_bytes_ += bytes; break;
-      case BandwidthTier::kSlowPCIe: total_slow_tier_bytes_ += bytes; break;
-      case BandwidthTier::kHostDRAM: total_host_bytes_      += bytes; break;
+      case BandwidthTier::kFastP2P:
+        total_fast_tier_bytes_ += bytes;
+        ewma_fast_.Update(bytes, duration_sec);
+        break;
+      case BandwidthTier::kSlowPCIe:
+        total_slow_tier_bytes_ += bytes;
+        ewma_slow_.Update(bytes, duration_sec);
+        break;
+      case BandwidthTier::kHostDRAM:
+        total_host_bytes_ += bytes;
+        ewma_host_.Update(bytes, duration_sec);
+        break;
     }
+
+    // [AJB_BP] EWMA state dump every 50 transfers
+    if (event_log_.size() % 50 == 0) {
+      ewma_fast_.DebugPrint("NVLink");
+      ewma_slow_.DebugPrint("PCIe");
+      ewma_host_.DebugPrint("HostDRAM");
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Adaptive K_u: golden-ratio step adjustment based on staleness
+  // Called after each chunk-group to potentially adjust K_u
+  // ---------------------------------------------------------------------------
+  void AdaptK_u(double current_staleness) {
+    ewma_slow_.cumulative_staleness += current_staleness;
+
+    if (current_staleness < kStalenessThreshold) {
+      consecutive_low_staleness_++;
+      // Boundaries are stable — increase K_u by golden ratio
+      if (consecutive_low_staleness_ >= 3 && cadence_.K_u < cadence_.K_x) {
+        size_t old_ku = cadence_.K_u;
+        cadence_.K_u = static_cast<size_t>(
+            std::ceil(static_cast<double>(cadence_.K_u) * kGoldenRatio));
+        cadence_.K_u = std::min(cadence_.K_u, cadence_.K_x);  // never exceed K_x
+        fprintf(stderr, "[AJB_BP][AdaptK_u] staleness=%.4f (<%.4f for %zu consecutive) "
+                "-> K_u: %zu -> %zu (golden ratio)\n",
+                current_staleness, kStalenessThreshold,
+                consecutive_low_staleness_, old_ku, cadence_.K_u);
+      }
+    } else {
+      // Boundaries are changing — reset K_u toward initial
+      consecutive_low_staleness_ = 0;
+      if (cadence_.K_u > initial_cadence_.K_u) {
+        size_t old_ku = cadence_.K_u;
+        cadence_.K_u = std::max(initial_cadence_.K_u,
+                                static_cast<size_t>(cadence_.K_u / kGoldenRatio));
+        fprintf(stderr, "[AJB_BP][AdaptK_u] staleness=%.4f (>%.4f) "
+                "-> K_u: %zu -> %zu (shrink)\n",
+                current_staleness, kStalenessThreshold, old_ku, cadence_.K_u);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Transfer coalescing: merge small adjacent transfers below MTU
+  // ---------------------------------------------------------------------------
+  bool ShouldCoalesce(size_t bytes_this, size_t bytes_next) const {
+    bool coalesce = (bytes_this + bytes_next) < kCoalesceMinBytes;
+    if (coalesce) {
+      fprintf(stderr, "[AJB_BP][Coalesce] %zu + %zu = %zu bytes < MTU %zu -> merging\n",
+              bytes_this, bytes_next, bytes_this + bytes_next, kCoalesceMinBytes);
+    }
+    return coalesce;
   }
 
   // ---------------------------------------------------------------------------
@@ -236,6 +337,28 @@ class TierTransferScheduler {
           : 0.0;
       printf("  Fast/Slow ratio:       %.2f:1\n", ratio);
     }
+    // EWMA bandwidth summary
+    printf("  --- EWMA Bandwidth Estimates ---\n");
+    printf("  NVLink: %.2f GB/s (peak %.2f, util %.0f%%)\n",
+           ewma_fast_.ewma_bw_gbps, ewma_fast_.peak_bw_gbps,
+           ewma_fast_.Utilization() * 100.0);
+    printf("  PCIe:   %.2f GB/s (peak %.2f, util %.0f%%)\n",
+           ewma_slow_.ewma_bw_gbps, ewma_slow_.peak_bw_gbps,
+           ewma_slow_.Utilization() * 100.0);
+    printf("  Host:   %.2f GB/s (peak %.2f, util %.0f%%)\n",
+           ewma_host_.ewma_bw_gbps, ewma_host_.peak_bw_gbps,
+           ewma_host_.Utilization() * 100.0);
+    // Adaptive K_u summary
+    printf("  --- Adaptive K_u ---\n");
+    printf("  Initial K_u: %zu, Final K_u: %zu, Change: %+.1f%%\n",
+           initial_cadence_.K_u, cadence_.K_u,
+           initial_cadence_.K_u > 0
+               ? 100.0 * (static_cast<double>(cadence_.K_u) / initial_cadence_.K_u - 1.0)
+               : 0.0);
+    printf("  Cumulative staleness: fast=%.3f slow=%.3f host=%.3f\n",
+           ewma_fast_.cumulative_staleness,
+           ewma_slow_.cumulative_staleness,
+           ewma_host_.cumulative_staleness);
     printf("==================================================================\n\n");
   }
 
@@ -287,10 +410,22 @@ class TierTransferScheduler {
   std::vector<int> gpus_;
   std::vector<DeviceLink> topology_;
   TransferCadence cadence_;
+  TransferCadence initial_cadence_;   // for comparison
   std::vector<TransferEvent> event_log_;
   size_t total_slow_tier_bytes_ = 0;
   size_t total_fast_tier_bytes_ = 0;
   size_t total_host_bytes_ = 0;
+
+  // EWMA per-tier bandwidth tracking
+  TierBandwidthEWMA ewma_fast_{0.1, 50.0};   // NVLink ~50 GB/s initial
+  TierBandwidthEWMA ewma_slow_{0.1, 12.0};   // PCIe ~12 GB/s initial
+  TierBandwidthEWMA ewma_host_{0.1, 6.0};    // Host DRAM ~6 GB/s initial
+
+  // Adaptive K_u state
+  size_t consecutive_low_staleness_ = 0;
+  static constexpr double kGoldenRatio = 1.618033988749895;
+  static constexpr double kStalenessThreshold = 0.01;
+  static constexpr size_t kCoalesceMinBytes = 4096;  // transfer coalescing MTU
 };
 
 // ---------------------------------------------------------------------------

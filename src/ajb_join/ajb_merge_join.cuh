@@ -63,6 +63,98 @@ struct DevicePartitionState {
 };
 
 // ---------------------------------------------------------------------------
+// HyperLogLog sketch for join output cardinality estimation
+// ---------------------------------------------------------------------------
+struct JoinCardinalityHLL {
+  static constexpr size_t kRegisters = 256;  // m=256 -> ~6.5% std error
+  static constexpr double kAlpha = 0.7213 / (1.0 + 1.079 / kRegisters);
+  uint8_t registers[kRegisters] = {};
+  size_t items_seen = 0;
+
+  void Insert(uint64_t hash) {
+    size_t idx = hash & (kRegisters - 1);
+    uint64_t w = hash >> 8;
+    uint8_t rho = (w == 0) ? 64 : static_cast<uint8_t>(__builtin_ctzll(w) + 1);
+    if (rho > registers[idx]) registers[idx] = rho;
+    items_seen++;
+  }
+
+  double Estimate() const {
+    double sum_inv = 0.0;
+    size_t zeros = 0;
+    for (size_t i = 0; i < kRegisters; ++i) {
+      sum_inv += 1.0 / static_cast<double>(1ULL << registers[i]);
+      if (registers[i] == 0) zeros++;
+    }
+    double raw = kAlpha * kRegisters * kRegisters / sum_inv;
+    // Small range correction
+    if (raw <= 2.5 * kRegisters && zeros > 0) {
+      return kRegisters * std::log(static_cast<double>(kRegisters) / zeros);
+    }
+    return raw;
+  }
+
+  void DebugPrint(size_t t) const {
+    fprintf(stderr, "[AJB_BP][HLL] t=%zu: items_seen=%zu est_cardinality=%.0f "
+            "non_zero_regs=%zu\n",
+            t, items_seen, Estimate(),
+            std::count_if(registers, registers + kRegisters,
+                          [](uint8_t r){ return r > 0; }));
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Merge-path boundary staleness tracker (L∞ norm of boundary changes)
+// ---------------------------------------------------------------------------
+struct BoundaryStaleness {
+  std::vector<int64_t> last_boundary_r;
+  std::vector<int64_t> last_boundary_s;
+  size_t consecutive_low = 0;
+  static constexpr double kLowThreshold = 0.01;
+  bool transfer_paused = false;
+
+  double ComputeLInfNorm(const std::vector<int64_t>& current_r,
+                         const std::vector<int64_t>& current_s,
+                         size_t total_tuples) {
+    if (last_boundary_r.empty()) {
+      last_boundary_r = current_r;
+      last_boundary_s = current_s;
+      return 1.0;  // first time: maximum staleness
+    }
+    double max_dev = 0.0;
+    double scale = static_cast<double>(std::max<size_t>(total_tuples, 1));
+    for (size_t i = 0; i < std::min(current_r.size(), last_boundary_r.size()); ++i) {
+      double dr = std::fabs(static_cast<double>(current_r[i] - last_boundary_r[i])) / scale;
+      double ds = std::fabs(static_cast<double>(current_s[i] - last_boundary_s[i])) / scale;
+      max_dev = std::max({max_dev, dr, ds});
+    }
+    last_boundary_r = current_r;
+    last_boundary_s = current_s;
+    return max_dev;
+  }
+
+  bool ShouldPauseTransfer(double linf) {
+    if (linf < kLowThreshold) {
+      consecutive_low++;
+      if (consecutive_low >= 3) {
+        transfer_paused = true;
+        fprintf(stderr, "[AJB_BP][Staleness] L∞=%.6f (< %.4f for %zu consecutive) "
+                "-> PAUSING boundary transfer\n",
+                linf, kLowThreshold, consecutive_low);
+      }
+    } else {
+      if (transfer_paused) {
+        fprintf(stderr, "[AJB_BP][Staleness] L∞=%.6f (> %.4f) "
+                "-> RESUMING boundary transfer\n", linf, kLowThreshold);
+      }
+      consecutive_low = 0;
+      transfer_paused = false;
+    }
+    return transfer_paused;
+  }
+};
+
+// ---------------------------------------------------------------------------
 // Chunk-group debug snapshot — printed/logged every N chunk groups
 // ---------------------------------------------------------------------------
 template <typename T>
@@ -216,6 +308,11 @@ JoinResult<T> AJBMergeJoin(
   printf("\n  [AJBLoop] Starting %zu chunk groups with adaptive transfer...\n\n",
          total_chunk_groups);
 
+  // HyperLogLog for output cardinality estimation
+  JoinCardinalityHLL hll_sketch;
+  // Boundary staleness tracker
+  BoundaryStaleness staleness_tracker;
+
   for (size_t t = 0; t < total_chunk_groups; ++t) {
     auto cg_start = std::chrono::high_resolution_clock::now();
 
@@ -302,6 +399,43 @@ JoinResult<T> AJBMergeJoin(
     auto cg_end = std::chrono::high_resolution_clock::now();
     double cg_duration = std::chrono::duration<double>(cg_end - cg_start).count();
 
+    // --- L∞ staleness computation ---
+    {
+      std::vector<int64_t> cur_r(device_count), cur_s(device_count);
+      for (size_t d = 0; d < device_count; ++d) {
+        cur_r[d] = ends[d].x;
+        cur_s[d] = ends[d].y;
+      }
+      double linf = staleness_tracker.ComputeLInfNorm(
+          cur_r, cur_s, keys_r.size() + keys_s.size());
+      bool paused = staleness_tracker.ShouldPauseTransfer(linf);
+      // Feed staleness to adaptive K_u
+      scheduler.AdaptK_u(linf);
+
+      if (t % debug_print_interval == 0) {
+        fprintf(stderr, "[AJB_BP][Staleness] t=%zu L∞=%.6f paused=%s\n",
+                t, linf, paused ? "YES" : "no");
+      }
+    }
+
+    // --- HLL sketch update (hash join keys from this chunk) ---
+    {
+      size_t n_matches = device_results[t].count_;
+      for (size_t m = 0; m < std::min<size_t>(n_matches, 5000); ++m) {
+        // FNV-1a hash of match index for HLL
+        uint64_t h = 14695981039346656037ULL;
+        uint64_t val = static_cast<uint64_t>(t * 1000000 + m);
+        for (int byte = 0; byte < 8; ++byte) {
+          h ^= (val >> (byte * 8)) & 0xFF;
+          h *= 1099511628211ULL;
+        }
+        hll_sketch.Insert(h);
+      }
+      if (t % debug_print_interval == 0) {
+        hll_sketch.DebugPrint(t);
+      }
+    }
+
     // --- Build debug snapshot ---
     if (snapshots || (t % debug_print_interval == 0)) {
       double elapsed = std::chrono::duration<double>(cg_end - pipeline_start).count();
@@ -370,6 +504,11 @@ JoinResult<T> AJBMergeJoin(
   printf("#  AJBMergeJoin COMPLETE                                             #\n");
   printf("######################################################################\n");
   printf("  Total matches:    %zu\n", answer.count_);
+  printf("  HLL estimate:     %.0f (error=%.1f%%)\n",
+         hll_sketch.Estimate(),
+         answer.count_ > 0
+             ? 100.0 * std::fabs(hll_sketch.Estimate() - answer.count_) / answer.count_
+             : 0.0);
   printf("  Pipeline time:    %.6f s\n", total_time);
   printf("  Materialized:     %s (%zu items)\n",
          materialize ? "yes" : "no", answer.items_.size());

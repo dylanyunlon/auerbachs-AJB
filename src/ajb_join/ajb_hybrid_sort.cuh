@@ -52,12 +52,25 @@ struct ChunkSizeSchedule {
   double warmup_fraction;
   double decay_fraction;
 
+  // Adaptive WSD: warmup = ceil(log2(ngpu)) / n_groups, decay scaled inversely
   ChunkSizeSchedule(size_t base, size_t n_groups,
-                    double warmup = 0.1, double decay = 0.1)
+                    double warmup = 0.1, double decay = 0.1,
+                    size_t ngpu = 1)
       : base_chunk_size(base),
         num_chunk_groups(n_groups),
         warmup_fraction(warmup),
-        decay_fraction(decay) {}
+        decay_fraction(decay) {
+    // Adaptive: more GPUs need longer warmup to fill pipeline
+    if (ngpu > 1 && n_groups > 0) {
+      size_t warmup_groups = static_cast<size_t>(
+          std::ceil(std::log2(static_cast<double>(ngpu))));
+      warmup_fraction = static_cast<double>(warmup_groups) / n_groups;
+      warmup_fraction = std::min(warmup_fraction, 0.3);  // cap at 30%
+      decay_fraction = std::min(0.15, 1.0 / ngpu);       // fewer GPUs = shorter tail
+      fprintf(stderr, "[AJB_BP][WSD] Adaptive params: ngpu=%zu -> warmup=%.2f decay=%.2f "
+              "(warmup_groups=%zu)\n", ngpu, warmup_fraction, decay_fraction, warmup_groups);
+    }
+  }
 
   size_t GetChunkSize(size_t t) const {
     double progress = static_cast<double>(t) / std::max<size_t>(num_chunk_groups, 1);
@@ -91,6 +104,49 @@ struct ChunkSizeSchedule {
     }
     if (num_chunk_groups > 20) printf("...");
     printf("\n");
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Load balance metrics (computed per chunk-group)
+// ---------------------------------------------------------------------------
+struct ChunkGroupBalance {
+  double gini_coefficient;      // 0=perfect balance, 1=total imbalance
+  double shannon_entropy;       // bits: high=uniform distribution (good for radix)
+  bool needs_redistribution;    // Gini > 0.3 triggers redistribution
+
+  static double ComputeGini(const std::vector<double>& values) {
+    size_t n = values.size();
+    if (n <= 1) return 0.0;
+    std::vector<double> sorted_v(values);
+    std::sort(sorted_v.begin(), sorted_v.end());
+    double sum = 0.0, weighted_sum = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      sum += sorted_v[i];
+      weighted_sum += static_cast<double>(i + 1) * sorted_v[i];
+    }
+    if (sum <= 0) return 0.0;
+    return (2.0 * weighted_sum) / (n * sum) - (static_cast<double>(n + 1) / n);
+  }
+
+  static double ComputeShannonEntropy(const std::vector<size_t>& histogram) {
+    double total = 0.0;
+    for (auto c : histogram) total += static_cast<double>(c);
+    if (total <= 0) return 0.0;
+    double entropy = 0.0;
+    for (auto c : histogram) {
+      if (c > 0) {
+        double p = static_cast<double>(c) / total;
+        entropy -= p * std::log2(p);
+      }
+    }
+    return entropy;
+  }
+
+  void DebugPrint(size_t t) const {
+    fprintf(stderr, "[AJB_BP][LoadBalance] t=%zu gini=%.4f entropy=%.2f bits %s\n",
+            t, gini_coefficient, shannon_entropy,
+            needs_redistribution ? "-> REDISTRIBUTE" : "(balanced)");
   }
 };
 
@@ -149,7 +205,7 @@ void AJBHybridSort(
   const size_t num_chunk_groups = DivideUp(num_elements, num_elements_per_chunk_group);
 
   // --- Create WSD chunk-size schedule ---
-  ChunkSizeSchedule schedule(chunk_size, num_chunk_groups);
+  ChunkSizeSchedule schedule(chunk_size, num_chunk_groups, 0.1, 0.1, gpus.size());
   schedule.DebugPrint();
 
   // --- Tier-aware GPU assignment order ---
@@ -234,6 +290,37 @@ void AJBHybridSort(
 
       total_processed += num_elements_to_process;
       num_remaining_elements -= num_elements_to_process;
+
+      // --- Load balance analysis ---
+      // Compute Gini of per-GPU sort times (simulated: distribute cg_dur)
+      {
+        std::vector<double> per_gpu_times(gpus.size());
+        // In real multi-GPU: each GPU reports its own time.
+        // Here we estimate from chunk distribution across GPUs.
+        for (size_t g = 0; g < gpus.size(); ++g) {
+          size_t gpu_elements = std::min(effective_cs,
+              (g < num_elements_to_process / effective_cs)
+                  ? effective_cs
+                  : (num_elements_to_process % effective_cs));
+          per_gpu_times[g] = cg_dur * (static_cast<double>(gpu_elements) /
+                              std::max<size_t>(1, num_elements_to_process));
+        }
+        ChunkGroupBalance balance;
+        balance.gini_coefficient = ChunkGroupBalance::ComputeGini(per_gpu_times);
+        // Shannon entropy of first-byte histogram (radix pivot quality)
+        std::vector<size_t> byte_hist(256, 0);
+        size_t sample_n = std::min<size_t>(10000, num_elements_to_process);
+        for (size_t s = 0; s < sample_n; ++s) {
+          uint8_t msb = static_cast<uint8_t>(
+              (static_cast<uint64_t>(in_keys[s]) >> 56) & 0xFF);
+          byte_hist[msb]++;
+        }
+        balance.shannon_entropy = ChunkGroupBalance::ComputeShannonEntropy(byte_hist);
+        balance.needs_redistribution = (balance.gini_coefficient > 0.3);
+        if (i % debug_print_interval == 0) {
+          balance.DebugPrint(i);
+        }
+      }
 
       // --- Debug snapshot ---
       SortChunkSnapshot snap;

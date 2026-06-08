@@ -158,7 +158,39 @@ class Index {
                     pos[i] = itermid[i] - iters[i].first;
                 }
             }
+            // M1102: track initial search space for early termination
+            size_t initial_search_space = 0;
+            for (size_t ei = 0; ei < iters.size(); ++ei) {
+                initial_search_space += static_cast<size_t>(
+                    iters[ei].second - iters[ei].first);
+            }
+            size_t mhbs_iterations = 0;
+
             while(cnt < iters.size()) {
+                // M1102: Early termination — remaining < 1% of initial
+                mhbs_iterations++;
+                size_t remaining_space = 0;
+                for (size_t ei = 0; ei < iters.size(); ++ei) {
+                    remaining_space += static_cast<size_t>(
+                        bounds[ei].second - bounds[ei].first);
+                }
+                if (initial_search_space > 100 &&
+                    remaining_space * 100 < initial_search_space) {
+                    // Search space exhausted — return best found
+                    int early_ans = 2147483647;
+                    for (size_t ei = 0; ei < iters.size(); ++ei) {
+                        if (bounds[ei].second != iters[ei].second)
+                            early_ans = min(early_ans, *bounds[ei].second);
+                    }
+                    if (ajb_idx_stats.mhbs_calls % 500 == 0) {
+                        fprintf(stderr, "[AJB_BP][MHBS] early_term: call=%lld iters=%zu "
+                                "remaining=%zu/%zu (%.2f%%)\n",
+                                ajb_idx_stats.mhbs_calls, mhbs_iterations,
+                                remaining_space, initial_search_space,
+                                100.0 * remaining_space / initial_search_space);
+                    }
+                    return early_ans;
+                }
                 mini = -1, maxi = -1;
                 for(size_t i : rels[splitDim]){
                     if(bounds[i].second - bounds[i].first <= 1) continue;
@@ -261,7 +293,39 @@ class Index {
             for (size_t ri : rels[splitDim]) {
                 if (bounds[ri].second - bounds[ri].first > 1) activeRels.push_back(ri);
             }
+            // M1102: track initial search space for early termination
+            size_t initial_search_space = 0;
+            for (size_t ei = 0; ei < iters.size(); ++ei) {
+                initial_search_space += static_cast<size_t>(
+                    iters[ei].second - iters[ei].first);
+            }
+            size_t mhbs_iterations = 0;
+
             while(cnt < iters.size()) {
+                // M1102: Early termination — remaining < 1% of initial
+                mhbs_iterations++;
+                size_t remaining_space = 0;
+                for (size_t ei = 0; ei < iters.size(); ++ei) {
+                    remaining_space += static_cast<size_t>(
+                        bounds[ei].second - bounds[ei].first);
+                }
+                if (initial_search_space > 100 &&
+                    remaining_space * 100 < initial_search_space) {
+                    // Search space exhausted — return best found via splitCol
+                    int early_ans = 2147483647;
+                    for (size_t ei = 0; ei < iters.size(); ++ei) {
+                        if (bounds[ei].second != iters[ei].second)
+                            early_ans = min(early_ans, (*splitCol[ei])[bounds[ei].second]);
+                    }
+                    if (ajb_idx_stats.mhbs_calls % 500 == 0) {
+                        fprintf(stderr, "[AJB_BP][MHBS] early_term: call=%lld iters=%zu "
+                                "remaining=%zu/%zu (%.2f%%)\n",
+                                ajb_idx_stats.mhbs_calls, mhbs_iterations,
+                                remaining_space, initial_search_space,
+                                100.0 * remaining_space / initial_search_space);
+                    }
+                    return early_ans;
+                }
                 mini = -1, maxi = -1;
                 for(size_t i : activeRels){
                     if(bounds[i].second - bounds[i].first <= 1) continue;
@@ -784,7 +848,38 @@ class Index {
             cntSplitCall++;
             if(B.AGM < 0) setAGMandIters(B);
             if(B.AGM == 0) return {};
-            int splitDim = B.getSplitDim();
+            // M1101: Greedy dim selection — pick dim with max cardinality ratio
+            // (range / min_relation_size) instead of first-mismatch
+            int splitDim = B.getSplitDim();  // fallback
+            {
+                double best_ratio = -1.0;
+                int best_dim = splitDim;
+                for (int d = 0; d < B.getDim(); ++d) {
+                    if (B.lowerBound[d] == B.upperBound[d]) continue;  // already fixed
+                    int range = B.upperBound[d] - B.lowerBound[d] + 1;
+                    // Find minimum relation cardinality on this dim
+                    double min_card = 1e18;
+                    for (size_t ri = 0; ri < rels[d].size(); ++ri) {
+                        int rx = rels[d][ri];
+                        double card = static_cast<double>(
+                            B.iters[rx].second - B.iters[rx].first);
+                        if (card < min_card) min_card = card;
+                    }
+                    double ratio = (min_card > 0)
+                        ? static_cast<double>(range) / min_card
+                        : static_cast<double>(range);
+                    if (ratio > best_ratio) {
+                        best_ratio = ratio;
+                        best_dim = d;
+                    }
+                }
+                if (best_dim != splitDim) {
+                    fprintf(stderr, "[AJB_BP][GreedyDim] split_call=%lld: "
+                            "mismatch_dim=%d -> greedy_dim=%d (ratio=%.2f)\n",
+                            ajb_idx_stats.split_calls, splitDim, best_dim, best_ratio);
+                    splitDim = best_dim;
+                }
+            }
             
             int splitPos, x;
             double ans;
@@ -834,6 +929,38 @@ class Index {
             setAGM(Bleft);
             setAGM(Bmid);
             setAGM(Bright);
+
+            // M1104: Bound tightening with actual min/max from data
+            // Instead of theoretical bounds, use the real data range
+            for (size_t ri = 0; ri < rels[splitDim].size(); ++ri) {
+                int rx = rels[splitDim][ri];
+                auto& sdcol = data[rx][varPos[rx][splitDim]];
+                // Tighten Bleft upper bound
+                if (Bleft.iters[rx].second > Bleft.iters[rx].first) {
+                    int actual_max = sdcol[Bleft.iters[rx].second - 1];
+                    if (actual_max < Bleft.upperBound[splitDim]) {
+                        Bleft.upperBound[splitDim] = actual_max;
+                    }
+                }
+                // Tighten Bright lower bound
+                if (Bright.iters[rx].second > Bright.iters[rx].first) {
+                    int actual_min = sdcol[Bright.iters[rx].first];
+                    if (actual_min > Bright.lowerBound[splitDim]) {
+                        Bright.lowerBound[splitDim] = actual_min;
+                    }
+                }
+            }
+
+            // M1105: Diagnostic breakpoint — split decision summary
+            if (ajb_idx_stats.split_calls % 1000 == 0) {
+                double remaining_pct = (B.AGM > 0)
+                    ? 100.0 * (Bleft.AGM + Bmid.AGM + Bright.AGM) / B.AGM
+                    : 0.0;
+                fprintf(stderr, "[AJB_BP][SplitDecision] call=%lld dim=%d pos=%d "
+                        "AGM=%lld->L:%lld/M:%lld/R:%lld (%.1f%% of parent)\n",
+                        ajb_idx_stats.split_calls, splitDim, splitPos,
+                        B.AGM, Bleft.AGM, Bmid.AGM, Bright.AGM, remaining_pct);
+            }
             // auto endSplit = chrono::high_resolution_clock::now();
             // chrono::duration<double> elapsedSplit = endSplit - startSplit;
             // totalSplitTime -= elapsedSplit.count();
