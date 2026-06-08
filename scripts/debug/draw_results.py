@@ -26,10 +26,25 @@ import os
 from collections import defaultdict
 
 # Agg backend for headless environments — must be set before pyplot import
-import matplotlib
-matplotlib.use('Agg')
-from matplotlib import pyplot as plt
-import numpy as np
+# Graceful fallback when matplotlib is absent (data-dump-only mode)
+_HAS_MPL = True
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    from matplotlib import pyplot as plt
+    import numpy as np
+except ImportError:
+    _HAS_MPL = False
+    plt = None
+    np = None
+    print("[AJB_WARN] matplotlib/numpy not installed — data-dump-only mode")
+
+
+def _dump_state(label, **kwargs):
+    """Breakpoint-style state dump: prints all kwargs as structured diagnostics.
+    Useful for verifying intermediate computation during experiment runs."""
+    parts = [f"{k}={v}" for k, v in kwargs.items()]
+    print(f"[AJB_BP] {label}: " + ", ".join(parts))
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +113,10 @@ def read_data(filename):
         return [], []
     X = [int(row[0]) for row in data]
     Y = [float(row[-1]) for row in data]
-    print(f"[AJB_STATE] {filename}: {len(X)} points, "
-          f"X=[{min(X)},{max(X)}], Y=[{min(Y):.4f},{max(Y):.4f}]")
+    _dump_state("read_data", file=filename, rows=len(X),
+                X_range=f"[{min(X)},{max(X)}]",
+                Y_range=f"[{min(Y):.4f},{max(Y):.4f}]",
+                Y_mean=f"{sum(Y)/len(Y):.4f}")
     return X, Y
 
 
@@ -138,6 +155,14 @@ def draw_grouped_bar(csv_path, save_path, title=None):
     5. Render left axis (timer_ms bars) and right axis (ajb_total markers)
     6. Annotate outlier bars with red borders + diamond markers
     """
+    if not _HAS_MPL:
+        print("[AJB_WARN] matplotlib absent — printing CSV summary only")
+        rows = read_csv_data(csv_path)
+        for r in rows[:20]:
+            _dump_state("csv_row", **{k: v for k, v in r.items()
+                        if k in ('test_name', 'variant', 'timer_ms', 'ajb_total')})
+        return
+
     rows = read_csv_data(csv_path)
 
     has_timer = any(isinstance(r.get('timer_ms'), (int, float)) for r in rows)
@@ -283,7 +308,21 @@ def draw_grouped_bar(csv_path, save_path, title=None):
 # Legacy line plot (backward compat with old result.txt files)
 # ---------------------------------------------------------------------------
 def draw_legacy(args):
-    """Original line-plot mode for .txt result files."""
+    """Original line-plot mode for .txt result files.
+    Falls back to data-dump if matplotlib is unavailable."""
+    if not _HAS_MPL:
+        print("[AJB_STATE] matplotlib absent — dumping data only")
+        for fname in args.files:
+            if not os.path.exists(fname):
+                print(f"[AJB_WARN] File not found: {fname}")
+                continue
+            X, Y = read_data(fname)
+            for xi, yi in zip(X[:15], Y[:15]):
+                print(f"  x={xi}  y={yi:.6f}")
+            if len(X) > 15:
+                print(f"  ... ({len(X) - 15} more rows)")
+        return
+
     labels = (args.labels.split(",") if args.labels
               else [os.path.basename(f) for f in args.files])
     fig, ax = plt.subplots(figsize=(10, 6))
