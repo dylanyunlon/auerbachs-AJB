@@ -11,7 +11,13 @@ set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O3 -fopenmp")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -fopenmp")
 set(CMAKE_CXX_STANDARD 20)
 
-set(CUDA_ARCH_LIST 70 80 90)
+# CUDA architectures: override via cmake -DCMAKE_CUDA_ARCHITECTURES="86;90"
+# Default: sm_70+80 (safe for CUDA 11.x); ags1: use "86;90" with CUDA 12+
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+  set(CUDA_ARCH_LIST 70 80)
+else()
+  string(REPLACE ";" " " CUDA_ARCH_LIST "${CMAKE_CUDA_ARCHITECTURES}")
+endif()
 
 add_subdirectory(third_party/thrust)
 
