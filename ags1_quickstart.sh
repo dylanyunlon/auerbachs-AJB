@@ -11,10 +11,7 @@ set -uo pipefail
 for p in /usr/local/cuda/bin /usr/local/cuda-*/bin $HOME/.local/bin /opt/cmake*/bin; do
   [ -d "$p" ] && export PATH="$p:$PATH"
 done
-# conda cmake fallback
-if ! command -v cmake &>/dev/null && command -v conda &>/dev/null; then
-  conda install -y cmake 2>/dev/null || true
-fi
+# NOTE: no conda — this is a C++/CUDA project, system cmake/g++ suffice
 # Check g++ version for -march support
 GCC_VER=$(g++ -dumpversion 2>/dev/null | cut -d. -f1)
 if [ "${GCC_VER:-0}" -lt 12 ]; then
@@ -87,10 +84,7 @@ for p in /usr/local/cuda/bin /usr/local/cuda-12*/bin /usr/local/cuda-11*/bin \
 done
 # Try module system
 command -v module &>/dev/null && { module load cmake 2>/dev/null || true; module load cuda 2>/dev/null || true; }
-# Try conda
-if ! command -v cmake &>/dev/null && command -v conda &>/dev/null; then
-  conda install -y -q cmake 2>/dev/null || true
-fi
+# No conda — use system cmake only
 
 BUILD_RC=1
 if command -v cmake &>/dev/null && command -v nvcc &>/dev/null; then
@@ -110,7 +104,7 @@ if command -v cmake &>/dev/null && command -v nvcc &>/dev/null; then
   fi
 else
   echo "=== Step 4 SKIPPED: cmake=$(command -v cmake || echo MISSING) nvcc=$(command -v nvcc || echo MISSING) ==="
-  echo "Fix: export PATH=/usr/local/cuda-XX/bin:\$PATH, or: conda install cmake"
+  echo "Fix: export PATH=/usr/local/cuda-XX/bin:\$PATH"
 fi
 
 # === Step 5: GPU实验 (如果build成功) ===
@@ -130,7 +124,10 @@ git commit -m "experiment_data: ags1 run $(date +%Y%m%d_%H%M%S)
 CPU tests: $PASS/$((PASS+FAIL)) PASS
 CUDA build: $([ $BUILD_RC -eq 0 ] && echo SUCCESS || echo FAILED)
 Hardware: 2x A6000 + H100 NVL + 2x EPYC 9354"
-git remote set-url origin https://YOUR_GITHUB_TOKEN@github.com/dylanyunlon/auerbachs-AJB.git
+# Push: set GH_TOKEN env var before running, e.g. export GH_TOKEN=ghp_xxx
+if [ -n "${GH_TOKEN:-}" ]; then
+  git remote set-url origin "https://${GH_TOKEN}@github.com/dylanyunlon/auerbachs-AJB.git"
+fi
 git push origin main
 
 echo "==========================================="
