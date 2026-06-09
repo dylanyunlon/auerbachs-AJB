@@ -48,13 +48,33 @@ echo "[AJB] === Step 1: Build deps in walking3 ==="
 # 只装: cmake(如果没有), glpk(CPU tests), matplotlib/seaborn(画图)
 # 绝不装: cuda-toolkit, nvidia-*, torch, 任何会动cu11链的东西
 
-eval "$(conda shell.bash hook)" 2>/dev/null || source ~/.bashrc 2>/dev/null || true
-conda activate walking3 2>/dev/null || {
-    echo "[AJB] WARNING: conda activate walking3 failed, trying source activate..."
-    source activate walking3 2>/dev/null || true
-}
-echo "[AJB] Python: $(python3 --version 2>&1)"
-echo "[AJB] torch: $(python3 -c 'import torch; print(torch.__version__)' 2>&1)"
+# conda activate 在 set -e 下容易炸, 先临时关掉
+set +eu
+# 初始化conda (找到conda的位置, 执行shell hook)
+CONDA_BASE=$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")
+if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+elif [ -f "$HOME/.bashrc" ]; then
+    source "$HOME/.bashrc"
+fi
+conda activate walking3
+# 恢复strict模式
+set -euo pipefail
+
+# 验证确实进了walking3
+ACTIVE_ENV=$(conda info --envs 2>/dev/null | grep '\*' | awk '{print $1}')
+PYTHON_VER=$(python3 --version 2>&1)
+TORCH_VER=$(python3 -c 'import torch; print(torch.__version__)' 2>&1)
+echo "[AJB] Active env: $ACTIVE_ENV"
+echo "[AJB] Python: $PYTHON_VER"
+echo "[AJB] torch: $TORCH_VER"
+
+# 硬校验: 必须是walking3
+if [[ "$TORCH_VER" != *"cu118"* ]]; then
+    echo "[AJB] ERROR: 不在walking3里! torch=$TORCH_VER, 期望含cu118"
+    echo "[AJB] 请手动执行: conda activate walking3 && bash scripts/ags1_deploy_and_run.sh"
+    exit 1
+fi
 
 # cmake — 编译需要, 与PyTorch无关
 if ! command -v cmake &>/dev/null; then
