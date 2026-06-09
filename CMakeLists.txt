@@ -9,7 +9,11 @@ message("-- Building for ${CMAKE_BUILD_TYPE}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fopenmp")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O3 -fopenmp")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -fopenmp")
-set(CMAKE_CXX_STANDARD 20)
+
+# nvcc 11.5 最高支持 C++17, 不能用 C++20
+# C++20 会让 nvcc 生成 gcc 无法解析的命令行
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
 
 # CUDA architectures: override via cmake -DCMAKE_CUDA_ARCHITECTURES="86;90"
 # Default: sm_70+80 (safe for CUDA 11.x); ags1: use "86;90" with CUDA 12+
@@ -89,7 +93,6 @@ target_include_directories(sort_benchmark PUBLIC
   third_party/tabulate/include
   third_party/termcolor/include
 )
-target_include_directories(sort_benchmark SYSTEM PRIVATE)
 
 add_executable(join_benchmark "src/join_benchmark.cu")
 target_link_libraries(join_benchmark PUBLIC Thrust::Thrust ThrustCUDA ${CUDA_NVTX_LIBRARY})
@@ -107,7 +110,6 @@ target_include_directories(join_benchmark PUBLIC
   third_party/tabulate/include
   third_party/termcolor/include
 )
-target_include_directories(join_benchmark SYSTEM PRIVATE)
 
 # =============================================================================
 # AJB targets — Adaptive Bandwidth-tier Join
@@ -132,7 +134,6 @@ target_include_directories(ajb_benchmark PUBLIC
   third_party/tabulate/include
   third_party/termcolor/include
 )
-target_include_directories(ajb_benchmark SYSTEM PRIVATE)
 
 # =============================================================================
 # AJB JoinREnum test/tool targets (CPU-only, no CUDA required)

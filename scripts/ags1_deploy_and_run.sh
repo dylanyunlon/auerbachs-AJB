@@ -221,8 +221,8 @@ cmake .. \
 echo ""
 echo "[AJB] Building targets..."
 
-# 先编upstream baseline
-make -j$(nproc) join_benchmark 2>&1 | tee "$RESULTS_DIR/build_join.log" | tail -10
+# 先编upstream baseline (VERBOSE=1 看实际编译命令，方便debug)
+make -j1 VERBOSE=1 join_benchmark 2>&1 | tee "$RESULTS_DIR/build_join.log" | tail -30
 echo "[AJB] join_benchmark: $([ -x join_benchmark ] && echo OK || echo FAIL)"
 
 # 再编AJB
