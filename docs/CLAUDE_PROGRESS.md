@@ -1308,37 +1308,46 @@ bash scripts/dispatch_subclaude.sh figure
 ### 完整Claude接力计划 (M1302起)
 
 ```
-第16位Claude(本轮): M1302-M1330
+第16位Claude: M1302-M1320
   ✅ SOTA分析 + 部署脚本 + 实验设计
   ✅ push到GitHub
 
-第17位Claude: M1331-M1360 (在ags1服务器上)
-  - 运行 ags1_deploy_and_run.sh
-  - 修复所有CUDA编译错误 (sm_86/sm_90)
-  - 确认 ajb_benchmark + join_benchmark 能跑
-  - 100M规模smoke test通过
-  - push编译修复 + smoke test结果
+第17位Claude (本轮, 2 compaction sessions): M1321-M1350
+  ✅ M1321-M1330: tier_transfer_scheduler.cuh — PrioritySchedule(), CoalesceTransfers(), DumpFullState()
+  ✅ M1321-M1330: skew_detector.cuh — TwoSampleKSTest(), EntropyOptimalBuckets()
+  ✅ M1321-M1330: ajb_debug_infra.cuh — AjbTraceRing, AjbPhaseTimer, AjbMemoryWatermark
+  ✅ M1321-M1330: auerbachs_bench.sh — AJB vs upstream baseline experiment suite
+  ✅ M1331-M1340: AGM_dual_analysis.hpp — perturbation_sweep(), classify_binding_constraints()
+  ✅ M1331-M1340: ajb_renum_adapter.hpp — Algorithm L reservoir sampling + collision EMA
+  ✅ 全部 9/9 CPU tests PASS
+  ✅ Pushed: 8c02dee, 04bbea2
+  ⚠️  Sub-Claude dispatch via claude.hk.cn SSE: conversation created but
+     multi-turn tool execution not pollable (server handles tool loops internally,
+     SSE stream only returns first tool_use). Need to poll conversation messages.
 
-第18位Claude: M1361-M1390
-  - 运行 ags1_full_experiment.sh 完整实验
-  - 4方法 × 4分布 × 1B/7B/13B 规模
-  - 收集所有CSV, push到experiment_data/
+第18位Claude: M1351-M1380 (on ags1 server)
+  - SSH to ags1, cd /data/jiacheng/system/cache/temp/atc2026/
+  - git clone https://github.com/dylanyunlon/auerbachs-AJB.git
+  - conda activate walking3
+  - bash auerbachs_bench.sh build  (fix CUDA 11.5 vs sm_86/sm_90)
+  - bash auerbachs_bench.sh cpu    (9/9 tests on server)
+  - bash auerbachs_bench.sh sort   (4 sizes × 4 dists × 3 GPUs, AJB vs upstream)
+  - bash auerbachs_bench.sh push
 
-第19位Claude: M1391-M1420
-  - 运行 dispatch_experiments.py 分析数据
-  - 用实测数据替换tex中Table 1 + Table 2
-  - 更新Abstract/Conclusion中的speedup数字
-  - 如果AJB实测不如baseline, 调整K_x/K_u/K_v参数重跑
+第19位Claude: M1381-M1410
+  - bash auerbachs_bench.sh join  (4 configs × 2 dists × 3 GPU configs)
+  - Analyze experiment_data/results/*.csv
+  - If AJB < upstream: tune K_x/K_u/K_v and re-run
+  - Fill paper/ajb_reconstructed.tex Table 1 + Table 2 with real data
 
-第20位Claude: M1421-M1450
-  - 用matplotlib生成Figure 2-7 (PDF)
-  - 论文camera-ready格式化
-  - 补充bibliography (目标30+篇引用)
-  - 最终编译验证: pdflatex通过, 无warning
+第20位Claude: M1411-M1440
+  - Generate Figure 2-7 from experiment_data/ CSVs
+  - Update Abstract/Conclusion speedup numbers
+  - Bibliography expansion (target 30+ refs)
+  - pdflatex full compile pass
 
-第21位Claude: M1451-M1480
+第21位Claude: M1441-M1470
   - Docker reproducibility container
-  - CI guard: 每次push自动编译+smoke test
-  - 最终review + 提交准备
+  - Final review + NeurIPS submission prep
 ```
 
