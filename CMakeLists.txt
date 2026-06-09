@@ -25,11 +25,18 @@ endif()
 
 add_subdirectory(third_party/thrust)
 
-set(WITH_OPEN_MP OMP)
+# Thrust + OpenMP: 不用 thrust_create_target(... HOST OMP ...)
+# 因为Thrust cmake会注入 -Xcompiler=SHELL:-fopenmp, nvcc 11.5不认识SHELL:前缀
+# 改为: Thrust只用CUDA backend, OpenMP通过我们自己的-Xcompiler手动传
 set(CUDA_NVTX_LIBRARY nvToolsExt)
-set(THRUST_REQUIRED_SYSTEMS CUDA ${WITH_OPEN_MP})
 
-thrust_create_target(ThrustCUDA HOST ${WITH_OPEN_MP} DEVICE CUDA)
+thrust_create_target(ThrustCUDA HOST CPP DEVICE CUDA)
+
+# 给所有CUDA编译手动加 -fopenmp (通过-Xcompiler, 不用SHELL:)
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-fopenmp")
+
+# link时也需要OpenMP
+link_libraries(OpenMP::OpenMP_CXX)
 
 add_executable(cpu_merge_benchmark "src/cpu_merge_benchmark.cu")
 target_link_libraries(cpu_merge_benchmark PUBLIC Thrust::Thrust ThrustCUDA)
