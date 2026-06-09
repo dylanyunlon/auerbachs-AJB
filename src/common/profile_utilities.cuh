@@ -66,14 +66,15 @@ class TimeDurations {
     return duration;
   }
 
-  double GetDuration(const std::string& tag) { return durations_[tag].count(); }
+  double GetDuration(const std::string& tag) { std::chrono::duration<double> d = durations_[tag]; return d.count(); }
 
   double GetTotalDuration() {
-    auto total = std::chrono::duration<double>::zero();
-    for (const auto& kv : durations_) {
-      total += kv.second;
+    double total = 0.0;
+    for (auto it = durations_.begin(); it != durations_.end(); ++it) {
+      std::chrono::duration<double> d = it->second;
+      total += d.count();
     }
-    return total.count();
+    return total;
   }
 
   // 带invocation统计的表格输出
@@ -84,12 +85,12 @@ class TimeDurations {
     fprintf(stderr, "  %-30s %8s %12s %12s %12s %12s\n",
             "-----", "-----", "--------", "-------", "------", "------");
     double total = 0.0;
-    for (const auto& kv : durations_) {
-      const auto& tag = kv.first;
-      const auto& dur = kv.second;
-      auto it = invocation_stats_.find(tag);
-      if (it != invocation_stats_.end()) {
-        const auto& s = it->second;
+    for (auto it = durations_.begin(); it != durations_.end(); ++it) {
+      std::string tag = it->first;
+      std::chrono::duration<double> dur = it->second;
+      auto sit = invocation_stats_.find(tag);
+      if (sit != invocation_stats_.end()) {
+        const InvocationStats& s = sit->second;
         fprintf(stderr, "  %-30s %8zu %12.6f %12.6f %12.6f %12.6f\n",
                 tag.c_str(), s.count, s.total_sec,
                 s.count > 0 ? s.total_sec / s.count : 0.0,
@@ -108,19 +109,20 @@ class TimeDurations {
     FILE* fp = fopen(path.c_str(), "w");
     if (!fp) { fprintf(stderr, "[TimeDurations] Cannot open %s\n", path.c_str()); return; }
     fprintf(fp, "phase,calls,total_sec,mean_sec,min_sec,max_sec\n");
-    for (const auto& kv : durations_) {
-      const auto& tag = kv.first;
-      const auto& dur = kv.second;
-      auto it = invocation_stats_.find(tag);
-      if (it != invocation_stats_.end()) {
-        const auto& s = it->second;
+    for (auto it = durations_.begin(); it != durations_.end(); ++it) {
+      std::string tag = it->first;
+      std::chrono::duration<double> dur = it->second;
+      auto sit = invocation_stats_.find(tag);
+      if (sit != invocation_stats_.end()) {
+        const InvocationStats& s = sit->second;
         fprintf(fp, "%s,%zu,%.9f,%.9f,%.9f,%.9f\n",
                 tag.c_str(), s.count, s.total_sec,
                 s.count > 0 ? s.total_sec / s.count : 0.0,
                 s.min_sec, s.max_sec);
       } else {
+        double dur_sec = dur.count();
         fprintf(fp, "%s,1,%.9f,%.9f,%.9f,%.9f\n",
-                tag.c_str(), dur.count(), dur.count(), dur.count(), dur.count());
+                tag.c_str(), dur_sec, dur_sec, dur_sec, dur_sec);
       }
     }
     fclose(fp);
@@ -146,8 +148,8 @@ class TimeDurations {
     if (active_intervals_.empty()) return;
     fprintf(stderr, "[AJB_BP][Overlap] %zu phases active simultaneously:",
             active_intervals_.size());
-    for (const auto& kv : active_intervals_) {
-      fprintf(stderr, " [%s]", kv.first.c_str());
+    for (auto it = active_intervals_.begin(); it != active_intervals_.end(); ++it) {
+      fprintf(stderr, " [%s]", it->first.c_str());
     }
     fprintf(stderr, "\n");
   }
