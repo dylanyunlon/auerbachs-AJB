@@ -434,6 +434,73 @@ void AJBHybridSort(
     fusion_plan = RadixPassFusionPlan::Analyze(sizeof(T) * 8);
   }
 
+  // --- Adaptive radix-bit selection (Algorithm: CLZ sampling) ---
+  // Instead of fixed 8-bit radix, sample keys to determine optimal bits/pass.
+  // Count Leading Zeros (CLZ) on a sample reveals effective key width.
+  // Narrower effective keys → fewer radix passes → less memory traffic.
+  size_t adaptive_radix_bits = 8;  // default
+  {
+    const size_t sample_sz = std::min(num_elements, (size_t)10000);
+    size_t stride = (num_elements > sample_sz) ? num_elements / sample_sz : 1;
+    int total_clz = 0;
+    int max_val_bits = 0;
+    for (size_t i = 0; i < num_elements && i / stride < sample_sz; i += stride) {
+      uint64_t val = static_cast<uint64_t>(keys[i]);
+      if (val == 0) { total_clz += 64; continue; }
+      int clz = __builtin_clzll(val);
+      total_clz += clz;
+      int val_bits = 64 - clz;
+      if (val_bits > max_val_bits) max_val_bits = val_bits;
+    }
+    size_t n_sampled = std::min(sample_sz, num_elements);
+    double avg_clz = (n_sampled > 0) ? static_cast<double>(total_clz) / n_sampled : 0;
+    int effective_width = (max_val_bits > 0) ? max_val_bits : (int)(sizeof(T) * 8);
+
+    // Choose radix bits: wider keys → larger radix (more parallelism)
+    // Narrow keys → smaller radix (fewer passes, less scratch memory)
+    if (effective_width <= 16) {
+      adaptive_radix_bits = 4;  // 4 passes of 4 bits = 16 bits
+    } else if (effective_width <= 32) {
+      adaptive_radix_bits = 8;  // 4 passes of 8 bits = 32 bits
+    } else {
+      adaptive_radix_bits = 8;  // 8 passes of 8 bits = 64 bits
+    }
+    // Clamp: powers of 2, 4-11 range
+    adaptive_radix_bits = std::max((size_t)4, std::min((size_t)11, adaptive_radix_bits));
+
+    fprintf(stderr, "[AJB_BP][AdaptiveRadix] sampled=%zu avg_clz=%.1f max_val_bits=%d "
+            "effective_width=%d -> radix_bits=%zu\n",
+            n_sampled, avg_clz, max_val_bits, effective_width, adaptive_radix_bits);
+  }
+
+  // --- Early termination check for nearly-sorted data ---
+  // Sample pairs to estimate disorder ratio. If < threshold, skip sort.
+  bool skip_sort = false;
+  {
+    const size_t check_sz = std::min(num_elements, (size_t)50000);
+    size_t stride = (num_elements > check_sz) ? num_elements / check_sz : 1;
+    size_t inversions = 0;
+    size_t checked = 0;
+    for (size_t i = stride; i < num_elements; i += stride) {
+      checked++;
+      if (keys[i] < keys[i - 1]) inversions++;
+    }
+    double disorder_ratio = (checked > 0) ? static_cast<double>(inversions) / checked : 1.0;
+
+    // Threshold: if less than 0.1% of sampled pairs are inverted, data is nearly sorted
+    const double disorder_threshold = 0.001;
+    if (disorder_ratio < disorder_threshold && num_elements > 1000) {
+      skip_sort = true;
+      fprintf(stderr, "[AJB_BP][EarlyTermination] disorder=%.6f (<%g threshold) "
+              "checked=%zu inversions=%zu -> SKIP SORT (nearly sorted)\n",
+              disorder_ratio, disorder_threshold, checked, inversions);
+    } else {
+      fprintf(stderr, "[AJB_BP][DisorderCheck] disorder=%.6f checked=%zu "
+              "inversions=%zu -> proceed with sort\n",
+              disorder_ratio, checked, inversions);
+    }
+  }
+
   // --- Compute base chunk size if auto (=0) ---
   if (chunk_size == 0) {
     chunk_size = CalculateChunkSize(gpus, num_elements, element_bytes);
@@ -505,8 +572,16 @@ void AJBHybridSort(
                                 host_allocators, device_allocators, stream_pools);
 
   // --- Sort phase with WSD schedule and memory-proportional chunks ---
+  if (skip_sort) {
+    printf("  [SKIP] Nearly-sorted input detected — bypassing GPU sort phase\n");
+    fprintf(stderr, "[AJB_STATE][SortSkipped] n=%zu disorder below threshold\n",
+            num_elements);
+  }
   {
     TimeScope time_scope("sort_phase");
+
+    // If skip_sort, we still enter the scope but skip the inner loop
+    if (skip_sort) goto sort_phase_end;
 
     std::function<void()> synchronize_transfers;
     size_t num_remaining_elements = num_elements;
@@ -615,6 +690,7 @@ void AJBHybridSort(
       printf("  [Sort] Synchronizing final transfers...\n");
       synchronize_transfers();
     }
+    sort_phase_end:;
   }
 
   // --- Print per-GPU throughput summary ---

@@ -1,131 +1,128 @@
 #!/usr/bin/env python3
 """
-AJB实验数据分析 + LaTeX表格自动填充
+analyze_and_fill_paper.py — Convert experiment CSVs to paper table values.
 
-用法: python3 scripts/analyze_and_fill_paper.py experiment_data/<timestamp>/summary.csv
+Reads experiment_data/results/sort_comparison_*.csv and join_comparison_*.csv,
+computes AJB vs upstream speedups, and outputs LaTeX table snippets + summary.
 
-流程:
-  1. 读取summary.csv (ags1服务器自动产出)
-  2. 计算Table 1 (ICL balance score) 和 Table 2 (wallclock time) 的数据
-  3. 对比4种方法: AJB vs uniform-cadence vs pin-local vs eager
-  4. 生成LaTeX表格片段, 可直接粘贴到paper/ajb_reconstructed.tex
-  5. 检查AJB是否超越SOTA baseline, 打印诊断
+Usage:
+  python3 scripts/analyze_and_fill_paper.py [experiment_data/results/]
 """
-import sys, csv, os
+import csv, glob, os, sys
 from collections import defaultdict
-import math
 
-def welford_finalize(n, mean, M2):
-    """Welford online variance: return (mean, stddev)"""
-    if n < 2: return (mean, 0.0)
-    return (mean, math.sqrt(M2 / (n - 1)))
-
-def analyze_results(csv_path):
-    """Parse summary.csv and compute paper table data"""
-    if not os.path.exists(csv_path):
-        print(f"[AJB_BP] File not found: {csv_path}")
-        return
-
-    # Parse CSV
+def load_csvs(pattern):
     rows = []
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
+    for f in sorted(glob.glob(pattern)):
+        with open(f) as fh:
+            for row in csv.DictReader(fh):
+                row['_source'] = os.path.basename(f)
+                rows.append(row)
+    return rows
 
-    print(f"[AJB_STATE] Loaded {len(rows)} result rows from {csv_path}")
+def analyze_sort(data_dir):
+    rows = load_csvs(os.path.join(data_dir, 'sort_comparison_*.csv'))
+    if not rows:
+        print("[WARN] No sort_comparison CSVs found"); return {}
+    groups = defaultdict(dict)
+    for r in rows:
+        key = (r.get('gpu_name',''), r.get('num_elements',''), r.get('distribution',''))
+        method = r.get('method','')
+        try: ms = float(r.get('sort_ms', 0))
+        except: ms = 0
+        if ms > 0: groups[key][method] = ms
 
-    # Group by (method, distribution, kx, input_size)
-    grouped = defaultdict(list)
-    for row in rows:
-        method = row.get("method", "unknown")
-        dist = row.get("distribution", "unknown")
-        kx = row.get("kx", "0")
-        n = row.get("input_size", "0")
-        key = (method, dist, kx, n)
-        grouped[key].append(row)
+    results = {}
+    for key, methods in groups.items():
+        ajb_ms = methods.get('ajb', 0)
+        up_ms = methods.get('upstream', 0)
+        if ajb_ms > 0 and up_ms > 0:
+            results[key] = {
+                'ajb_ms': ajb_ms, 'upstream_ms': up_ms,
+                'speedup': up_ms / ajb_ms,
+                'gpu': key[0], 'n': key[1], 'dist': key[2],
+            }
+    return results
 
-    # ---- Table 1: ICL Balance Score ----
-    print("\n[AJB_STATE] === Table 1: ICL Balance Score (normalized, higher=better) ===")
-    distributions = ["uniform", "zipfian", "foreign_key", "many_to_many"]
-    methods = ["ajb", "uniform_cadence", "pin_local", "eager"]
-    method_labels = {"ajb": "AJB", "uniform_cadence": "Uniform-cadence",
-                     "pin_local": "Pin-local", "eager": "Eager repartition"}
+def analyze_join(data_dir):
+    rows = load_csvs(os.path.join(data_dir, 'join_comparison_*.csv'))
+    if not rows:
+        print("[WARN] No join_comparison CSVs found"); return {}
+    groups = defaultdict(dict)
+    for r in rows:
+        key = (r.get('gpu_config',''), r.get('r_elements',''),
+               r.get('s_elements',''), r.get('distribution',''))
+        method = r.get('method','')
+        try: ms = float(r.get('join_ms', 0))
+        except: ms = 0
+        if ms > 0: groups[key][method] = ms
 
-    print(f"{'Method':<20} " + " ".join(f"{d:<14}" for d in distributions) + " Avg")
-    print("-" * 90)
-    for method in methods:
-        scores = []
-        for dist in distributions:
-            # Find results for this method+dist (any kx/n)
-            matching = [v for (m, d, _, _), v in grouped.items()
-                       if m == method and d == dist]
-            if matching:
-                # Use balance_score from CSV if available
-                vals = []
-                for group in matching:
-                    for row in group:
-                        bs = row.get("balance_score") or row.get("load_balance_gini")
-                        if bs:
-                            try: vals.append(float(bs))
-                            except: pass
-                avg = sum(vals) / len(vals) if vals else 0.0
-                scores.append(avg)
-            else:
-                scores.append(0.0)
-        avg_score = sum(scores) / len(scores) if scores else 0.0
-        print(f"{method_labels.get(method, method):<20} " +
-              " ".join(f"{s:<14.1f}" for s in scores) + f" {avg_score:.1f}")
+    results = {}
+    for key, methods in groups.items():
+        ajb_ms = methods.get('ajb', 0)
+        up_ms = methods.get('upstream', 0)
+        if ajb_ms > 0 and up_ms > 0:
+            results[key] = {
+                'ajb_ms': ajb_ms, 'upstream_ms': up_ms,
+                'speedup': up_ms / ajb_ms,
+                'gpus': key[0], 'r': key[1], 's': key[2], 'dist': key[3],
+            }
+    return results
 
-    # ---- Table 2: Wallclock Time ----
-    print("\n[AJB_STATE] === Table 2: End-to-end join time (seconds) ===")
-    input_sizes = sorted(set(n for _, _, _, n in grouped.keys()))
-    kx_values = sorted(set(kx for _, _, kx, _ in grouped.keys()))
+def generate_latex_table1(sort_results):
+    if not sort_results: return "% No sort data yet\n"
+    lines = ["% Table 1: Sort Performance (AJB vs Upstream)",
+             "\\begin{tabular}{llrrr}", "\\toprule",
+             "GPU & Distribution & Upstream (ms) & AJB (ms) & Speedup \\\\",
+             "\\midrule"]
+    for key in sorted(sort_results.keys()):
+        r = sort_results[key]
+        lines.append(f"  {r['gpu']} & {r['dist']} & {r['upstream_ms']:.1f} & "
+                     f"{r['ajb_ms']:.1f} & {r['speedup']:.2f}$\\times$ \\\\")
+    lines += ["\\bottomrule", "\\end{tabular}"]
+    return "\n".join(lines)
 
-    header = "Method"
-    for n in input_sizes[:3]:
-        for kx in kx_values[:2]:
-            header += f"  {n}/{kx}"
-    print(header)
-    print("-" * 100)
+def generate_latex_table2(join_results):
+    if not join_results: return "% No join data yet\n"
+    lines = ["% Table 2: Join Performance (AJB vs Upstream)",
+             "\\begin{tabular}{llrrr}", "\\toprule",
+             "GPUs & |R|:|S| & Upstream (ms) & AJB (ms) & Speedup \\\\",
+             "\\midrule"]
+    for key in sorted(join_results.keys()):
+        r = join_results[key]
+        lines.append(f"  {r['gpus']} & {r['r']}:{r['s']} & {r['upstream_ms']:.1f} & "
+                     f"{r['ajb_ms']:.1f} & {r['speedup']:.2f}$\\times$ \\\\")
+    lines += ["\\bottomrule", "\\end{tabular}"]
+    return "\n".join(lines)
 
-    for method in methods:
-        line = f"{method_labels.get(method, method):<20}"
-        for n in input_sizes[:3]:
-            for kx in kx_values[:2]:
-                key = (method, "uniform", kx, n)
-                if key in grouped:
-                    times = []
-                    for row in grouped[key]:
-                        t = row.get("total_time_sec") or row.get("join_time")
-                        if t:
-                            try: times.append(float(t))
-                            except: pass
-                    if times:
-                        mean = sum(times) / len(times)
-                        stddev = math.sqrt(sum((x - mean)**2 for x in times) / max(len(times)-1, 1))
-                        line += f"  {mean:.2f}±{stddev:.3f}"
-                    else:
-                        line += "  N/A"
-                else:
-                    line += "  N/A"
-        print(line)
+def main():
+    data_dir = sys.argv[1] if len(sys.argv) > 1 else 'experiment_data/results'
+    print(f"[analyze] Loading from {data_dir}/")
+    sort_results = analyze_sort(data_dir)
+    join_results = analyze_join(data_dir)
+    print(f"[analyze] Sort: {len(sort_results)} entries, Join: {len(join_results)} entries")
 
-    # ---- AJB vs SOTA比较 ----
-    print("\n[AJB_STATE] === AJB vs Baselines ===")
-    for (method, dist, kx, n), rows_list in sorted(grouped.items()):
-        if method != "ajb": continue
-        # Find corresponding uniform-cadence
-        uc_key = ("uniform_cadence", dist, kx, n)
-        if uc_key in grouped:
-            ajb_times = [float(r.get("total_time_sec", "0")) for r in rows_list if r.get("total_time_sec")]
-            uc_times = [float(r.get("total_time_sec", "0")) for r in grouped[uc_key] if r.get("total_time_sec")]
-            if ajb_times and uc_times:
-                speedup = (sum(uc_times)/len(uc_times)) / (sum(ajb_times)/len(ajb_times))
-                print(f"  {dist} kx={kx} n={n}: AJB {speedup:.2f}x vs uniform-cadence")
+    table1 = generate_latex_table1(sort_results)
+    table2 = generate_latex_table2(join_results)
+    print("\n=== Table 1 (Sort) ===\n" + table1)
+    print("\n=== Table 2 (Join) ===\n" + table2)
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python3 analyze_and_fill_paper.py <summary.csv>")
-        sys.exit(1)
-    analyze_results(sys.argv[1])
+    # Summary stats
+    sort_sp = [r['speedup'] for r in sort_results.values()]
+    join_sp = [r['speedup'] for r in join_results.values()]
+    os.makedirs('experiment_data/paper', exist_ok=True)
+    with open('experiment_data/paper/table1_sort.tex', 'w') as f: f.write(table1)
+    with open('experiment_data/paper/table2_join.tex', 'w') as f: f.write(table2)
+    with open('experiment_data/paper/summary.txt', 'w') as f:
+        if sort_sp:
+            f.write(f"sort_min_speedup: {min(sort_sp):.4f}\n")
+            f.write(f"sort_max_speedup: {max(sort_sp):.4f}\n")
+            f.write(f"sort_mean_speedup: {sum(sort_sp)/len(sort_sp):.4f}\n")
+        if join_sp:
+            f.write(f"join_min_speedup: {min(join_sp):.4f}\n")
+            f.write(f"join_max_speedup: {max(join_sp):.4f}\n")
+            f.write(f"join_mean_speedup: {sum(join_sp)/len(join_sp):.4f}\n")
+    print("[analyze] Written to experiment_data/paper/")
+
+if __name__ == '__main__':
+    main()
