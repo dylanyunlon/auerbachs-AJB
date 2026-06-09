@@ -1250,3 +1250,95 @@ Completed: M1-M1280 (15 Claudes)
 2. 运行 `bash scripts/ags1_build_from_scratch.sh`
 3. 确认GPU kernel实际执行 (nvidia-smi看利用率)
 4. 用真实数据替换paper中的占位数字
+
+---
+
+## 16th Claude (本轮, M1302-M1330) — 部署流水线 + SOTA分析 + 计划制定
+
+### 关键发现
+
+#### 1. SOTA竞争格局
+| 工作 | 年份 | 贡献 | AJB的定位 |
+|------|------|------|-----------|
+| Maltry et al. (hpides/multi-gpu-sort-merge-join) | VLDB'25 | 多GPU sort-merge join, NVLink P2P, 15.2x vs CPU | **AJB的直接upstream和baseline** |
+| MG-Join (Paul et al.) | SIGMOD'21 | 识别异构互连瓶颈, 首个系统性multi-GPU join | 问题相同但未提出解耦传输 |
+| Triton Join (Lutz et al.) | SIGMOD'22 | Out-of-core GPU join with fast interconnects | 聚焦单GPU→CPU, 非multi-GPU |
+| JoinREnum (Chen et al.) | arXiv 2025 | Random-order enumeration with AGM bound | AJB的第二个upstream |
+| Rui et al. | VLDB'20 | Multi-GPU join without P2P | AJB的弱baseline |
+
+**AJB的核心差异化**: 在**异构互连**(NVLink island + PCIe)上做**解耦传输调度**。
+Maltry假设统一NVLink/NVSwitch; AJB处理NVLink+PCIe混合的现实场景。
+
+#### 2. 项目现状
+- 代码: 278文件, 26K行, 全部有明确用途
+- 论文: 1215行完整tex, 7节, 可编译, 但**所有数据是占位符**
+- 实验: 11/11 CPU tests通过, **GPU从未编译运行过**
+- 根因: CUDA 11.5不支持H100 (sm_90), third_party依赖从未安装
+
+#### 3. 本轮完成
+- `scripts/ags1_deploy_and_run.sh`: 一键CUDA 12环境 + 编译 + 实验 + push
+- `scripts/ags1_full_experiment.sh`: 4方法 × 4分布 × 5规模 × 3 K_x 完整实验
+- `scripts/dispatch_experiments.py`: 实验CSV → 论文Table 1/Table 2数值
+- `scripts/dispatch_subclaude.sh`: 子Claude任务分派(analyze/build_fix/figure)
+
+### 服务器执行指令 (在ags1上操作)
+
+```bash
+# 1. 设置token (从安全渠道获取)
+echo "<YOUR_GH_TOKEN>" > ~/.gh_token
+
+# 2. clone项目
+cd /data/jiacheng/system/cache/temp/atc2026
+git clone https://github.com/dylanyunlon/auerbachs-AJB.git
+cd auerbachs-AJB
+
+# 3. 一键部署
+bash scripts/ags1_deploy_and_run.sh
+
+# 4. 如果编译失败, 分派子Claude修复
+bash scripts/dispatch_subclaude.sh build_fix
+
+# 5. 实验完成后, 分派子Claude分析数据填充论文
+bash scripts/dispatch_subclaude.sh analyze
+
+# 6. 生成图表
+bash scripts/dispatch_subclaude.sh figure
+```
+
+### 完整Claude接力计划 (M1302起)
+
+```
+第16位Claude(本轮): M1302-M1330
+  ✅ SOTA分析 + 部署脚本 + 实验设计
+  ✅ push到GitHub
+
+第17位Claude: M1331-M1360 (在ags1服务器上)
+  - 运行 ags1_deploy_and_run.sh
+  - 修复所有CUDA编译错误 (sm_86/sm_90)
+  - 确认 ajb_benchmark + join_benchmark 能跑
+  - 100M规模smoke test通过
+  - push编译修复 + smoke test结果
+
+第18位Claude: M1361-M1390
+  - 运行 ags1_full_experiment.sh 完整实验
+  - 4方法 × 4分布 × 1B/7B/13B 规模
+  - 收集所有CSV, push到experiment_data/
+
+第19位Claude: M1391-M1420
+  - 运行 dispatch_experiments.py 分析数据
+  - 用实测数据替换tex中Table 1 + Table 2
+  - 更新Abstract/Conclusion中的speedup数字
+  - 如果AJB实测不如baseline, 调整K_x/K_u/K_v参数重跑
+
+第20位Claude: M1421-M1450
+  - 用matplotlib生成Figure 2-7 (PDF)
+  - 论文camera-ready格式化
+  - 补充bibliography (目标30+篇引用)
+  - 最终编译验证: pdflatex通过, 无warning
+
+第21位Claude: M1451-M1480
+  - Docker reproducibility container
+  - CI guard: 每次push自动编译+smoke test
+  - 最终review + 提交准备
+```
+
