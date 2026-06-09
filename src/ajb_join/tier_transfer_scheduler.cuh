@@ -496,6 +496,184 @@ class TierTransferScheduler {
            event_log_.size(), path.c_str());
   }
 
+  // -----------------------------------------------------------------------
+  // Bandwidth-headroom priority scheduling (Algorithm 2 in the paper):
+  //
+  // Instead of fixed-period modular scheduling, rank pending transfers by
+  //   priority = urgency(staleness) * headroom(tier_bw / peak_bw)
+  // High urgency + high bandwidth headroom => transfer first.
+  // This replaces the fixed (t mod K) rule when staleness exceeds threshold.
+  // -----------------------------------------------------------------------
+  struct TransferCandidate {
+    TransferEvent::StructureKind kind;
+    int src_gpu;
+    int dst_gpu;
+    double urgency;    // staleness-derived, [0,1]
+    double headroom;   // current_bw / peak_bw of the link tier, [0,1]
+    double priority;   // urgency * headroom
+  };
+
+  // Rank all pending transfers and return the top-k that fit within
+  // the bandwidth budget for this chunk-group step.
+  std::vector<TransferCandidate> PrioritySchedule(
+      size_t t,
+      const std::vector<double>& staleness_per_gpu,
+      size_t max_concurrent = 4) {
+
+    std::vector<TransferCandidate> candidates;
+
+    TransferEvent::StructureKind kinds[] = {
+        TransferEvent::StructureKind::kBuildPartition,
+        TransferEvent::StructureKind::kMergePathBoundary,
+        TransferEvent::StructureKind::kMaterializationBuffer};
+
+    for (auto kind : kinds) {
+      // Base period check: only consider if within 2x the cadence window
+      size_t period = GetPeriod(kind);
+      size_t since_last = t % period;
+      double base_urgency = (period > 0)
+          ? static_cast<double>(since_last) / static_cast<double>(period)
+          : 0.0;
+
+      for (size_t i = 0; i < gpus_.size(); ++i) {
+        for (size_t j = 0; j < gpus_.size(); ++j) {
+          if (i == j) continue;
+          int src = gpus_[i], dst = gpus_[j];
+
+          // Skip backed-off links
+          bool backed_off = false;
+          for (const auto& link : topology_) {
+            if (link.src_device == src && link.dst_device == dst) {
+              if (link.IsBackedOff()) backed_off = true;
+              break;
+            }
+          }
+          if (backed_off) continue;
+
+          // Staleness contribution from this GPU pair
+          double gpu_staleness = (i < staleness_per_gpu.size())
+              ? staleness_per_gpu[i] : 0.0;
+          double urgency = std::min(1.0, base_urgency + gpu_staleness);
+
+          // Headroom: how much bandwidth is available on this link's tier
+          BandwidthTier tier = LookupTier(src, dst);
+          double headroom = 0.5;  // default
+          switch (tier) {
+            case BandwidthTier::kFastP2P:
+              headroom = ewma_fast_.Utilization();
+              headroom = 1.0 - headroom;  // invert: low utilization = high headroom
+              break;
+            case BandwidthTier::kSlowPCIe:
+              headroom = 1.0 - ewma_slow_.Utilization();
+              break;
+            case BandwidthTier::kHostDRAM:
+              headroom = 1.0 - ewma_host_.Utilization();
+              break;
+          }
+          headroom = std::max(0.05, headroom);  // floor to avoid starvation
+
+          double priority = urgency * headroom;
+          if (priority > 0.01) {
+            candidates.push_back({kind, src, dst, urgency, headroom, priority});
+          }
+        }
+      }
+    }
+
+    // Sort by priority descending (highest priority first)
+    std::sort(candidates.begin(), candidates.end(),
+              [](const TransferCandidate& a, const TransferCandidate& b) {
+                return a.priority > b.priority;
+              });
+
+    // Truncate to max_concurrent
+    if (candidates.size() > max_concurrent) {
+      candidates.resize(max_concurrent);
+    }
+
+    // [AJB_BP] Priority schedule diagnostic
+    if (!candidates.empty() && t % 10 == 0) {
+      fprintf(stderr, "[AJB_BP][PrioritySchedule] t=%zu candidates=%zu selected=%zu\n",
+              t, candidates.size(), std::min(candidates.size(), max_concurrent));
+      for (size_t k = 0; k < std::min(candidates.size(), (size_t)3); ++k) {
+        const auto& c = candidates[k];
+        fprintf(stderr, "  [%zu] %s GPU %d->%d urgency=%.3f headroom=%.3f priority=%.4f\n",
+                k, TransferEvent::KindName(c.kind),
+                c.src_gpu, c.dst_gpu, c.urgency, c.headroom, c.priority);
+      }
+    }
+
+    return candidates;
+  }
+
+  // -----------------------------------------------------------------------
+  // Transfer coalescing: combine small transfers to the same destination
+  // into a single batch to reduce kernel launch and PCIe round-trip overhead.
+  // Returns the merged byte count (0 if nothing to coalesce).
+  // -----------------------------------------------------------------------
+  size_t CoalesceTransfers(
+      const std::vector<TransferCandidate>& candidates,
+      int dst_gpu) {
+    size_t total_bytes = 0;
+    size_t n_coalesced = 0;
+
+    for (const auto& c : candidates) {
+      if (c.dst_gpu == dst_gpu) {
+        // Estimate bytes per structure kind
+        size_t est_bytes = 0;
+        switch (c.kind) {
+          case TransferEvent::StructureKind::kBuildPartition:
+            est_bytes = 1024 * 1024;  // ~1MB typical partition chunk
+            break;
+          case TransferEvent::StructureKind::kMergePathBoundary:
+            est_bytes = 4096;  // boundaries are small
+            break;
+          case TransferEvent::StructureKind::kMaterializationBuffer:
+            est_bytes = 256 * 1024;  // ~256KB buffer
+            break;
+        }
+        total_bytes += est_bytes;
+        n_coalesced++;
+      }
+    }
+
+    if (n_coalesced > 1 && total_bytes > 0) {
+      fprintf(stderr, "[AJB_STATE][Coalesce] dst_gpu=%d merged %zu transfers -> %zu bytes\n",
+              dst_gpu, n_coalesced, total_bytes);
+    }
+    return total_bytes;
+  }
+
+  // -----------------------------------------------------------------------
+  // Comprehensive state dump: print all scheduler internals for debugging.
+  // Call this from the benchmark loop to get full visibility into scheduling.
+  // -----------------------------------------------------------------------
+  void DumpFullState(size_t t) const {
+    fprintf(stderr, "\n[AJB_STATE][SchedulerDump] === t=%zu ===\n", t);
+    fprintf(stderr, "  Cadence: K_x=%zu K_u=%zu K_v=%zu (initial: %zu/%zu/%zu)\n",
+            cadence_.K_x, cadence_.K_u, cadence_.K_v,
+            initial_cadence_.K_x, initial_cadence_.K_u, initial_cadence_.K_v);
+    fprintf(stderr, "  Bytes: fast=%zu slow=%zu host=%zu total=%zu\n",
+            total_fast_tier_bytes_, total_slow_tier_bytes_, total_host_bytes_,
+            total_fast_tier_bytes_ + total_slow_tier_bytes_ + total_host_bytes_);
+    fprintf(stderr, "  Events: %zu transfers logged\n", event_log_.size());
+    fprintf(stderr, "  EWMA bandwidths:\n");
+    ewma_fast_.DebugPrint("    NVLink");
+    ewma_slow_.DebugPrint("    PCIe");
+    ewma_host_.DebugPrint("    HostDRAM");
+    fprintf(stderr, "  Topology congestion:\n");
+    for (const auto& link : topology_) {
+      if (link.link_transfer_count > 0) {
+        fprintf(stderr, "    GPU %d->%d: ema_bw=%.1f MB/s congestion=%.2f "
+                "backoff_exp=%zu count=%zu\n",
+                link.src_device, link.dst_device,
+                link.ema_bw_mbps, link.congestion_level,
+                link.backoff_exponent, link.link_transfer_count);
+      }
+    }
+    fprintf(stderr, "[AJB_STATE][SchedulerDump] === end ===\n\n");
+  }
+
   // Accessors
   const TransferCadence& GetCadence() const { return cadence_; }
   const std::vector<TransferEvent>& GetEventLog() const { return event_log_; }

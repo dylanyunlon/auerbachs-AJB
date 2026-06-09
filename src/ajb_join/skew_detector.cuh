@@ -411,3 +411,164 @@ double EstimateJoinSelectivity(const T* keys_r, size_t n_r,
 
   return selectivity;
 }
+
+// ---------------------------------------------------------------------------
+// Two-Sample Kolmogorov-Smirnov test: compare key distributions between
+// two relations (or two GPU partitions) to detect distribution drift.
+// Returns the KS distance and approximate p-value.
+// Used by TierTransferScheduler to decide if repartitioning is needed.
+// ---------------------------------------------------------------------------
+struct TwoSampleKSResult {
+  double ks_distance;     // max |F_1(x) - F_2(x)|
+  double p_value;         // approximate p-value (Smirnov formula)
+  size_t n1, n2;          // sample sizes
+  bool reject_h0;         // reject H0: same distribution? (at alpha=0.05)
+
+  void DebugPrint(const char* label) const {
+    fprintf(stderr, "[AJB_BP][KS2Sample][%s] D=%.6f p=%.6f n1=%zu n2=%zu -> %s\n",
+            label, ks_distance, p_value, n1, n2,
+            reject_h0 ? "DIFFERENT distributions" : "same distribution");
+  }
+};
+
+template <typename T>
+TwoSampleKSResult TwoSampleKSTest(const T* data1, size_t n1,
+                                    const T* data2, size_t n2,
+                                    double alpha = 0.05,
+                                    size_t max_samples = 100000) {
+  TwoSampleKSResult result;
+  result.n1 = std::min(n1, max_samples);
+  result.n2 = std::min(n2, max_samples);
+
+  // Reservoir sample if data too large
+  std::vector<double> s1(result.n1), s2(result.n2);
+  std::mt19937 rng(42);
+
+  if (n1 <= max_samples) {
+    for (size_t i = 0; i < n1; ++i) s1[i] = static_cast<double>(data1[i]);
+  } else {
+    // Algorithm R reservoir sampling
+    for (size_t i = 0; i < max_samples; ++i) s1[i] = static_cast<double>(data1[i]);
+    for (size_t i = max_samples; i < n1; ++i) {
+      size_t j = rng() % (i + 1);
+      if (j < max_samples) s1[j] = static_cast<double>(data1[i]);
+    }
+  }
+
+  if (n2 <= max_samples) {
+    for (size_t i = 0; i < n2; ++i) s2[i] = static_cast<double>(data2[i]);
+  } else {
+    for (size_t i = 0; i < max_samples; ++i) s2[i] = static_cast<double>(data2[i]);
+    for (size_t i = max_samples; i < n2; ++i) {
+      size_t j = rng() % (i + 1);
+      if (j < max_samples) s2[j] = static_cast<double>(data2[i]);
+    }
+  }
+
+  // Sort both samples
+  std::sort(s1.begin(), s1.end());
+  std::sort(s2.begin(), s2.end());
+
+  // Merge-walk to compute KS statistic
+  double max_diff = 0.0;
+  size_t i = 0, j = 0;
+  while (i < result.n1 && j < result.n2) {
+    double cdf1 = static_cast<double>(i + 1) / result.n1;
+    double cdf2 = static_cast<double>(j + 1) / result.n2;
+    double diff = std::fabs(cdf1 - cdf2);
+    if (diff > max_diff) max_diff = diff;
+
+    if (s1[i] <= s2[j]) ++i; else ++j;
+  }
+  // Handle remaining elements
+  while (i < result.n1) {
+    double cdf1 = static_cast<double>(i + 1) / result.n1;
+    double diff = std::fabs(cdf1 - 1.0);
+    if (diff > max_diff) max_diff = diff;
+    ++i;
+  }
+  while (j < result.n2) {
+    double cdf2 = static_cast<double>(j + 1) / result.n2;
+    double diff = std::fabs(0.0 - cdf2);
+    if (diff > max_diff) max_diff = diff;
+    ++j;
+  }
+
+  result.ks_distance = max_diff;
+
+  // Approximate p-value using asymptotic Smirnov distribution
+  double n_eff = static_cast<double>(result.n1 * result.n2)
+                 / (result.n1 + result.n2);
+  double lambda = (std::sqrt(n_eff) + 0.12 + 0.11 / std::sqrt(n_eff)) * max_diff;
+
+  // Kolmogorov-Smirnov asymptotic p-value: P(D > d) ≈ 2 Σ (-1)^{k-1} exp(-2k²λ²)
+  double p = 0.0;
+  for (int k = 1; k <= 20; ++k) {
+    double sign = (k % 2 == 1) ? 1.0 : -1.0;
+    double term = sign * std::exp(-2.0 * k * k * lambda * lambda);
+    p += term;
+  }
+  result.p_value = std::max(0.0, std::min(1.0, 2.0 * p));
+  result.reject_h0 = (result.p_value < alpha);
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Entropy-based adaptive bucket count: choose the number of histogram buckets
+// that maximizes the information content (Shannon entropy) of the histogram.
+// This replaces Freedman-Diaconis when the distribution is multimodal.
+// ---------------------------------------------------------------------------
+template <typename T>
+size_t EntropyOptimalBuckets(const T* data, size_t n,
+                              size_t min_buckets = 8,
+                              size_t max_buckets = 512) {
+  if (n < 2 * min_buckets) return min_buckets;
+
+  // Find data range
+  T min_val = data[0], max_val = data[0];
+  for (size_t i = 1; i < n; ++i) {
+    if (data[i] < min_val) min_val = data[i];
+    if (data[i] > max_val) max_val = data[i];
+  }
+  if (max_val <= min_val) return min_buckets;
+
+  double best_entropy = -1.0;
+  size_t best_k = min_buckets;
+
+  // Search over candidate bucket counts (powers of 2 for speed)
+  for (size_t k = min_buckets; k <= max_buckets; k *= 2) {
+    std::vector<size_t> counts(k, 0);
+    double range = static_cast<double>(max_val - min_val);
+
+    for (size_t i = 0; i < n; ++i) {
+      double norm = static_cast<double>(data[i] - min_val) / range;
+      size_t bucket = static_cast<size_t>(norm * (k - 1));
+      bucket = std::min(bucket, k - 1);
+      counts[bucket]++;
+    }
+
+    // Shannon entropy: H = -Σ p_i log2(p_i)
+    double H = 0.0;
+    for (size_t b = 0; b < k; ++b) {
+      if (counts[b] == 0) continue;
+      double p = static_cast<double>(counts[b]) / n;
+      H -= p * std::log2(p);
+    }
+
+    // Penalize for too many empty buckets (Bayesian Information Criterion style)
+    size_t nonempty = 0;
+    for (size_t b = 0; b < k; ++b) if (counts[b] > 0) nonempty++;
+    double penalty = 0.5 * static_cast<double>(nonempty) * std::log2(n) / n;
+    double score = H - penalty;
+
+    if (score > best_entropy) {
+      best_entropy = score;
+      best_k = k;
+    }
+  }
+
+  fprintf(stderr, "[AJB_BP][EntropyBuckets] n=%zu optimal_k=%zu entropy=%.4f\n",
+          n, best_k, best_entropy);
+  return best_k;
+}
