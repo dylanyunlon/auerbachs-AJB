@@ -503,7 +503,10 @@ void RunJoinBenchmark(Settings& settings) {
         tabulate::Table table;
 
         table.add_row({"key", "r_value", "s_value"});
-        for (const auto& [key, r_value, s_value] : result_rows) {
+        for (const auto& row : result_rows) {
+          const auto& key = std::get<0>(row);
+          const auto& r_value = std::get<1>(row);
+          const auto& s_value = std::get<2>(row);
           table.add_row({std::to_string(key), std::to_string(r_value), std::to_string(s_value)});
         }
 

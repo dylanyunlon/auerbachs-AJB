@@ -260,10 +260,12 @@ void RunAJBBenchmark(AJBSettings& settings) {
   double effective_skew = 0.0;
   {
     AJBTimer skew_timer("skew_detection");
-    auto [skew_r, skew_s] = DetectJoinSkew(
+    auto skew_pair = DetectJoinSkew(
         r_keys.data(), r_keys.size(),
         s_keys.data(), s_keys.size(),
         std::min<size_t>(10000, settings.r_num_elements));
+    const auto& skew_r = skew_pair.first;
+    const auto& skew_s = skew_pair.second;
     effective_skew = std::max(skew_r.normalized, skew_s.normalized);
   }
   fprintf(stderr, "[AJB_STATE] SkewDetection END effective_skew=%.6f\n", effective_skew);
