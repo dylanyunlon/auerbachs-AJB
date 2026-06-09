@@ -219,9 +219,15 @@ struct PartitionCardinalityWelford {
     size_t n;
     double mean;
     double m2;     // sum of squared deviations
+    // EMA for trend detection: is output cardinality shrinking?
+    double ema_output;        // exponential moving average of recent outputs
+    double ema_delta;         // EMA of output differences (negative = converging)
+    double prev_output;       // last observed output for delta computation
 
-    Stats() : partition_id(0), n(0), mean(0.0), m2(0.0) {}
-    explicit Stats(size_t pid) : partition_id(pid), n(0), mean(0.0), m2(0.0) {}
+    Stats() : partition_id(0), n(0), mean(0.0), m2(0.0),
+              ema_output(0.0), ema_delta(0.0), prev_output(0.0) {}
+    explicit Stats(size_t pid) : partition_id(pid), n(0), mean(0.0), m2(0.0),
+              ema_output(0.0), ema_delta(0.0), prev_output(0.0) {}
 
     void Update(double value) {
       n++;
@@ -229,6 +235,18 @@ struct PartitionCardinalityWelford {
       mean += delta / static_cast<double>(n);
       double delta2 = value - mean;
       m2 += delta * delta2;
+
+      // EMA update (alpha=0.2 for ~5-sample half-life)
+      const double alpha = 0.2;
+      if (n == 1) {
+        ema_output = value;
+        ema_delta = 0.0;
+      } else {
+        double output_delta = value - prev_output;
+        ema_output = alpha * value + (1.0 - alpha) * ema_output;
+        ema_delta = alpha * output_delta + (1.0 - alpha) * ema_delta;
+      }
+      prev_output = value;
     }
 
     double Variance() const {
@@ -255,6 +273,43 @@ struct PartitionCardinalityWelford {
     if (partition_id < partition_stats.size()) {
       partition_stats[partition_id].Update(static_cast<double>(output_count));
     }
+  }
+
+  // Check if ALL partitions show a monotonically decreasing trend
+  // (output cardinality is shrinking). If so, the join is converging
+  // and remaining chunks will produce fewer matches — potential early exit.
+  bool IsConverging(double threshold = -0.5) const {
+    if (partition_stats.empty()) return false;
+    size_t converging = 0;
+    for (const auto& s : partition_stats) {
+      if (s.n >= 5 && s.ema_delta < threshold) {
+        converging++;
+      }
+    }
+    bool result = (converging == partition_stats.size());
+    if (result) {
+      fprintf(stderr, "[AJB_BP][WelfordConverge] ALL %zu partitions converging "
+              "(ema_delta < %.2f)\n", partition_stats.size(), threshold);
+      for (const auto& s : partition_stats) {
+        fprintf(stderr, "  partition %zu: ema_output=%.1f ema_delta=%.2f n=%zu\n",
+                s.partition_id, s.ema_output, s.ema_delta, s.n);
+      }
+    }
+    return result;
+  }
+
+  // Get the global EMA trend across all partitions
+  double GlobalTrend() const {
+    if (partition_stats.empty()) return 0.0;
+    double sum_delta = 0.0;
+    size_t count = 0;
+    for (const auto& s : partition_stats) {
+      if (s.n >= 3) {
+        sum_delta += s.ema_delta;
+        count++;
+      }
+    }
+    return (count > 0) ? sum_delta / count : 0.0;
   }
 
   void DebugPrint(size_t t) const {
@@ -645,21 +700,40 @@ JoinResult<T> AJBMergeJoin(
       }
     }
 
-    // --- HLL sketch update (hash join keys from this chunk) ---
+    // --- HLL sketch update (MurmurHash3 finalizer for better distribution) ---
     {
       size_t n_matches = device_results[t].count_;
       for (size_t m = 0; m < std::min<size_t>(n_matches, 5000); ++m) {
-        // FNV-1a hash of match index for HLL
-        uint64_t h = 14695981039346656037ULL;
-        uint64_t val = static_cast<uint64_t>(t * 1000000 + m);
-        for (int byte = 0; byte < 8; ++byte) {
-          h ^= (val >> (byte * 8)) & 0xFF;
-          h *= 1099511628211ULL;
-        }
+        // MurmurHash3 64-bit finalizer — much better avalanche than FNV byte-loop
+        uint64_t h = static_cast<uint64_t>(t * 1000000 + m);
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33;
+        h *= 0xc4ceb9fe1a85ec53ULL;
+        h ^= h >> 33;
         hll_sketch.Insert(h);
       }
       if (t % debug_print_interval == 0) {
         hll_sketch.DebugPrint(t);
+      }
+    }
+
+    // --- Imbalance feedback: trigger repartitioning if max imbalance exceeds threshold ---
+    {
+      double max_imbalance = 0.0;
+      double ideal_per_dev = static_cast<double>(keys_r.size() + keys_s.size()) / device_count;
+      for (size_t d = 0; d < device_count; ++d) {
+        double local = (ends[d].x - starts[d].x) + (ends[d].y - starts[d].y);
+        double imb = (ideal_per_dev > 0)
+            ? std::fabs(local - ideal_per_dev) / ideal_per_dev : 0.0;
+        if (imb > max_imbalance) max_imbalance = imb;
+      }
+      // If imbalance > 30%, force boundary recomputation next step
+      if (max_imbalance > 0.30 && t > 0 && t % 3 == 0) {
+        fprintf(stderr, "[AJB_BP][ImbalanceFeedback] t=%zu max_imbalance=%.4f > 0.30 "
+                "-> forcing boundary recompute\n", t, max_imbalance);
+        // Signal scheduler to transfer boundaries on next step regardless of cadence
+        scheduler.AdaptK_u(max_imbalance);
       }
     }
 
