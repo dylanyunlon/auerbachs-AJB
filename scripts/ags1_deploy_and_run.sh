@@ -203,6 +203,22 @@ else
     fi
 fi
 
+# csvparser: 新版main branch的single_include/csv.hpp是shim, 需要用旧版或下载完整header
+if [ -f "third_party/csvparser/single_include/csv.hpp" ] && \
+   grep -q "compatibility shim" "third_party/csvparser/single_include/csv.hpp" 2>/dev/null; then
+    echo "  ↓ csvparser single_include is shim, switching to tag 2.3.0..."
+    rm -rf "third_party/csvparser"
+    git clone --depth=1 -b 2.3.0 -q \
+        https://github.com/vincentlaucsb/csv-parser.git third_party/csvparser 2>/dev/null || {
+        echo "  ↓ tag 2.3.0 failed, downloading full header directly..."
+        mkdir -p third_party/csvparser/single_include
+        curl -sL "https://vincentlaucsb.github.io/csv-parser/csv.hpp" \
+            -o third_party/csvparser/single_include/csv.hpp 2>/dev/null || \
+            echo "  ✗ FAILED: csvparser header download"
+    }
+    echo "  ✓ csvparser single_include/csv.hpp fixed"
+fi
+
 # parallel header stub
 mkdir -p third_party/parallel/include
 
