@@ -24,7 +24,14 @@ RESULTS_DIR="${1:-experiment_data/$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$RESULTS_DIR"
 
 NUM_RUNS=5
-NUM_GPUS=3  # 2x A6000 + 1x H100
+# 如果CUDA < 12, 只用A6000x2; 否则用全部3张
+if [ "${AJB_SKIP_H100:-0}" = "1" ]; then
+    NUM_GPUS=2
+    export CUDA_VISIBLE_DEVICES=0,1
+    echo "[AJB_EXP] Using 2 GPUs (A6000x2, H100 skipped due to CUDA 11.x)"
+else
+    NUM_GPUS=3  # 2x A6000 + 1x H100
+fi
 
 echo "[AJB_EXP] Starting full experiment"
 echo "[AJB_EXP] Results: $RESULTS_DIR"

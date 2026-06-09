@@ -37,78 +37,85 @@ nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv,noheader
 nvidia-smi topo -m 2>/dev/null | head -15 || true
 echo ""
 
-# ---- Step 1: Conda environment (reuse walking3) ----
-echo "[AJB] === Step 1: Conda environment ==="
+# ---- Step 1: 在walking3里补装编译依赖 (绝不碰PyTorch/CUDA runtime) ----
+echo "[AJB] === Step 1: Build deps in walking3 ==="
 
-# 复用已有的walking3环境 (已有PyTorch cu121, cmake, g++等)
-CONDA_ENV="${CONDA_ENV:-walking3}"
-echo "[AJB] Activating conda env: $CONDA_ENV"
-eval "$(conda shell.bash hook)" 2>/dev/null || true
-conda activate "$CONDA_ENV" 2>/dev/null || {
-    echo "[AJB] WARNING: conda activate $CONDA_ENV failed"
-    echo "[AJB] Trying base environment..."
-    conda activate base 2>/dev/null || true
+# walking3 现状:
+#   torch 2.7.1+cu118, nvidia-*-cu11 — 不许动
+#   系统 nvcc 11.5 — 支持 sm_80 native, sm_86 通过PTX兼容跑A6000
+#   H100 (sm_90) 需要 CUDA 12 — 后续单独处理, 先用2张A6000出数据
+#
+# 只装: cmake(如果没有), glpk(CPU tests), matplotlib/seaborn(画图)
+# 绝不装: cuda-toolkit, nvidia-*, torch, 任何会动cu11链的东西
+
+eval "$(conda shell.bash hook)" 2>/dev/null || source ~/.bashrc 2>/dev/null || true
+conda activate walking3 2>/dev/null || {
+    echo "[AJB] WARNING: conda activate walking3 failed, trying source activate..."
+    source activate walking3 2>/dev/null || true
+}
+echo "[AJB] Python: $(python3 --version 2>&1)"
+echo "[AJB] torch: $(python3 -c 'import torch; print(torch.__version__)' 2>&1)"
+
+# cmake — 编译需要, 与PyTorch无关
+if ! command -v cmake &>/dev/null; then
+    echo "[AJB] Installing cmake (不影响PyTorch)..."
+    pip install cmake 2>&1 | tail -3 || conda install -y cmake 2>&1 | tail -3 || true
+fi
+echo "[AJB] cmake: $(cmake --version 2>/dev/null | head -1 || echo 'not found')"
+
+# matplotlib/seaborn — 画图用, 与PyTorch无关
+python3 -c "import matplotlib" 2>/dev/null || {
+    echo "[AJB] Installing matplotlib seaborn (不影响PyTorch)..."
+    pip install matplotlib seaborn 2>&1 | tail -3 || true
 }
 
-# 找nvcc: 优先conda环境里的, 然后system
+# 找nvcc — 用系统的, 不装新的
 CURRENT_NVCC=""
-if command -v nvcc &>/dev/null; then
-    CURRENT_NVCC=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' || echo "")
-fi
-
-if [ -z "$CURRENT_NVCC" ]; then
-    # 系统nvcc
-    for cuda_dir in /usr/local/cuda-12* /usr/local/cuda-11* /usr/local/cuda; do
-        if [ -x "$cuda_dir/bin/nvcc" ]; then
-            export PATH="$cuda_dir/bin:$PATH"
-            export CUDA_HOME="$cuda_dir"
-            CURRENT_NVCC=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+' || echo "")
-            break
-        fi
-    done
-fi
-
-echo "[AJB] nvcc version: ${CURRENT_NVCC:-not found}"
-
-# 如果只有CUDA 11.5, 尝试在walking3环境里装CUDA 12 toolkit
-CUDA_MAJOR=$(echo "$CURRENT_NVCC" | cut -d. -f1)
-if [ "${CUDA_MAJOR:-0}" -lt 12 ]; then
-    echo "[AJB] CUDA < 12 detected, installing cuda-toolkit 12.6 into $CONDA_ENV..."
-    conda install -y -c nvidia/label/cuda-12.6.3 cuda-toolkit 2>&1 | tail -10 || {
-        echo "[AJB] conda install failed, trying pip..."
-        pip install nvidia-cuda-toolkit 2>&1 | tail -5 || true
-    }
-    # 刷新nvcc
-    CONDA_PREFIX="${CONDA_PREFIX:-$(conda info --base)/envs/$CONDA_ENV}"
-    [ -x "$CONDA_PREFIX/bin/nvcc" ] && export PATH="$CONDA_PREFIX/bin:$PATH"
-    CURRENT_NVCC=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' || echo "")
-    CUDA_MAJOR=$(echo "$CURRENT_NVCC" | cut -d. -f1)
-fi
+for nvcc_path in \
+    "$(command -v nvcc 2>/dev/null)" \
+    /usr/local/cuda/bin/nvcc \
+    /usr/local/cuda-11.5/bin/nvcc \
+    /usr/local/cuda-11.8/bin/nvcc \
+    /usr/local/cuda-12*/bin/nvcc; do
+    if [ -x "$nvcc_path" ] 2>/dev/null; then
+        export PATH="$(dirname "$nvcc_path"):$PATH"
+        export CUDA_HOME="$(dirname "$(dirname "$nvcc_path")")"
+        CURRENT_NVCC=$("$nvcc_path" --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' || echo "")
+        [ -n "$CURRENT_NVCC" ] && break
+    fi
+done
+echo "[AJB] nvcc: ${CURRENT_NVCC:-not found}"
 
 # 最终验证
-nvcc --version | tail -1 || { echo "[AJB] FATAL: nvcc not found after setup"; exit 1; }
+nvcc --version | tail -1 || { echo "[AJB] FATAL: nvcc not found"; exit 1; }
 CUDA_VER=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+')
 CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
+CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
 
 if [ "$CUDA_MAJOR" -ge 12 ]; then
     ARCH_LIST="86;90"
     echo "[AJB] CUDA $CUDA_VER: native sm_86 (A6000) + sm_90 (H100)"
+elif [ "$CUDA_MAJOR" -eq 11 ] && [ "${CUDA_MINOR:-0}" -ge 5 ]; then
+    # CUDA 11.5: sm_80 native, A6000(sm_86)通过PTX兼容跑
+    # H100(sm_90)跑不了 — 先用2张A6000出数据
+    ARCH_LIST="80"
+    echo "[AJB] CUDA $CUDA_VER: sm_80 native, A6000通过PTX兼容"
+    echo "[AJB] NOTE: H100 (sm_90) 需要CUDA 12, 本轮先用A6000 x2"
+    echo "[AJB] 设 NUM_GPUS=2 (跳过GPU2=H100)"
+    export AJB_SKIP_H100=1
 else
     ARCH_LIST="80"
-    echo "[AJB] WARNING: CUDA $CUDA_VER < 12, H100 will NOT work natively"
+    echo "[AJB] WARNING: CUDA $CUDA_VER 较旧, 尝试sm_80编译"
 fi
 
 # ---- Step 2: 依赖 ----
 echo ""
 echo "[AJB] === Step 2: Dependencies ==="
 
-# Python deps
-pip install numpy pandas matplotlib seaborn 2>/dev/null | tail -3 || true
-
 # glpk for joinrenum CPU tests
 if ! dpkg -l libglpk-dev &>/dev/null 2>&1; then
-    echo "[AJB] libglpk-dev not found, trying conda..."
-    conda install -y -c conda-forge glpk 2>/dev/null | tail -3 || true
+    echo "[AJB] libglpk-dev not found, trying conda (不影响PyTorch)..."
+    conda install -y -c conda-forge glpk 2>&1 | tail -3 || true
 fi
 
 # third_party (git clone each dep)
@@ -174,12 +181,20 @@ cd "$AJB_ROOT"
 echo ""
 echo "[AJB] === Step 4: Smoke test (1M elements) ==="
 
+# CUDA 11.5: 只用GPU0+GPU1 (A6000x2), 跳过GPU2 (H100)
+SMOKE_GPUS=2
+[ "${AJB_SKIP_H100:-0}" = "1" ] && {
+    export CUDA_VISIBLE_DEVICES=0,1
+    SMOKE_GPUS=2
+    echo "[AJB] CUDA_VISIBLE_DEVICES=0,1 (跳过H100)"
+}
+
 if [ -x build/join_benchmark ]; then
     echo "[AJB] Running upstream join_benchmark..."
     timeout 120 build/join_benchmark \
         --num-elements=1000000 \
         --distribution=uniform \
-        --num-gpus=2 \
+        --num-gpus="$SMOKE_GPUS" \
         --gpu-sort=radix \
         --gpu-merge=merge-path \
         2>&1 | tee "$RESULTS_DIR/smoke_join.txt" | tail -15
@@ -190,7 +205,7 @@ if [ -x build/ajb_benchmark ]; then
     timeout 120 build/ajb_benchmark \
         --num-elements=1000000 \
         --distribution=uniform \
-        --num-gpus=2 \
+        --num-gpus="$SMOKE_GPUS" \
         2>&1 | tee "$RESULTS_DIR/smoke_ajb.txt" | tail -15
 fi
 
