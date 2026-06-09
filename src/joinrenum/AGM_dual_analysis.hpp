@@ -566,4 +566,215 @@ struct SensitivityResult {
 
             return result;
         }
+
+        // ====================================================================
+        // [AJB] perturbation_sweep — Multi-epsilon sensitivity analysis
+        //
+        // Instead of a single perturbation epsilon, sweep across a geometric
+        // series of perturbation magnitudes to find the breakpoint where the
+        // basis changes (shadow price becomes nonlinear). This identifies
+        // the *range of validity* of each shadow price more precisely than
+        // the single-epsilon approach above.
+        //
+        // Returns per-variable: the largest epsilon where the shadow price
+        // remains approximately constant (basis stability radius).
+        // ====================================================================
+        struct PerturbSweepEntry {
+            int    var_idx;
+            string variable_name;
+            double shadow_price;
+            double stability_radius;   // largest eps where shadow price is stable
+            double breakpoint_eps;     // first eps where basis changes
+            bool   is_degenerate;      // shadow price flips sign during sweep
+            vector<pair<double,double>> eps_obj_curve; // (eps, obj_value) for plotting
+        };
+
+        struct PerturbSweepResult {
+            vector<PerturbSweepEntry> entries;
+            double sweep_time_ms;
+            int    total_solves;
+        };
+
+        PerturbSweepResult perturbation_sweep(vector<int> &cars,
+                                               int n_steps = 8,
+                                               double eps_min = 1e-6,
+                                               double eps_max = 1.0) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            PerturbSweepResult sweep;
+            sweep.total_solves = 0;
+
+            int nrels = static_cast<int>(relations.size());
+            int nvars = static_cast<int>(variables.size());
+
+            // Build LP once
+            vector<double> c(nrels);
+            for (int i = 0; i < nrels; i++) c[i] = log2(cars[i]);
+
+            glp_prob *lp = glp_create_prob();
+            glp_set_obj_dir(lp, GLP_MIN);
+            glp_add_cols(lp, nrels);
+            for (int i = 1; i <= nrels; i++) {
+                glp_set_col_bnds(lp, i, GLP_LO, 0.0, 0.0);
+                glp_set_obj_coef(lp, i, c[i - 1]);
+            }
+            glp_add_rows(lp, nvars);
+            for (int v = 0; v < nvars; v++) {
+                glp_set_row_bnds(lp, v + 1, GLP_LO, 1.0, 0.0);
+                const auto& rs = relsofVar[v];
+                vector<int> ind(rs.size() + 1);
+                vector<double> val(rs.size() + 1);
+                ind[0] = 0; val[0] = 0.0;
+                for (size_t j = 0; j < rs.size(); j++) {
+                    ind[j + 1] = rs[j] + 1;
+                    val[j + 1] = 1.0;
+                }
+                glp_set_mat_row(lp, v + 1, (int)rs.size(), ind.data(), val.data());
+            }
+            glp_smcp parm;
+            glp_init_smcp(&parm);
+            parm.msg_lev = GLP_MSG_OFF;
+
+            // Solve baseline
+            glp_simplex(lp, &parm);
+            double base_obj = glp_get_obj_val(lp);
+            sweep.total_solves++;
+
+            // Geometric series of epsilon values
+            vector<double> eps_values;
+            double ratio = pow(eps_max / eps_min, 1.0 / (n_steps - 1));
+            for (int s = 0; s < n_steps; s++) {
+                eps_values.push_back(eps_min * pow(ratio, s));
+            }
+
+            sweep.entries.resize(nvars);
+
+            for (int v = 0; v < nvars; v++) {
+                PerturbSweepEntry& entry = sweep.entries[v];
+                entry.var_idx = v;
+                entry.variable_name = (v < (int)variableNames.size())
+                    ? variableNames[v] : ("x" + to_string(v));
+                entry.shadow_price = glp_get_row_dual(lp, v + 1);
+                entry.stability_radius = eps_max;
+                entry.breakpoint_eps = eps_max;
+                entry.is_degenerate = false;
+
+                double sp = entry.shadow_price;
+                bool found_break = false;
+
+                for (double eps : eps_values) {
+                    // Perturb row v+1 upward by eps
+                    glp_set_row_bnds(lp, v + 1, GLP_LO, 1.0 + eps, 0.0);
+                    glp_simplex(lp, &parm);
+                    double obj_perturbed = glp_get_obj_val(lp);
+                    sweep.total_solves++;
+
+                    // Linear prediction: obj should change by sp * eps
+                    double expected = base_obj + sp * eps;
+                    double prediction_error = fabs(obj_perturbed - expected);
+                    double rel_error = (fabs(expected) > 1e-15)
+                        ? prediction_error / fabs(expected) : prediction_error;
+
+                    entry.eps_obj_curve.push_back({eps, obj_perturbed});
+
+                    // Check if new dual at this row has flipped sign
+                    double new_sp = glp_get_row_dual(lp, v + 1);
+                    if (sp * new_sp < 0 && fabs(new_sp) > 1e-10) {
+                        entry.is_degenerate = true;
+                    }
+
+                    // Basis change: prediction error exceeds 1% relative
+                    if (!found_break && rel_error > 0.01) {
+                        entry.breakpoint_eps = eps;
+                        // Stability radius is the previous epsilon
+                        entry.stability_radius = (eps > eps_min) ? eps / ratio : eps_min;
+                        found_break = true;
+                    }
+
+                    // Restore for next iteration
+                    glp_set_row_bnds(lp, v + 1, GLP_LO, 1.0, 0.0);
+                }
+
+                // If no breakpoint found, shadow price is stable across entire range
+                if (!found_break) {
+                    entry.stability_radius = eps_max;
+                    entry.breakpoint_eps = eps_max;
+                }
+
+                fprintf(stderr, "[AJB_BP][PerturbSweep] var=%s shadow=%.6f "
+                        "stability_radius=%.6f breakpoint=%.6f %s\n",
+                        entry.variable_name.c_str(), entry.shadow_price,
+                        entry.stability_radius, entry.breakpoint_eps,
+                        entry.is_degenerate ? "DEGENERATE" : "stable");
+            }
+
+            glp_delete_prob(lp);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            sweep.sweep_time_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+            fprintf(stderr, "[AJB_SENS][PerturbSweep] %d variables, %d total solves, "
+                    "%.3f ms\n", nvars, sweep.total_solves, sweep.sweep_time_ms);
+
+            return sweep;
+        }
+
+        // ====================================================================
+        // [AJB] classify_binding_constraints — Partition variable constraints
+        // into three categories that guide the join enumeration strategy:
+        //
+        //   TIGHT:  shadow_price > 0, slack ≈ 0  → bottleneck, worth optimizing
+        //   SLACK:  shadow_price ≈ 0, slack > 0  → not binding, low priority
+        //   NEAR:   shadow_price ≈ 0, slack ≈ 0  → near-degenerate, sensitive
+        //
+        // The TIGHT set directly drives which relations to prioritize in the
+        // join order. NEAR constraints may become TIGHT with small data changes.
+        // ====================================================================
+        struct BindingClassification {
+            vector<int> tight;      // variable indices
+            vector<int> slack;
+            vector<int> near_degenerate;
+            double tight_shadow_sum;  // total shadow price of tight constraints
+        };
+
+        BindingClassification classify_binding_constraints(
+            const SensitivityResult& sens,
+            double shadow_threshold = 1e-6,
+            double slack_threshold = 1e-4) {
+
+            BindingClassification bc;
+            bc.tight_shadow_sum = 0.0;
+
+            for (size_t v = 0; v < sens.row_analysis.size(); v++) {
+                const auto& e = sens.row_analysis[v];
+                double abs_shadow = fabs(e.shadow_price);
+                double abs_slack = fabs(e.row_slack);
+
+                if (abs_shadow > shadow_threshold && abs_slack < slack_threshold) {
+                    bc.tight.push_back(v);
+                    bc.tight_shadow_sum += abs_shadow;
+                } else if (abs_shadow < shadow_threshold && abs_slack > slack_threshold) {
+                    bc.slack.push_back(v);
+                } else {
+                    bc.near_degenerate.push_back(v);
+                }
+            }
+
+            // Sort tight by descending shadow price
+            sort(bc.tight.begin(), bc.tight.end(), [&](int a, int b) {
+                return fabs(sens.row_analysis[a].shadow_price) >
+                       fabs(sens.row_analysis[b].shadow_price);
+            });
+
+            fprintf(stderr, "[AJB_STATE][BindingClass] tight=%zu slack=%zu near=%zu "
+                    "tight_shadow_sum=%.6f\n",
+                    bc.tight.size(), bc.slack.size(), bc.near_degenerate.size(),
+                    bc.tight_shadow_sum);
+
+            for (int v : bc.tight) {
+                const auto& e = sens.row_analysis[v];
+                fprintf(stderr, "[AJB_STATE][BindingClass]   TIGHT var=%s shadow=%.6f\n",
+                        e.variable_name.c_str(), e.shadow_price);
+            }
+
+            return bc;
+        }
 };

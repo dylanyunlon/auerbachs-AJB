@@ -126,16 +126,102 @@ struct REnumSkewProbe {
   REnumSkewProbe(size_t n = 1000, float thresh = 0.6f)
     : num_samples(n), skew_threshold(thresh) {}
 
-  // Run sampling and return skew estimate + accumulator
+  // Run sampling and return skew estimate + accumulator.
+  // Uses Algorithm L (Li 1994) reservoir sampling when num_samples is large:
+  //   - Exponential jump distances avoid checking every element
+  //   - O(k(1 + log(n/k))) expected comparisons vs O(n) for Algorithm R
+  //   - Collision rate tracked via EMA; buffer doubles when EMA > 0.95
   std::pair<SkewEstimate, SampleAccumulator> Probe(RandOrderEnum& renum) const {
     SampleAccumulator acc;
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    for (size_t i = 0; i < num_samples; i++) {
+    // Collision tracking (hash-based duplicate detection)
+    std::unordered_set<size_t> seen_hashes;
+    size_t collisions = 0;
+    double collision_ema = 0.0;
+    const double ema_alpha = 0.01;  // smoothing factor
+
+    // Adaptive reservoir: Algorithm L for large sample counts
+    // W = exp(log(U(0,1))/k) where k is reservoir size
+    std::mt19937_64 rng(42);
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+
+    size_t reservoir_k = std::min(num_samples, (size_t)10000);
+    std::vector<std::vector<int>> reservoir(reservoir_k);
+    size_t total_attempted = 0;
+    size_t empty_returns = 0;
+
+    // Phase 1: fill reservoir
+    for (size_t i = 0; i < reservoir_k; i++) {
       std::vector<int> tuple = renum.sample();
+      total_attempted++;
       if (!tuple.empty()) {
+        reservoir[i] = tuple;
         acc.AddSample(tuple);
+
+        // Collision check
+        size_t h = 0;
+        for (int v : tuple) h ^= std::hash<int>{}(v) * 2654435761ULL;
+        if (seen_hashes.count(h)) {
+          collisions++;
+        }
+        seen_hashes.insert(h);
+        collision_ema = ema_alpha * (seen_hashes.count(h) > 1 ? 1.0 : 0.0)
+                        + (1.0 - ema_alpha) * collision_ema;
+      } else {
+        empty_returns++;
+      }
+    }
+
+    // Phase 2: Algorithm L — exponential jumps for remaining samples
+    if (num_samples > reservoir_k) {
+      // W = exp(log(U) / k)
+      double W = std::exp(std::log(uni(rng)) / reservoir_k);
+      size_t i = reservoir_k;
+      size_t jump_count = 0;
+
+      while (i < num_samples) {
+        // Skip distance: geometric with parameter W
+        double skip = std::floor(std::log(uni(rng)) / std::log(1.0 - W));
+        i += static_cast<size_t>(skip) + 1;
+        if (i >= num_samples) break;
+
+        // Replace random element in reservoir
+        std::vector<int> tuple = renum.sample();
+        total_attempted++;
+        if (!tuple.empty()) {
+          size_t replace_idx = rng() % reservoir_k;
+          reservoir[replace_idx] = tuple;
+          acc.AddSample(tuple);
+          jump_count++;
+
+          // Update collision EMA
+          size_t h = 0;
+          for (int v : tuple) h ^= std::hash<int>{}(v) * 2654435761ULL;
+          double is_collision = seen_hashes.count(h) ? 1.0 : 0.0;
+          collision_ema = ema_alpha * is_collision + (1.0 - ema_alpha) * collision_ema;
+          seen_hashes.insert(h);
+
+          // Adaptive: if collision rate too high, double the sampling effort
+          if (collision_ema > 0.95 && reservoir_k < 100000) {
+            fprintf(stderr, "[AJB_STATE][ReservoirAdapt] collision_ema=%.4f > 0.95, "
+                    "doubling reservoir from %zu\n", collision_ema, reservoir_k);
+            reservoir_k *= 2;
+            reservoir.resize(reservoir_k);
+            W = std::exp(std::log(uni(rng)) / reservoir_k);
+          }
+        }
+
+        // Update W
+        W *= std::exp(std::log(uni(rng)) / reservoir_k);
+
+        // [AJB_STATE] periodic collision diagnostic
+        if (total_attempted % 1000 == 0 && total_attempted > 0) {
+          fprintf(stderr, "[AJB_STATE][adapter_collision_ema] attempted=%zu "
+                  "collision_ema=%.4f collisions=%zu reservoir_k=%zu jumps=%zu\n",
+                  total_attempted, collision_ema, collisions, reservoir_k, jump_count);
+        }
       }
     }
 
@@ -144,11 +230,14 @@ struct REnumSkewProbe {
 
     SkewEstimate est = acc.EstimateSkew(skew_threshold);
 
-    printf("[AJB-REnum] probe complete: %zu samples in %.4fs\n", num_samples, elapsed);
-    printf("[AJB-REnum]   total_tuples=%zu  distinct_keys=%zu\n",
-           acc.total_tuples, acc.key_freq.size());
+    printf("[AJB-REnum] probe complete: %zu requested, %zu attempted in %.4fs\n",
+           num_samples, total_attempted, elapsed);
+    printf("[AJB-REnum]   total_tuples=%zu  distinct_keys=%zu  empty_returns=%zu\n",
+           acc.total_tuples, acc.key_freq.size(), empty_returns);
     printf("[AJB-REnum]   CV=%.4f  normalized=%.4f  is_high_skew=%s\n",
            est.cv, est.normalized, est.is_high_skew ? "YES" : "NO");
+    printf("[AJB-REnum]   collision_ema=%.4f  collisions=%zu  reservoir_k=%zu\n",
+           collision_ema, collisions, reservoir_k);
 
     return {est, acc};
   }
