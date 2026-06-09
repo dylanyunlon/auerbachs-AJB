@@ -41,16 +41,16 @@ class TimeDurations {
     active_intervals_[tag] = begin_times_[tag];
   }
 
-  inline std::chrono::duration<double> Toc(const std::string& tag) {
+  inline double Toc(const std::string& tag) {
     auto now = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = now - begin_times_[tag];
     double dur_sec = duration.count();
 
     auto iter = durations_.find(tag);
     if (iter == durations_.end()) {
-      durations_[tag] = duration;
+      durations_[tag] = dur_sec;
     } else {
-      iter->second += duration;
+      iter->second += dur_sec;
     }
 
     // Per-invocation统计
@@ -63,16 +63,15 @@ class TimeDurations {
     // 清除active区间
     active_intervals_.erase(tag);
 
-    return duration;
+    return dur_sec;
   }
 
-  double GetDuration(const std::string& tag) { std::chrono::duration<double> d = durations_[tag]; return d.count(); }
+  double GetDuration(const std::string& tag) { return durations_[tag]; }
 
   double GetTotalDuration() {
     double total = 0.0;
     for (auto it = durations_.begin(); it != durations_.end(); ++it) {
-      std::chrono::duration<double> d = it->second;
-      total += d.count();
+      total += it->second;
     }
     return total;
   }
@@ -87,7 +86,7 @@ class TimeDurations {
     double total = 0.0;
     for (auto it = durations_.begin(); it != durations_.end(); ++it) {
       std::string tag = it->first;
-      std::chrono::duration<double> dur = it->second;
+      double dur = it->second;
       auto sit = invocation_stats_.find(tag);
       if (sit != invocation_stats_.end()) {
         const InvocationStats& s = sit->second;
@@ -96,9 +95,9 @@ class TimeDurations {
                 s.count > 0 ? s.total_sec / s.count : 0.0,
                 s.min_sec, s.max_sec);
       } else {
-        fprintf(stderr, "  %-30s %8s %12.6f\n", tag.c_str(), "1", dur.count());
+        fprintf(stderr, "  %-30s %8s %12.6f\n", tag.c_str(), "1", dur);
       }
-      total += dur.count();
+      total += dur;
     }
     fprintf(stderr, "  %-30s %8s %12.6f\n", "TOTAL", "", total);
     fprintf(stderr, "\n");
@@ -111,7 +110,7 @@ class TimeDurations {
     fprintf(fp, "phase,calls,total_sec,mean_sec,min_sec,max_sec\n");
     for (auto it = durations_.begin(); it != durations_.end(); ++it) {
       std::string tag = it->first;
-      std::chrono::duration<double> dur = it->second;
+      double dur = it->second;
       auto sit = invocation_stats_.find(tag);
       if (sit != invocation_stats_.end()) {
         const InvocationStats& s = sit->second;
@@ -120,9 +119,8 @@ class TimeDurations {
                 s.count > 0 ? s.total_sec / s.count : 0.0,
                 s.min_sec, s.max_sec);
       } else {
-        double dur_sec = dur.count();
         fprintf(fp, "%s,1,%.9f,%.9f,%.9f,%.9f\n",
-                tag.c_str(), dur_sec, dur_sec, dur_sec, dur_sec);
+                tag.c_str(), dur, dur, dur, dur);
       }
     }
     fclose(fp);
@@ -166,7 +164,7 @@ class TimeDurations {
   };
 
   std::map<std::string, std::chrono::time_point<std::chrono::high_resolution_clock>> begin_times_;
-  std::map<std::string, std::chrono::duration<double>> durations_;
+  std::map<std::string, double> durations_;
   std::map<std::string, InvocationStats> invocation_stats_;
   // 当前正在计时的phase (Tic后Toc前)
   std::map<std::string, std::chrono::time_point<std::chrono::high_resolution_clock>> active_intervals_;
