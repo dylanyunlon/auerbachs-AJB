@@ -37,49 +37,52 @@ nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv,noheader
 nvidia-smi topo -m 2>/dev/null | head -15 || true
 echo ""
 
-# ---- Step 1: CUDA 12 环境 ----
-echo "[AJB] === Step 1: CUDA 12 toolkit ==="
+# ---- Step 1: Conda environment (reuse walking3) ----
+echo "[AJB] === Step 1: Conda environment ==="
 
-# 检查当前nvcc版本
+# 复用已有的walking3环境 (已有PyTorch cu121, cmake, g++等)
+CONDA_ENV="${CONDA_ENV:-walking3}"
+echo "[AJB] Activating conda env: $CONDA_ENV"
+eval "$(conda shell.bash hook)" 2>/dev/null || true
+conda activate "$CONDA_ENV" 2>/dev/null || {
+    echo "[AJB] WARNING: conda activate $CONDA_ENV failed"
+    echo "[AJB] Trying base environment..."
+    conda activate base 2>/dev/null || true
+}
+
+# 找nvcc: 优先conda环境里的, 然后system
 CURRENT_NVCC=""
 if command -v nvcc &>/dev/null; then
     CURRENT_NVCC=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' || echo "")
 fi
-echo "[AJB] Current nvcc: ${CURRENT_NVCC:-not found}"
 
-NEED_CUDA12=true
-if [[ "$CURRENT_NVCC" == 12.* ]]; then
-    echo "[AJB] CUDA 12 already available, skipping install"
-    NEED_CUDA12=false
+if [ -z "$CURRENT_NVCC" ]; then
+    # 系统nvcc
+    for cuda_dir in /usr/local/cuda-12* /usr/local/cuda-11* /usr/local/cuda; do
+        if [ -x "$cuda_dir/bin/nvcc" ]; then
+            export PATH="$cuda_dir/bin:$PATH"
+            export CUDA_HOME="$cuda_dir"
+            CURRENT_NVCC=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+' || echo "")
+            break
+        fi
+    done
 fi
 
-if [ "$NEED_CUDA12" = true ]; then
-    echo "[AJB] Installing CUDA 12.6 via conda..."
-    
-    # 用conda安装CUDA toolkit 12.6 到 base 环境
-    # 这不会影响系统驱动(550.144.03 支持 CUDA 12.x)
+echo "[AJB] nvcc version: ${CURRENT_NVCC:-not found}"
+
+# 如果只有CUDA 11.5, 尝试在walking3环境里装CUDA 12 toolkit
+CUDA_MAJOR=$(echo "$CURRENT_NVCC" | cut -d. -f1)
+if [ "${CUDA_MAJOR:-0}" -lt 12 ]; then
+    echo "[AJB] CUDA < 12 detected, installing cuda-toolkit 12.6 into $CONDA_ENV..."
     conda install -y -c nvidia/label/cuda-12.6.3 cuda-toolkit 2>&1 | tail -10 || {
-        echo "[AJB] conda cuda-toolkit install failed, trying pip..."
+        echo "[AJB] conda install failed, trying pip..."
         pip install nvidia-cuda-toolkit 2>&1 | tail -5 || true
     }
-    
-    # 验证
-    CONDA_PREFIX="${CONDA_PREFIX:-$(conda info --base)}"
-    if [ -x "$CONDA_PREFIX/bin/nvcc" ]; then
-        export PATH="$CONDA_PREFIX/bin:$PATH"
-        export CUDA_HOME="$CONDA_PREFIX"
-        echo "[AJB] nvcc from conda: $($CONDA_PREFIX/bin/nvcc --version | tail -1)"
-    else
-        echo "[AJB] Fallback: looking for system CUDA 12..."
-        for cuda_dir in /usr/local/cuda-12* /usr/local/cuda; do
-            if [ -x "$cuda_dir/bin/nvcc" ]; then
-                export PATH="$cuda_dir/bin:$PATH"
-                export CUDA_HOME="$cuda_dir"
-                echo "[AJB] Found: $cuda_dir/bin/nvcc"
-                break
-            fi
-        done
-    fi
+    # 刷新nvcc
+    CONDA_PREFIX="${CONDA_PREFIX:-$(conda info --base)/envs/$CONDA_ENV}"
+    [ -x "$CONDA_PREFIX/bin/nvcc" ] && export PATH="$CONDA_PREFIX/bin:$PATH"
+    CURRENT_NVCC=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' || echo "")
+    CUDA_MAJOR=$(echo "$CURRENT_NVCC" | cut -d. -f1)
 fi
 
 # 最终验证
