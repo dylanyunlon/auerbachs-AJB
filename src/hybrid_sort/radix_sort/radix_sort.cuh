@@ -504,7 +504,8 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
         size_t gpus_with_spanning = 0;
         if (iteration > 0 && iteration < spanning_buckets.size()) {
           std::vector<bool> gpu_active(num_gpus, false);
-          for (auto& [gid, bucket] : spanning_buckets[iteration]) {  // AJB: radix pass iteration
+          for (auto& kv : spanning_buckets[iteration]) {  // AJB: radix pass iteration
+            auto& gid = kv.first;
             for (size_t gi = 0; gi < num_gpus; ++gi) {  // AJB: radix pass iteration
               if (gpus[gi] == gid) { gpu_active[gi] = true; break; }
             }
@@ -911,8 +912,10 @@ std::function<void()> RadixSort(T* in_keys, V* in_values, T* out_keys, V* out_va
                   BucketId(max_num_partition_passes - 1, i, &spanning_buckets[iteration][s].second);
 
               // AJB: try_emplace一步完成查找+构造——避免count+operator[]两次查找
-              auto [lp_it, lp_inserted] = last_pass_spanning_buckets.try_emplace(
+              auto lp_result = last_pass_spanning_buckets.try_emplace(
                   last_pass_bucket, std::pair<size_t, std::vector<LPSpanningBucketFraction>>{0, {}});
+              auto lp_it = lp_result.first;
+              auto lp_inserted = lp_result.second;
               if (lp_inserted) {
                 lp_it->second.second.reserve(num_gpus);
               }
@@ -1346,7 +1349,9 @@ static inline bool validate_sort_output(const T* keys, size_t n, size_t sample_s
         {n > DENSE_REGION ? n - DENSE_REGION : 0, n},
         {n > DENSE_REGION ? n / 2 - DENSE_REGION / 2 : 0, std::min(n / 2 + DENSE_REGION / 2, n)}
     };
-    for (auto& [start, end] : regions) {
+    for (auto& region : regions) {
+        auto& start = region.first;
+        auto& end = region.second;
         for (size_t i = start; i + 1 < end && i + 1 < n; i++) {
             positions_checked++;
             if (keys[i] > keys[i + 1]) {

@@ -175,8 +175,8 @@ class AJBEventCounter {
 
   void PrintAll(const char* label = "EventCounts") const {
     printf("[%s]\n", label);
-    for (const auto& [name, count] : counts_) {
-      printf("  %-40s : %zu\n", name.c_str(), count);
+    for (const auto& kv : counts_) {
+      printf("  %-40s : %zu\n", kv.first.c_str(), kv.second);
     }
   }
 

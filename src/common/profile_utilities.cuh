@@ -70,8 +70,8 @@ class TimeDurations {
 
   double GetTotalDuration() {
     auto total = std::chrono::duration<double>::zero();
-    for (const auto& [tag, dur] : durations_) {
-      total += dur;
+    for (const auto& kv : durations_) {
+      total += kv.second;
     }
     return total.count();
   }
@@ -84,7 +84,9 @@ class TimeDurations {
     fprintf(stderr, "  %-30s %8s %12s %12s %12s %12s\n",
             "-----", "-----", "--------", "-------", "------", "------");
     double total = 0.0;
-    for (const auto& [tag, dur] : durations_) {
+    for (const auto& kv : durations_) {
+      const auto& tag = kv.first;
+      const auto& dur = kv.second;
       auto it = invocation_stats_.find(tag);
       if (it != invocation_stats_.end()) {
         const auto& s = it->second;
@@ -106,7 +108,9 @@ class TimeDurations {
     FILE* fp = fopen(path.c_str(), "w");
     if (!fp) { fprintf(stderr, "[TimeDurations] Cannot open %s\n", path.c_str()); return; }
     fprintf(fp, "phase,calls,total_sec,mean_sec,min_sec,max_sec\n");
-    for (const auto& [tag, dur] : durations_) {
+    for (const auto& kv : durations_) {
+      const auto& tag = kv.first;
+      const auto& dur = kv.second;
       auto it = invocation_stats_.find(tag);
       if (it != invocation_stats_.end()) {
         const auto& s = it->second;
@@ -142,8 +146,8 @@ class TimeDurations {
     if (active_intervals_.empty()) return;
     fprintf(stderr, "[AJB_BP][Overlap] %zu phases active simultaneously:",
             active_intervals_.size());
-    for (const auto& [tag, _] : active_intervals_) {
-      fprintf(stderr, " [%s]", tag.c_str());
+    for (const auto& kv : active_intervals_) {
+      fprintf(stderr, " [%s]", kv.first.c_str());
     }
     fprintf(stderr, "\n");
   }

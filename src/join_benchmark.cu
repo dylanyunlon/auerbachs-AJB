@@ -391,9 +391,13 @@ void RunJoinBenchmark(Settings& settings) {
             settings.r_sort, settings.s_sort);
       }
 
-      auto [sort_dur, merge_dur, join_dur, total_dur] = RunSingleIteration<T, V>(
+      auto iter_result = RunSingleIteration<T, V>(
           settings, r_relation, s_relation, host_allocators, device_allocators,
           stream_pools, num_matches, is_warmup);
+      auto sort_dur = std::get<0>(iter_result);
+      auto merge_dur = std::get<1>(iter_result);
+      auto join_dur = std::get<2>(iter_result);
+      auto total_dur = std::get<3>(iter_result);
 
       sort_acc.Update(sort_dur);
       merge_acc.Update(merge_dur);
@@ -417,8 +421,12 @@ void RunJoinBenchmark(Settings& settings) {
         std::vector<DeviceAllocator> bl_da(settings.gpus.size());
         std::vector<StreamPool> bl_sp(settings.gpus.size());
 
-        auto [bl_sort, bl_merge, bl_join, bl_total] = RunSingleIteration<T, V>(
+        auto bl_result = RunSingleIteration<T, V>(
             baseline_settings, bl_r, bl_s, bl_ha, bl_da, bl_sp, num_matches, false);
+        auto bl_sort = std::get<0>(bl_result);
+        auto bl_merge = std::get<1>(bl_result);
+        auto bl_join = std::get<2>(bl_result);
+        auto bl_total = std::get<3>(bl_result);
 
         baseline_total_acc.Update(bl_total);
 
