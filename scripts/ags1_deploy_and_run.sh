@@ -142,7 +142,6 @@ fi
 echo "[AJB] Cloning third_party dependencies..."
 mkdir -p third_party
 declare -A DEPS=(
-    [thrust]="https://github.com/NVIDIA/thrust.git"
     [moderngpu]="https://github.com/moderngpu/moderngpu.git"
     [cxxopts]="https://github.com/jarro2783/cxxopts.git"
     [tabulate]="https://github.com/p-ranav/tabulate.git"
@@ -162,6 +161,30 @@ for dep in "${!DEPS[@]}"; do
             echo "  ✗ FAILED: $dep"
     fi
 done
+
+# Thrust 需要特殊处理: 必须 --recursive 拉 dependencies/libcudacxx 和 dependencies/cub
+# 用 1.17.2 tag (最后一个独立Thrust release, 兼容CUDA 11.x)
+if [ -d "third_party/thrust" ] && [ -d "third_party/thrust/dependencies/libcudacxx" ]; then
+    echo "  ✓ third_party/thrust (with libcudacxx)"
+else
+    echo "  ↓ cloning thrust --recursive (含libcudacxx+cub submodule)..."
+    rm -rf "third_party/thrust"
+    git clone --depth=1 --recursive -b 1.17.2 -q \
+        https://github.com/NVIDIA/thrust.git third_party/thrust 2>/dev/null || {
+        # 如果tag不存在, 试不带tag的recursive clone
+        echo "  ↓ retrying thrust main branch --recursive..."
+        rm -rf "third_party/thrust"
+        git clone --depth=1 --recursive -q \
+            https://github.com/NVIDIA/thrust.git third_party/thrust 2>/dev/null || \
+            echo "  ✗ FAILED: thrust"
+    }
+    # 验证libcudacxx存在
+    if [ -d "third_party/thrust/dependencies/libcudacxx" ]; then
+        echo "  ✓ thrust/dependencies/libcudacxx present"
+    else
+        echo "  ✗ WARNING: libcudacxx missing after clone, cmake will fail"
+    fi
+fi
 
 # parallel header stub
 mkdir -p third_party/parallel/include
