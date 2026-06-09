@@ -77,9 +77,26 @@ if [[ "$TORCH_VER" != *"cu118"* ]]; then
 fi
 
 # cmake — 编译需要, 与PyTorch无关
-if ! command -v cmake &>/dev/null; then
-    echo "[AJB] Installing cmake (不影响PyTorch)..."
-    pip install cmake 2>&1 | tail -3 || conda install -y cmake 2>&1 | tail -3 || true
+# 注意: cmake 4.x 和 nvcc 11.5 不兼容 (生成的编译命令格式变了)
+# 如果系统nvcc < 12, 必须用 cmake <= 3.31
+CMAKE_OK=false
+if command -v cmake &>/dev/null; then
+    CMAKE_VER=$(cmake --version | head -1 | grep -oP '[0-9]+\.[0-9]+' | head -1)
+    CMAKE_MAJOR=$(echo "$CMAKE_VER" | cut -d. -f1)
+    if [ "${CMAKE_MAJOR:-0}" -le 3 ]; then
+        CMAKE_OK=true
+        echo "[AJB] cmake $CMAKE_VER — OK for nvcc 11.x"
+    else
+        echo "[AJB] cmake $CMAKE_VER (v4+) — 与 nvcc 11.x 不兼容, 降级..."
+        pip uninstall -y cmake 2>/dev/null || true
+        CMAKE_OK=false
+    fi
+fi
+if [ "$CMAKE_OK" = false ]; then
+    echo "[AJB] Installing cmake 3.31.6 (最后兼容nvcc 11.x的版本)..."
+    pip install 'cmake==3.31.6' 2>&1 | tail -3 || \
+    pip install 'cmake<4' 2>&1 | tail -3 || \
+    conda install -y 'cmake>=3.18,<4' 2>&1 | tail -3 || true
 fi
 echo "[AJB] cmake: $(cmake --version 2>/dev/null | head -1 || echo 'not found')"
 
